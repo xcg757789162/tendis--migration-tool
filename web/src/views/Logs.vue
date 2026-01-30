@@ -441,26 +441,42 @@ const formatValue = (value) => {
   return String(value)
 }
 
+const copyToClipboard = (text) => {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text)
+  }
+  // Fallback for non-HTTPS
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  document.body.appendChild(textarea)
+  textarea.select()
+  try {
+    document.execCommand('copy')
+    return Promise.resolve()
+  } catch (e) {
+    return Promise.reject(e)
+  } finally {
+    document.body.removeChild(textarea)
+  }
+}
+
 const copyLog = (log) => {
   const text = formatLogForCopy(log)
-  navigator.clipboard.writeText(text).then(() => {
+  copyToClipboard(text).then(() => {
     ElMessage.success('已复制到剪贴板')
   }).catch(() => {
-    // Fallback
-    const textarea = document.createElement('textarea')
-    textarea.value = text
-    document.body.appendChild(textarea)
-    textarea.select()
-    document.execCommand('copy')
-    document.body.removeChild(textarea)
-    ElMessage.success('已复制到剪贴板')
+    ElMessage.error('复制失败')
   })
 }
 
 const copyAllLogs = () => {
   const text = logs.value.map(formatLogForCopy).join('\n\n')
-  navigator.clipboard.writeText(text).then(() => {
+  copyToClipboard(text).then(() => {
     ElMessage.success(`已复制 ${logs.value.length} 条日志`)
+  }).catch(() => {
+    ElMessage.error('复制失败')
   })
 }
 

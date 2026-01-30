@@ -245,9 +245,30 @@ const formatTime = (time) => {
   return dayjs(time).format('YYYY-MM-DD HH:mm:ss')
 }
 
+const copyToClipboard = (text) => {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text)
+  }
+  // Fallback for non-HTTPS
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  document.body.appendChild(textarea)
+  textarea.select()
+  try {
+    document.execCommand('copy')
+    return Promise.resolve()
+  } catch (e) {
+    return Promise.reject(e)
+  } finally {
+    document.body.removeChild(textarea)
+  }
+}
+
 const copyTaskId = async (id) => {
   try {
-    await navigator.clipboard.writeText(id)
+    await copyToClipboard(id)
     ElMessage.success('任务ID已复制')
   } catch (err) {
     ElMessage.error('复制失败')

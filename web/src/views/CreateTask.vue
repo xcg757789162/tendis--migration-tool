@@ -326,6 +326,10 @@
                     <span class="value">{{ recommendedConfig.worker_count }}</span>
                   </div>
                   <div class="recommend-row">
+                    <span class="label">推荐连接数:</span>
+                    <span class="value">源端 {{ recommendedConfig.source_connections }}，目标端 {{ recommendedConfig.target_connections }}</span>
+                  </div>
+                  <div class="recommend-row">
                     <span class="label">推荐理由:</span>
                     <span class="value reason">{{ recommendedConfig.reason }}</span>
                   </div>
@@ -453,6 +457,7 @@
                       :max="500"
                       style="width: 100%"
                     />
+                    <div class="form-tip">建议设置为 Worker数 × 2，不超过源端 maxclients 的 10%</div>
                   </el-form-item>
                 </el-col>
                 
@@ -464,6 +469,7 @@
                       :max="200"
                       style="width: 100%"
                     />
+                    <div class="form-tip">建议设置为 Worker数 × 2，不超过目标端 maxclients 的 10%</div>
                   </el-form-item>
                 </el-col>
               </el-row>

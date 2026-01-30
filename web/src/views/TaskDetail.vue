@@ -149,45 +149,89 @@
           <el-button 
             v-if="task.status === 'running'" 
             type="primary" 
-            size="small" 
-            text
+            size="small"
             @click="openConfigDialog"
+            class="adjust-btn"
           >
             <el-icon><Edit /></el-icon> 调整参数
           </el-button>
         </div>
-        <div class="config-info">
-          <div class="config-row">
-            <span class="label">Worker数量</span>
-            <span class="value highlight">{{ config?.worker_count || 4 }}</span>
+        <div class="config-info compact">
+          <div class="config-grid">
+            <div class="config-item">
+              <span class="label">Worker配置</span>
+              <span class="value highlight">{{ config?.worker_count || 4 }}</span>
+            </div>
+            <div class="config-item" v-if="task.status === 'running'">
+              <span class="label">活跃Worker</span>
+              <span class="value" :class="{'adjusting': task.active_workers !== (config?.worker_count || 4)}">
+                {{ task.active_workers || config?.worker_count || 4 }}
+                <el-icon v-if="task.active_workers !== (config?.worker_count || 4)" class="adjusting-icon"><Loading /></el-icon>
+              </span>
+            </div>
+            <div class="config-item">
+              <span class="label">批次大小</span>
+              <span class="value">{{ config?.scan_batch_size || 1000 }}</span>
+            </div>
+            <div class="config-item">
+              <span class="label">源端QPS</span>
+              <span class="value">{{ config?.rate_limit?.source_qps || '不限' }}</span>
+            </div>
+            <div class="config-item">
+              <span class="label">目标QPS</span>
+              <span class="value">{{ config?.rate_limit?.target_qps || '不限' }}</span>
+            </div>
+            <div class="config-item">
+              <span class="label">源端连接</span>
+              <span class="value">{{ config?.rate_limit?.source_connections || 50 }}</span>
+            </div>
+            <div class="config-item">
+              <span class="label">目标连接</span>
+              <span class="value">{{ config?.rate_limit?.target_connections || 50 }}</span>
+            </div>
+            <div class="config-item">
+              <span class="label">冲突策略</span>
+              <span class="value">{{ getConflictPolicyText(config?.conflict_policy) }}</span>
+            </div>
+            <div class="config-item">
+              <span class="label">大Key阈值</span>
+              <span class="value">{{ formatBytes(config?.large_key_threshold || 10485760) }}</span>
+            </div>
           </div>
-          <div class="config-row">
-            <span class="label">扫描批次大小</span>
-            <span class="value">{{ config?.scan_batch_size || 1000 }}</span>
+          <!-- Key过滤配置 -->
+          <div class="filter-section" v-if="config?.key_filter">
+            <div class="filter-title">
+              <el-icon><Filter /></el-icon> Key过滤
+            </div>
+            <div class="filter-content">
+              <div class="filter-item" v-if="config?.key_filter?.mode">
+                <span class="label">模式:</span>
+                <span class="value">{{ getFilterModeText(config?.key_filter?.mode) }}</span>
+              </div>
+              <div class="filter-item" v-if="config?.key_filter?.prefixes?.length">
+                <span class="label">包含前缀:</span>
+                <span class="value mono">{{ config?.key_filter?.prefixes?.join(', ') }}</span>
+              </div>
+              <div class="filter-item" v-if="config?.key_filter?.exclude_prefixes?.length">
+                <span class="label">排除前缀:</span>
+                <span class="value mono warning">{{ config?.key_filter?.exclude_prefixes?.join(', ') }}</span>
+              </div>
+              <div class="filter-item" v-if="config?.key_filter?.patterns?.length">
+                <span class="label">匹配模式:</span>
+                <span class="value mono">{{ config?.key_filter?.patterns?.join(', ') }}</span>
+              </div>
+              <div class="filter-item no-filter" v-if="!config?.key_filter?.prefixes?.length && !config?.key_filter?.exclude_prefixes?.length && !config?.key_filter?.patterns?.length">
+                <span class="value">无过滤规则，迁移所有Key</span>
+              </div>
+            </div>
           </div>
-          <div class="config-row">
-            <span class="label">源端QPS限制</span>
-            <span class="value">{{ config?.rate_limit?.source_qps || '不限制' }}</span>
-          </div>
-          <div class="config-row">
-            <span class="label">目标端QPS限制</span>
-            <span class="value">{{ config?.rate_limit?.target_qps || '不限制' }}</span>
-          </div>
-          <div class="config-row">
-            <span class="label">源端连接数</span>
-            <span class="value">{{ config?.rate_limit?.source_connections || 50 }}</span>
-          </div>
-          <div class="config-row">
-            <span class="label">目标端连接数</span>
-            <span class="value">{{ config?.rate_limit?.target_connections || 50 }}</span>
-          </div>
-          <div class="config-row">
-            <span class="label">冲突策略</span>
-            <span class="value">{{ getConflictPolicyText(config?.conflict_policy) }}</span>
-          </div>
-          <div class="config-row">
-            <span class="label">大Key阈值</span>
-            <span class="value">{{ formatBytes(config?.large_key_threshold || 10485760) }}</span>
+          <div class="filter-section no-filter-config" v-else>
+            <div class="filter-title">
+              <el-icon><Filter /></el-icon> Key过滤
+            </div>
+            <div class="filter-content">
+              <span class="no-filter-text">未配置过滤规则，迁移所有Key</span>
+            </div>
           </div>
         </div>
       </div>
@@ -706,6 +750,15 @@ const getConflictPolicyText = (policy) => {
   return map[policy] || policy || 'skip'
 }
 
+const getFilterModeText = (mode) => {
+  const map = {
+    prefix: '前缀匹配',
+    pattern: '模式匹配',
+    all: '全部迁移'
+  }
+  return map[mode] || mode || '全部迁移'
+}
+
 // 打开参数调整对话框
 const openConfigDialog = () => {
   const cfg = config.value || {}
@@ -1081,6 +1134,160 @@ onUnmounted(() => {
         color: var(--text-primary);
       }
     }
+    
+    // 紧凑布局样式
+    &.compact {
+      .config-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px 16px;
+        margin-bottom: 12px;
+        
+        @media (max-width: 600px) {
+          grid-template-columns: repeat(2, 1fr);
+        }
+        
+        .config-item {
+          display: flex;
+          flex-direction: column;
+          padding: 8px 10px;
+          background: var(--bg-primary);
+          border-radius: var(--radius-sm);
+          
+          .label {
+            font-size: 11px;
+            color: var(--text-tertiary);
+            margin-bottom: 2px;
+          }
+          
+          .value {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            
+            &.highlight {
+              color: var(--primary-color);
+            }
+            
+            &.adjusting {
+              color: var(--el-color-warning);
+              
+              .adjusting-icon {
+                animation: spin 1s linear infinite;
+              }
+            }
+          }
+        }
+      }
+      
+      @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
+      
+      .filter-section {
+        border-top: 1px solid var(--border-light);
+        padding-top: 12px;
+        margin-top: 4px;
+        
+        .filter-title {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 13px;
+          font-weight: 600;
+          color: var(--text-secondary);
+          margin-bottom: 8px;
+          
+          .el-icon {
+            font-size: 14px;
+          }
+        }
+        
+        .filter-content {
+          background: var(--bg-primary);
+          border-radius: var(--radius-sm);
+          padding: 10px 12px;
+          
+          .filter-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            margin-bottom: 6px;
+            font-size: 13px;
+            
+            &:last-child {
+              margin-bottom: 0;
+            }
+            
+            &.no-filter {
+              color: var(--text-tertiary);
+            }
+            
+            .label {
+              color: var(--text-tertiary);
+              flex-shrink: 0;
+              min-width: 70px;
+            }
+            
+            .value {
+              color: var(--text-primary);
+              word-break: break-all;
+              
+              &.mono {
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 12px;
+                background: rgba(0, 0, 0, 0.05);
+                padding: 2px 6px;
+                border-radius: 3px;
+              }
+              
+              &.warning {
+                color: var(--el-color-warning);
+              }
+            }
+          }
+          
+          .no-filter-text {
+            color: var(--text-tertiary);
+            font-size: 13px;
+          }
+        }
+        
+        &.no-filter-config {
+          .filter-content {
+            background: transparent;
+            padding: 0;
+          }
+        }
+      }
+    }
+  }
+}
+
+.config-card {
+  .config-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    
+    h3 {
+      margin-bottom: 0;
+    }
+    
+    .adjust-btn {
+      font-weight: 500;
+      padding: 8px 16px;
+      
+      &:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+      }
+    }
   }
 }
 
@@ -1238,6 +1445,7 @@ onUnmounted(() => {
     padding: 16px;
     max-height: 400px;
     overflow-y: auto;
+    overflow-x: auto;
     font-family: 'Consolas', 'Monaco', monospace;
     font-size: 12px;
     line-height: 1.6;
@@ -1251,9 +1459,12 @@ onUnmounted(() => {
   
   .log-entry {
     display: flex;
+    align-items: flex-start;
     gap: 12px;
     padding: 4px 0;
     color: #d4d4d4;
+    white-space: nowrap;
+    min-width: max-content;
     
     &.debug { color: #888; }
     &.info { color: #4fc3f7; }
@@ -1264,12 +1475,14 @@ onUnmounted(() => {
     .log-time {
       color: #888;
       flex-shrink: 0;
+      min-width: 85px;
     }
     
     .log-level {
       width: 50px;
       flex-shrink: 0;
       font-weight: 600;
+      text-align: left;
       
       &.debug { color: #888; }
       &.info { color: #4fc3f7; }
@@ -1279,13 +1492,18 @@ onUnmounted(() => {
     }
     
     .log-message {
-      flex: 1;
-      word-break: break-all;
+      flex-shrink: 0;
+      white-space: nowrap;
     }
     
     .log-fields {
-      color: #888;
-      font-size: 11px;
+      color: #9e9e9e;
+      font-size: 12px;
+      white-space: nowrap;
+      flex-shrink: 0;
+      max-width: 600px;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
   }
 }

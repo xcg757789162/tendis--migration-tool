@@ -39,10 +39,10 @@
     
     <!-- 主内容 -->
     <main class="app-main">
-      <router-view v-slot="{ Component }">
-        <transition name="fade" mode="out-in">
-          <component :is="Component" />
-        </transition>
+      <router-view v-slot="{ Component, route }">
+        <keep-alive :exclude="['TaskDetail']">
+          <component :is="Component" :key="route.fullPath" />
+        </keep-alive>
       </router-view>
     </main>
     

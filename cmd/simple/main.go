@@ -42,8 +42,11 @@ type Task struct {
 	BytesTotal     int64   `json:"bytes_total"`
 	Speed          int64   `json:"speed"`
 	Phase          string  `json:"phase"` // full, incremental, completed
+	ActiveWorkers  int     `json:"active_workers,omitempty"`   // 当前活跃Worker数
 	// 配置选项
 	Options *TaskOptions `json:"options,omitempty"`
+	// 内部字段（不序列化）
+	workerPool *DynamicWorkerPool `json:"-"`
 }
 
 // TaskTemplate 任务模板
@@ -813,6 +816,15 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 				"target_connections": task.Options.RateLimit.TargetConnections,
 			}
 		}
+		// 添加 key_filter 信息
+		if task.Options.KeyFilter != nil {
+			configData["key_filter"] = map[string]interface{}{
+				"mode":             task.Options.KeyFilter.Mode,
+				"prefixes":         task.Options.KeyFilter.Prefixes,
+				"exclude_prefixes": task.Options.KeyFilter.ExcludePrefixes,
+				"patterns":         task.Options.KeyFilter.Patterns,
+			}
+		}
 	}
 
 	jsonResponse(w, map[string]interface{}{
@@ -960,20 +972,44 @@ func updateTaskConfigHandler(w http.ResponseWriter, r *http.Request, id string, 
 		"old_scan_batch":     oldScanBatchSize,
 		"new_scan_batch":     task.Options.ScanBatchSize,
 	})
-	taskLog.Info("Config updated (graceful)", map[string]interface{}{
+	
+	// 记录Worker动态调整信息
+	adjustMsg := "will take effect dynamically"
+	if task.workerPool != nil {
+		currentActive := task.workerPool.GetActiveWorkerCount()
+		if oldWorkerCount != task.Options.WorkerCount {
+			if task.Options.WorkerCount > oldWorkerCount {
+				adjustMsg = fmt.Sprintf("increasing workers from %d to %d (current active: %d)", oldWorkerCount, task.Options.WorkerCount, currentActive)
+			} else {
+				adjustMsg = fmt.Sprintf("decreasing workers from %d to %d gracefully (current active: %d)", oldWorkerCount, task.Options.WorkerCount, currentActive)
+			}
+		}
+	}
+	
+	// 获取QPS值用于日志（处理空指针）
+	sourceQPS := 0
+	targetQPS := 0
+	if task.Options.RateLimit != nil {
+		sourceQPS = task.Options.RateLimit.SourceQPS
+		targetQPS = task.Options.RateLimit.TargetQPS
+	}
+	
+	taskLog.Info("Config updated (dynamic adjustment)", map[string]interface{}{
 		"worker_count":    task.Options.WorkerCount,
 		"scan_batch_size": task.Options.ScanBatchSize,
-		"source_qps":      task.Options.RateLimit.SourceQPS,
-		"target_qps":      task.Options.RateLimit.TargetQPS,
+		"source_qps":      sourceQPS,
+		"target_qps":      targetQPS,
+		"adjustment":      adjustMsg,
 	})
 
 	jsonResponse(w, map[string]interface{}{
 		"code":    0,
-		"message": "Config updated, will take effect after current batch completes",
+		"message": "Config updated dynamically, worker adjustment in progress",
 		"data": map[string]interface{}{
 			"worker_count":    task.Options.WorkerCount,
 			"scan_batch_size": task.Options.ScanBatchSize,
 			"rate_limit":      task.Options.RateLimit,
+			"adjustment":      adjustMsg,
 		},
 	})
 }
@@ -1141,8 +1177,25 @@ func simulateProgress(task *Task) {
 		targetAddrs[i] = strings.TrimSpace(targetAddrs[i])
 	}
 
-	// 尝试连接源端
-	sourceClient, sourceIsCluster, err := connectRedis(ctx, sourceAddrs, task.SourcePassword)
+	// 获取连接数配置
+	sourcePoolSize := 50 // 默认50连接
+	targetPoolSize := 50 // 默认50连接
+	if task.Options != nil && task.Options.RateLimit != nil {
+		if task.Options.RateLimit.SourceConnections > 0 {
+			sourcePoolSize = task.Options.RateLimit.SourceConnections
+		}
+		if task.Options.RateLimit.TargetConnections > 0 {
+			targetPoolSize = task.Options.RateLimit.TargetConnections
+		}
+	}
+
+	taskLog.Info("Connection pool config", map[string]interface{}{
+		"source_pool_size": sourcePoolSize,
+		"target_pool_size": targetPoolSize,
+	})
+
+	// 尝试连接源端（使用配置的连接池大小）
+	sourceClient, sourceIsCluster, err := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, sourcePoolSize)
 	if err != nil {
 		taskLog.Error("Failed to connect source cluster", map[string]interface{}{"error": err.Error()})
 		tasksMu.Lock()
@@ -1153,8 +1206,8 @@ func simulateProgress(task *Task) {
 	}
 	defer sourceClient.Close()
 
-	// 尝试连接目标端
-	targetClient, targetIsCluster, err := connectRedis(ctx, targetAddrs, task.TargetPassword)
+	// 尝试连接目标端（使用配置的连接池大小）
+	targetClient, targetIsCluster, err := connectRedisWithPoolSize(ctx, targetAddrs, task.TargetPassword, targetPoolSize)
 	if err != nil {
 		taskLog.Error("Failed to connect target cluster", map[string]interface{}{"error": err.Error()})
 		tasksMu.Lock()
@@ -1219,10 +1272,23 @@ func simulateProgress(task *Task) {
 
 // connectRedis 连接Redis，返回通用客户端接口
 func connectRedis(ctx context.Context, addrs []string, password string) (redis.UniversalClient, bool, error) {
+	return connectRedisWithPoolSize(ctx, addrs, password, 0)
+}
+
+// connectRedisWithPoolSize 连接Redis，支持自定义连接池大小
+func connectRedisWithPoolSize(ctx context.Context, addrs []string, password string, poolSize int) (redis.UniversalClient, bool, error) {
+	// 设置默认连接池大小
+	if poolSize <= 0 {
+		poolSize = 10 // 默认10个连接
+	}
+	
 	// 先尝试集群模式
 	clusterClient := redis.NewClusterClient(&redis.ClusterOptions{
-		Addrs:    addrs,
-		Password: password,
+		Addrs:        addrs,
+		Password:     password,
+		PoolSize:     poolSize,           // 每个节点的连接池大小
+		MinIdleConns: poolSize / 4,       // 最小空闲连接数
+		PoolTimeout:  30 * time.Second,   // 等待连接的超时时间
 	})
 	if err := clusterClient.Ping(ctx).Err(); err == nil {
 		return clusterClient, true, nil
@@ -1231,8 +1297,11 @@ func connectRedis(ctx context.Context, addrs []string, password string) (redis.U
 
 	// 尝试单机模式
 	standaloneClient := redis.NewClient(&redis.Options{
-		Addr:     addrs[0],
-		Password: password,
+		Addr:         addrs[0],
+		Password:     password,
+		PoolSize:     poolSize,           // 连接池大小
+		MinIdleConns: poolSize / 4,       // 最小空闲连接数
+		PoolTimeout:  30 * time.Second,   // 等待连接的超时时间
 	})
 	if err := standaloneClient.Ping(ctx).Err(); err != nil {
 		standaloneClient.Close()
@@ -1265,12 +1334,505 @@ func getDBSize(ctx context.Context, client redis.UniversalClient, isCluster bool
 	return total, err
 }
 
-// doFullMigration 执行全量迁移（并行Worker模式）
+// WorkerInfo Worker信息
+type WorkerInfo struct {
+	ID            int
+	StopChan      chan struct{}       // 停止信号
+	StoppedChan   chan struct{}       // 已停止确认
+	ProcessingKey string              // 当前正在处理的Key（用于日志）
+	IsProcessing  int32               // 是否正在处理Key（原子操作）
+	CreatedAt     time.Time           // 创建时间（用于LIFO）
+}
+
+// DynamicWorkerPool 动态Worker池，支持运行时调整Worker数量
+type DynamicWorkerPool struct {
+	task           *Task
+	ctx            context.Context
+	keyChan        chan string
+	wg             sync.WaitGroup
+	mu             sync.RWMutex
+	activeWorkers  int32                    // 当前活跃Worker数量
+	targetWorkers  int32                    // 目标Worker数量
+	workers        []*WorkerInfo            // Worker列表（有序，用于LIFO）
+	nextWorkerID   int                      // 下一个Worker ID
+	taskLog        *logger.TaskLogger
+	
+	// 迁移相关参数
+	sourceClient   redis.UniversalClient
+	targetClient   redis.UniversalClient
+	conflictPolicy string
+	rateLimiter    *RateLimiter             // 源端限速器
+	targetLimiter  *RateLimiter             // 目标端限速器
+	rateLimiterMu  sync.RWMutex             // 限速器锁（支持动态更新）
+	processedKeys  *sync.Map
+	
+	// 统计计数器
+	migratedCount  *int64
+	migratedBytes  *int64
+	failedCount    *int64
+	skippedCount   *int64
+	filteredCount  *int64
+}
+
+// NewDynamicWorkerPool 创建动态Worker池
+func NewDynamicWorkerPool(ctx context.Context, task *Task, keyChan chan string, taskLog *logger.TaskLogger,
+	sourceClient, targetClient redis.UniversalClient, conflictPolicy string, 
+	sourceLimiter, targetLimiter *RateLimiter,
+	processedKeys *sync.Map, migratedCount, migratedBytes, failedCount, skippedCount, filteredCount *int64) *DynamicWorkerPool {
+	
+	return &DynamicWorkerPool{
+		task:           task,
+		ctx:            ctx,
+		keyChan:        keyChan,
+		workers:        make([]*WorkerInfo, 0),
+		nextWorkerID:   0,
+		taskLog:        taskLog,
+		sourceClient:   sourceClient,
+		targetClient:   targetClient,
+		conflictPolicy: conflictPolicy,
+		rateLimiter:    sourceLimiter,
+		targetLimiter:  targetLimiter,
+		processedKeys:  processedKeys,
+		migratedCount:  migratedCount,
+		migratedBytes:  migratedBytes,
+		failedCount:    failedCount,
+		skippedCount:   skippedCount,
+		filteredCount:  filteredCount,
+	}
+}
+
+// SetWorkerCount 动态调整Worker数量
+func (p *DynamicWorkerPool) SetWorkerCount(count int) {
+	atomic.StoreInt32(&p.targetWorkers, int32(count))
+}
+
+// GetActiveWorkerCount 获取当前活跃Worker数量
+func (p *DynamicWorkerPool) GetActiveWorkerCount() int {
+	return int(atomic.LoadInt32(&p.activeWorkers))
+}
+
+// UpdateRateLimiter 动态更新源端限速器
+func (p *DynamicWorkerPool) UpdateRateLimiter(newQPS int) {
+	p.rateLimiterMu.Lock()
+	defer p.rateLimiterMu.Unlock()
+	
+	oldQPS := 0
+	if p.rateLimiter != nil {
+		oldQPS = p.rateLimiter.qps
+	}
+	
+	// QPS 没有变化，无需更新
+	if oldQPS == newQPS {
+		return
+	}
+	
+	// 停止旧的限速器
+	if p.rateLimiter != nil {
+		p.rateLimiter.Stop()
+		p.rateLimiter = nil
+	}
+	
+	// 创建新的限速器（如果 QPS > 0）
+	if newQPS > 0 {
+		p.rateLimiter = NewRateLimiter(newQPS)
+	}
+	
+	p.taskLog.Info("Source rate limiter updated dynamically", map[string]interface{}{
+		"old_qps": oldQPS,
+		"new_qps": newQPS,
+	})
+}
+
+// UpdateTargetRateLimiter 动态更新目标端限速器
+func (p *DynamicWorkerPool) UpdateTargetRateLimiter(newQPS int) {
+	p.rateLimiterMu.Lock()
+	defer p.rateLimiterMu.Unlock()
+	
+	oldQPS := 0
+	if p.targetLimiter != nil {
+		oldQPS = p.targetLimiter.qps
+	}
+	
+	// QPS 没有变化，无需更新
+	if oldQPS == newQPS {
+		return
+	}
+	
+	// 停止旧的限速器
+	if p.targetLimiter != nil {
+		p.targetLimiter.Stop()
+		p.targetLimiter = nil
+	}
+	
+	// 创建新的限速器（如果 QPS > 0）
+	if newQPS > 0 {
+		p.targetLimiter = NewRateLimiter(newQPS)
+	}
+	
+	p.taskLog.Info("Target rate limiter updated dynamically", map[string]interface{}{
+		"old_qps": oldQPS,
+		"new_qps": newQPS,
+	})
+}
+
+// GetTargetRateLimiter 获取目标端限速器（线程安全）
+func (p *DynamicWorkerPool) GetTargetRateLimiter() *RateLimiter {
+	p.rateLimiterMu.RLock()
+	defer p.rateLimiterMu.RUnlock()
+	return p.targetLimiter
+}
+
+// GetRateLimiter 获取当前限速器（线程安全）
+func (p *DynamicWorkerPool) GetRateLimiter() *RateLimiter {
+	p.rateLimiterMu.RLock()
+	defer p.rateLimiterMu.RUnlock()
+	return p.rateLimiter
+}
+
+// Start 启动指定数量的Worker
+func (p *DynamicWorkerPool) Start(initialCount int) {
+	atomic.StoreInt32(&p.targetWorkers, int32(initialCount))
+	for i := 0; i < initialCount; i++ {
+		p.addWorker()
+	}
+}
+
+// addWorker 添加一个新Worker
+func (p *DynamicWorkerPool) addWorker() {
+	p.mu.Lock()
+	workerID := p.nextWorkerID
+	p.nextWorkerID++
+	
+	workerInfo := &WorkerInfo{
+		ID:          workerID,
+		StopChan:    make(chan struct{}),
+		StoppedChan: make(chan struct{}),
+		CreatedAt:   time.Now(),
+	}
+	p.workers = append(p.workers, workerInfo)
+	p.mu.Unlock()
+	
+	atomic.AddInt32(&p.activeWorkers, 1)
+	p.wg.Add(1)
+	
+	go p.workerLoop(workerInfo)
+	
+	p.taskLog.Info("Worker started", map[string]interface{}{
+		"worker_id":      workerID,
+		"active_workers": atomic.LoadInt32(&p.activeWorkers),
+	})
+}
+
+// removeWorkerSmart 智能选择Worker停止：优先空闲Worker，其次LIFO（优雅停止）
+func (p *DynamicWorkerPool) removeWorkerSmart() bool {
+	p.mu.Lock()
+	
+	if len(p.workers) == 0 {
+		p.mu.Unlock()
+		return false
+	}
+	
+	// 策略：优先找空闲的Worker（从后往前找，保持LIFO倾向）
+	var targetIdx = -1
+	var selectionReason string
+	
+	for i := len(p.workers) - 1; i >= 0; i-- {
+		if atomic.LoadInt32(&p.workers[i].IsProcessing) == 0 {
+			targetIdx = i
+			selectionReason = "idle"
+			break
+		}
+	}
+	
+	// 如果没有空闲的，选最后一个（LIFO兜底）
+	if targetIdx == -1 {
+		targetIdx = len(p.workers) - 1
+		selectionReason = "LIFO (all busy)"
+	}
+	
+	// 移除选中的Worker
+	workerInfo := p.workers[targetIdx]
+	p.workers = append(p.workers[:targetIdx], p.workers[targetIdx+1:]...)
+	p.mu.Unlock()
+	
+	// 记录Worker当前状态
+	isProcessing := atomic.LoadInt32(&workerInfo.IsProcessing) == 1
+	processingKey := workerInfo.ProcessingKey
+	
+	p.taskLog.Info("Stopping worker (smart selection)", map[string]interface{}{
+		"worker_id":        workerInfo.ID,
+		"selection_reason": selectionReason,
+		"is_processing":    isProcessing,
+		"processing_key":   processingKey,
+		"created_at":       workerInfo.CreatedAt.Format("15:04:05"),
+	})
+	
+	// 发送停止信号
+	close(workerInfo.StopChan)
+	
+	// 等待Worker确认停止（空闲Worker应该立即停止，忙碌Worker需要等待）
+	timeout := 5 * time.Second
+	if isProcessing {
+		timeout = 30 * time.Second // 忙碌Worker给更长时间
+	}
+	
+	select {
+	case <-workerInfo.StoppedChan:
+		p.taskLog.Info("Worker stopped confirmed", map[string]interface{}{
+			"worker_id":        workerInfo.ID,
+			"selection_reason": selectionReason,
+		})
+	case <-time.After(timeout):
+		p.taskLog.Warn("Worker stop timeout, force continue", map[string]interface{}{
+			"worker_id": workerInfo.ID,
+			"timeout":   timeout.String(),
+		})
+	}
+	
+	return true
+}
+
+// workerLoop Worker的主循环（改进版：完全优雅停止）
+func (p *DynamicWorkerPool) workerLoop(info *WorkerInfo) {
+	defer func() {
+		atomic.AddInt32(&p.activeWorkers, -1)
+		p.wg.Done()
+		// 发送已停止确认
+		close(info.StoppedChan)
+		p.taskLog.Debug("Worker exited", map[string]interface{}{
+			"worker_id":      info.ID,
+			"active_workers": atomic.LoadInt32(&p.activeWorkers),
+		})
+	}()
+	
+	shouldStop := false
+	
+	for {
+		// 先检查是否收到停止信号（非阻塞）
+		select {
+		case <-info.StopChan:
+			shouldStop = true
+		default:
+		}
+		
+		// 如果已收到停止信号且当前没有在处理Key，则退出
+		if shouldStop && atomic.LoadInt32(&info.IsProcessing) == 0 {
+			p.taskLog.Debug("Worker stopping gracefully (no pending work)", map[string]interface{}{
+				"worker_id": info.ID,
+			})
+			return
+		}
+		
+		// 尝试从通道获取Key（带超时，便于定期检查停止信号）
+		select {
+		case <-info.StopChan:
+			// 收到停止信号
+			if atomic.LoadInt32(&info.IsProcessing) == 0 {
+				p.taskLog.Debug("Worker stopping gracefully (stop signal received)", map[string]interface{}{
+					"worker_id": info.ID,
+				})
+				return
+			}
+			// 正在处理中，标记需要停止，但继续完成当前工作
+			shouldStop = true
+			continue
+			
+		case key, ok := <-p.keyChan:
+			if !ok {
+				// 通道关闭，退出
+				return
+			}
+			
+			// 如果已标记停止，将key放回通道让其他worker处理，然后退出
+			if shouldStop {
+				// 尝试放回（非阻塞），如果通道满了就丢弃（会在scan时重新扫到）
+				select {
+				case p.keyChan <- key:
+					p.taskLog.Debug("Key returned to channel", map[string]interface{}{
+						"worker_id": info.ID,
+						"key":       key,
+					})
+				default:
+					// 通道满了，这个key会丢失，但scan会重新扫描到
+					p.taskLog.Warn("Could not return key to channel (full)", map[string]interface{}{
+						"worker_id": info.ID,
+						"key":       key,
+					})
+				}
+				return
+			}
+			
+			// 标记正在处理
+			atomic.StoreInt32(&info.IsProcessing, 1)
+			info.ProcessingKey = key
+			
+			// 处理Key
+			p.processKey(info.ID, key)
+			
+			// 标记处理完成
+			info.ProcessingKey = ""
+			atomic.StoreInt32(&info.IsProcessing, 0)
+			
+			// 处理完成后再次检查是否需要停止
+			if shouldStop {
+				p.taskLog.Info("Worker completed current key and stopping", map[string]interface{}{
+					"worker_id":    info.ID,
+					"completed_key": key,
+				})
+				return
+			}
+			
+		case <-time.After(100 * time.Millisecond):
+			// 超时，继续循环检查停止信号
+			continue
+		}
+	}
+}
+
+// processKey 处理单个Key的迁移
+func (p *DynamicWorkerPool) processKey(workerID int, key string) {
+	// 检查任务状态
+	tasksMu.RLock()
+	status := p.task.Status
+	tasksMu.RUnlock()
+	if status != "running" {
+		return
+	}
+
+	// 检查是否已处理
+	if _, loaded := p.processedKeys.LoadOrStore(key, true); loaded {
+		return
+	}
+
+	// 源端限速（读取操作）
+	if rl := p.GetRateLimiter(); rl != nil {
+		rl.Wait()
+	}
+
+	// 检查Key是否匹配过滤规则
+	if !matchKeyFilter(key, p.task.Options) {
+		atomic.AddInt64(p.filteredCount, 1)
+		return
+	}
+
+	// 迁移Key（带重试机制）
+	var migrated bool
+	var bytes int64
+	var reason string
+	maxRetries, fullIntervalMs, _ := getRetryConfig(p.task.Options)
+	
+	for retry := 0; retry < maxRetries; retry++ {
+		// 目标端限速（写入操作）- 在每次重试前都进行限速
+		if tl := p.GetTargetRateLimiter(); tl != nil {
+			tl.Wait()
+		}
+		
+		migrated, bytes, reason = migrateKeyWithPolicy(p.ctx, p.sourceClient, p.targetClient, key, p.conflictPolicy)
+		if migrated || reason == "skipped" || reason == "filtered" || reason == "" {
+			break
+		}
+		if retry < maxRetries-1 {
+			time.Sleep(time.Duration((retry+1)*fullIntervalMs) * time.Millisecond)
+		}
+	}
+
+	if migrated {
+		atomic.AddInt64(p.migratedCount, 1)
+		atomic.AddInt64(p.migratedBytes, bytes)
+	} else if reason == "skipped" {
+		atomic.AddInt64(p.skippedCount, 1)
+	} else if reason == "filtered" {
+		atomic.AddInt64(p.filteredCount, 1)
+	} else {
+		atomic.AddInt64(p.failedCount, 1)
+		addErrorKey(p.task.ID, key, "string", "failed", reason+" (after "+fmt.Sprintf("%d", maxRetries)+" retries)")
+	}
+}
+
+// AdjustWorkers 调整Worker数量到目标值
+func (p *DynamicWorkerPool) AdjustWorkers() {
+	target := int(atomic.LoadInt32(&p.targetWorkers))
+	current := int(atomic.LoadInt32(&p.activeWorkers))
+	
+	if target > current {
+		// 需要增加Worker
+		toAdd := target - current
+		for i := 0; i < toAdd; i++ {
+			p.addWorker()
+		}
+		p.taskLog.Info("Workers increased", map[string]interface{}{
+			"from":  current,
+			"to":    target,
+			"added": toAdd,
+		})
+	} else if target < current {
+		// 需要减少Worker（智能选择：优先空闲，其次LIFO）
+		toRemove := current - target
+		for i := 0; i < toRemove; i++ {
+			p.removeWorkerSmart()
+		}
+		p.taskLog.Info("Workers decreased (smart selection)", map[string]interface{}{
+			"from":    current,
+			"to":      target,
+			"removed": toRemove,
+		})
+	}
+}
+
+// Wait 等待所有Worker完成
+func (p *DynamicWorkerPool) Wait() {
+	p.wg.Wait()
+}
+
+// StopAll 停止所有Worker
+func (p *DynamicWorkerPool) StopAll() {
+	p.mu.Lock()
+	workers := make([]*WorkerInfo, len(p.workers))
+	copy(workers, p.workers)
+	p.workers = p.workers[:0]
+	p.mu.Unlock()
+	
+	// 并行发送停止信号
+	for _, w := range workers {
+		close(w.StopChan)
+	}
+	
+	// 等待所有Worker确认停止
+	for _, w := range workers {
+		select {
+		case <-w.StoppedChan:
+		case <-time.After(30 * time.Second):
+			p.taskLog.Warn("Worker stop timeout during StopAll", map[string]interface{}{
+				"worker_id": w.ID,
+			})
+		}
+	}
+}
+
+// GetWorkerStatus 获取所有Worker的状态（用于监控）
+func (p *DynamicWorkerPool) GetWorkerStatus() []map[string]interface{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	
+	status := make([]map[string]interface{}, len(p.workers))
+	for i, w := range p.workers {
+		status[i] = map[string]interface{}{
+			"id":            w.ID,
+			"created_at":    w.CreatedAt.Format("2006-01-02 15:04:05"),
+			"is_processing": atomic.LoadInt32(&w.IsProcessing) == 1,
+			"current_key":   w.ProcessingKey,
+		}
+	}
+	return status
+}
+
+// doFullMigration 执行全量迁移（并行Worker模式 - 支持动态调整）
 func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient redis.UniversalClient, sourceIsCluster, targetIsCluster bool, taskLog *logger.TaskLogger) {
 	// 获取配置参数
 	batchSize := int64(1000)
 	workerCount := 4
-	var rateLimiter *RateLimiter
+	var sourceLimiter *RateLimiter
+	var targetLimiter *RateLimiter
 
 	if task.Options != nil {
 		if task.Options.ScanBatchSize > 0 {
@@ -1279,9 +1841,13 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 		if task.Options.WorkerCount > 0 {
 			workerCount = task.Options.WorkerCount
 		}
-		// 初始化限速器
+		// 初始化源端限速器
 		if task.Options.RateLimit != nil && task.Options.RateLimit.SourceQPS > 0 {
-			rateLimiter = NewRateLimiter(task.Options.RateLimit.SourceQPS)
+			sourceLimiter = NewRateLimiter(task.Options.RateLimit.SourceQPS)
+		}
+		// 初始化目标端限速器
+		if task.Options.RateLimit != nil && task.Options.RateLimit.TargetQPS > 0 {
+			targetLimiter = NewRateLimiter(task.Options.RateLimit.TargetQPS)
 		}
 	}
 
@@ -1291,10 +1857,20 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 		conflictPolicy = task.Options.ConflictPolicy
 	}
 
-	taskLog.Info("Starting parallel migration", map[string]interface{}{
+	// 获取QPS配置用于日志
+	sourceQPS := 0
+	targetQPS := 0
+	if task.Options != nil && task.Options.RateLimit != nil {
+		sourceQPS = task.Options.RateLimit.SourceQPS
+		targetQPS = task.Options.RateLimit.TargetQPS
+	}
+
+	taskLog.Info("Starting parallel migration with dynamic worker pool", map[string]interface{}{
 		"worker_count": workerCount,
 		"batch_size":   batchSize,
 		"policy":       conflictPolicy,
+		"source_qps":   sourceQPS,
+		"target_qps":   targetQPS,
 	})
 
 	// 统计计数器（使用原子操作）
@@ -1310,74 +1886,23 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 	// 用于追踪已处理的key（避免重复处理）
 	processedKeys := sync.Map{}
 
-	// 创建Key通道
+	// 创建Key通道（缓冲区大小动态调整）
 	keyChan := make(chan string, workerCount*100)
-	var wg sync.WaitGroup
 
-	// 启动Worker协程池
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for key := range keyChan {
-				// 检查任务状态
-				tasksMu.RLock()
-				status := task.Status
-				tasksMu.RUnlock()
-				if status != "running" {
-					continue
-				}
+	// 创建动态Worker池
+	workerPool := NewDynamicWorkerPool(ctx, task, keyChan, taskLog,
+		sourceClient, targetClient, conflictPolicy, sourceLimiter, targetLimiter,
+		&processedKeys, &migratedCount, &migratedBytes, &failedCount, &skippedCount, &filteredCount)
+	
+	// 启动初始Worker
+	workerPool.Start(workerCount)
+	
+	// 注册Worker池到任务（用于动态调整）
+	tasksMu.Lock()
+	task.workerPool = workerPool
+	tasksMu.Unlock()
 
-				// 检查是否已处理
-				if _, loaded := processedKeys.LoadOrStore(key, true); loaded {
-					continue
-				}
-
-				// 限速
-				if rateLimiter != nil {
-					rateLimiter.Wait()
-				}
-
-				// 检查Key是否匹配过滤规则
-				if !matchKeyFilter(key, task.Options) {
-					atomic.AddInt64(&filteredCount, 1)
-					continue
-				}
-
-				// 迁移Key（带重试机制）
-				var migrated bool
-				var bytes int64
-				var reason string
-				maxRetries, fullIntervalMs, _ := getRetryConfig(task.Options)
-				
-				for retry := 0; retry < maxRetries; retry++ {
-					migrated, bytes, reason = migrateKeyWithPolicy(ctx, sourceClient, targetClient, key, conflictPolicy)
-					if migrated || reason == "skipped" || reason == "filtered" || reason == "" {
-						// 成功、被跳过、被过滤、或无错误，退出重试
-						break
-					}
-					// 网络错误等临时性错误，等待后重试
-					if retry < maxRetries-1 {
-						time.Sleep(time.Duration((retry+1)*fullIntervalMs) * time.Millisecond) // 退避
-					}
-				}
-
-				if migrated {
-					atomic.AddInt64(&migratedCount, 1)
-					atomic.AddInt64(&migratedBytes, bytes)
-				} else if reason == "skipped" {
-					atomic.AddInt64(&skippedCount, 1)
-				} else if reason == "filtered" {
-					atomic.AddInt64(&filteredCount, 1)
-				} else {
-					atomic.AddInt64(&failedCount, 1)
-					addErrorKey(task.ID, key, "string", "failed", reason+" (after "+fmt.Sprintf("%d", maxRetries)+" retries)")
-				}
-			}
-		}(i)
-	}
-
-	// 进度更新协程
+	// 进度更新协程（包含Worker动态调整检查）
 	stopProgress := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
@@ -1392,6 +1917,34 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 				fc := atomic.LoadInt64(&failedCount)
 				sc := atomic.LoadInt64(&skippedCount)
 				ftc := atomic.LoadInt64(&filteredCount)
+				
+				// 检查是否需要动态调整配置
+				tasksMu.RLock()
+				targetWorkerCount := 4
+				targetSourceQPS := 0
+				targetTargetQPS := 0
+				if task.Options != nil {
+					if task.Options.WorkerCount > 0 {
+						targetWorkerCount = task.Options.WorkerCount
+					}
+					if task.Options.RateLimit != nil {
+						targetSourceQPS = task.Options.RateLimit.SourceQPS
+						targetTargetQPS = task.Options.RateLimit.TargetQPS
+					}
+				}
+				tasksMu.RUnlock()
+				
+				// 动态调整Worker
+				workerPool.SetWorkerCount(targetWorkerCount)
+				workerPool.AdjustWorkers()
+				
+				// 动态调整源端QPS限速器
+				workerPool.UpdateRateLimiter(targetSourceQPS)
+				
+				// 动态调整目标端QPS限速器
+				workerPool.UpdateTargetRateLimiter(targetTargetQPS)
+				
+				currentWorkers := workerPool.GetActiveWorkerCount()
 
 				tasksMu.Lock()
 				task.KeysMigrated = mc
@@ -1399,6 +1952,7 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 				task.KeysFailed = fc
 				task.KeysSkipped = sc
 				task.KeysFiltered = ftc
+				task.ActiveWorkers = currentWorkers  // 更新当前活跃Worker数
 				if task.KeysTotal > 0 {
 					task.Progress = float64(mc+sc+ftc) / float64(task.KeysTotal) * 100
 					if task.Progress > 100 {
@@ -1416,13 +1970,14 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 				lastLogMu.Lock()
 				if time.Since(lastLogTime) > 10*time.Second {
 					taskLog.Info("Migration progress", map[string]interface{}{
-						"progress":      fmt.Sprintf("%.1f%%", task.Progress),
-						"migrated_keys": mc,
-						"failed_keys":   fc,
-						"skipped_keys":  sc,
-						"filtered_keys": ftc,
-						"speed":         task.Speed,
-						"workers":       workerCount,
+						"progress":       fmt.Sprintf("%.1f%%", task.Progress),
+						"migrated_keys":  mc,
+						"failed_keys":    fc,
+						"skipped_keys":   sc,
+						"filtered_keys":  ftc,
+						"speed":          task.Speed,
+						"active_workers": currentWorkers,
+						"target_workers": targetWorkerCount,
 					})
 					lastLogTime = time.Now()
 				}
@@ -1432,6 +1987,16 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 	}()
 
 	// SCAN并分发Key到Worker
+	// 辅助函数：动态获取批次大小
+	getBatchSize := func() int64 {
+		tasksMu.RLock()
+		defer tasksMu.RUnlock()
+		if task.Options != nil && task.Options.ScanBatchSize > 0 {
+			return int64(task.Options.ScanBatchSize)
+		}
+		return 1000
+	}
+	
 	if sourceIsCluster {
 		// 集群模式：并行遍历所有master节点
 		clusterClient := sourceClient.(*redis.ClusterClient)
@@ -1450,7 +2015,9 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 						return
 					}
 
-					keys, newCursor, err := nodeClient.Scan(ctx, cursor, "*", batchSize).Result()
+					// 动态获取批次大小
+					currentBatchSize := getBatchSize()
+					keys, newCursor, err := nodeClient.Scan(ctx, cursor, "*", currentBatchSize).Result()
 					if err != nil {
 						taskLog.Warn("SCAN failed on node", map[string]interface{}{"error": err.Error()})
 						time.Sleep(time.Second)
@@ -1488,7 +2055,9 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 				break
 			}
 
-			keys, newCursor, err := sourceClient.Scan(ctx, cursor, "*", batchSize).Result()
+			// 动态获取批次大小
+			currentBatchSize := getBatchSize()
+			keys, newCursor, err := sourceClient.Scan(ctx, cursor, "*", currentBatchSize).Result()
 			if err != nil {
 				taskLog.Error("SCAN failed", map[string]interface{}{"error": err.Error()})
 				time.Sleep(time.Second)
@@ -1514,8 +2083,13 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 
 	// 关闭通道，等待所有Worker完成
 	close(keyChan)
-	wg.Wait()
+	workerPool.Wait()
 	close(stopProgress)
+	
+	// 清理Worker池引用
+	tasksMu.Lock()
+	task.workerPool = nil
+	tasksMu.Unlock()
 
 	// 最终更新统计
 	mc := atomic.LoadInt64(&migratedCount)
@@ -1554,6 +2128,7 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 
 // RateLimiter 简单的限速器
 type RateLimiter struct {
+	qps      int                // QPS值（用于比较是否需要更新）
 	ticker   *time.Ticker
 	tokens   chan struct{}
 	stopChan chan struct{}
@@ -1570,6 +2145,7 @@ func NewRateLimiter(qps int) *RateLimiter {
 	}
 
 	rl := &RateLimiter{
+		qps:      qps,
 		ticker:   time.NewTicker(interval),
 		tokens:   make(chan struct{}, qps),
 		stopChan: make(chan struct{}),

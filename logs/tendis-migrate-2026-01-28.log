@@ -1,0 +1,8 @@
+[2026-01-28 18:49:48.202] [INFO] [logger.go:453] 🚀 Tendis Migration Tool starting {"pid":"1","port":8088,"version":"1.0.0"}
+[2026-01-28 18:49:48.202] [INFO] [logger.go:453] System initialized {"mode":"production"}
+[2026-01-28 18:49:48.202] [INFO] [logger.go:453] Server listening on http://localhost:8088
+[2026-01-28 18:49:48.203] [FATAL] [logger.go:465] Server failed to start {"error":"listen tcp :8088: bind: address already in use"}
+[2026-01-28 18:51:34.128] [INFO] [logger.go:453] 🚀 Tendis Migration Tool starting {"pid":"1","port":8088,"version":"1.0.0"}
+[2026-01-28 18:51:34.129] [INFO] [logger.go:453] System initialized {"mode":"production"}
+[2026-01-28 18:51:34.129] [INFO] [logger.go:453] Server listening on http://localhost:8088
+[2026-01-28 18:51:34.129] [FATAL] [logger.go:465] Server failed to start {"error":"listen tcp :8088: bind: address already in use"}

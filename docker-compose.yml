@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  tendis-migrate:
+    build: .
+    container_name: tendis-migrate
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data          # 持久化数据
+      - ./config:/app/config      # 配置文件
+    environment:
+      - GIN_MODE=release
+      - DATA_DIR=/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 开发模式 - 分离前后端
+  backend-dev:
+    image: golang:1.21-alpine
+    container_name: tendis-migrate-backend
+    working_dir: /app
+    volumes:
+      - .:/app
+      - go-modules:/go/pkg/mod
+    ports:
+      - "8080:8080"
+    command: sh -c "go mod download && go run cmd/server/main.go"
+    environment:
+      - DATA_DIR=/app/data
+    profiles:
+      - dev
+
+  frontend-dev:
+    image: node:18-alpine
+    container_name: tendis-migrate-frontend
+    working_dir: /app/web
+    volumes:
+      - ./web:/app/web
+      - node-modules:/app/web/node_modules
+    ports:
+      - "3000:3000"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    profiles:
+      - dev
+
+volumes:
+  go-modules:
+  node-modules:

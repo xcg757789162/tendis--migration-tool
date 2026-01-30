@@ -1,0 +1,45 @@
+Tendis Migration Tool 安装说明
+================================
+
+文件说明:
+  tendis-migrate  - 主程序
+  run.sh          - 启动脚本
+  stop.sh         - 停止脚本
+  web/dist/       - 前端静态文件
+  logs/           - 日志目录
+  data/           - 数据目录（自动创建）
+
+快速开始:
+  1. 解压文件
+     tar -zxvf tendis-migrate-linux-xxx.tar.gz
+
+  2. 启动服务
+     ./run.sh
+
+  3. 访问 Web 界面
+     http://localhost:8080
+
+  4. 停止服务
+     ./stop.sh
+
+配置选项 (环境变量):
+  PORT=8080       - 服务端口（默认 8080）
+  DATA_DIR=./data - 数据存储目录
+  WORKERS=4       - Worker 数量
+
+示例:
+  PORT=9090 ./run.sh   # 使用 9090 端口启动
+
+日志位置:
+  logs/tendis-migrate.log      - 应用日志
+  logs/tendis-migrate-*.log    - 历史日志
+
+常见问题:
+  Q: 启动失败，提示端口被占用
+  A: 修改 PORT 环境变量或停止占用端口的进程
+
+  Q: 无法访问 Web 界面
+  A: 检查防火墙设置，确保端口开放
+
+技术支持:
+  查看日志文件获取详细错误信息

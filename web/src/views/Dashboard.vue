@@ -8,7 +8,7 @@
     
     <!-- 统计卡片 -->
     <div class="stats-grid">
-      <div class="stat-card">
+      <div class="stat-card clickable" @click="goToTasks('all')">
         <div class="stat-icon" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
           <el-icon :size="24"><Tickets /></el-icon>
         </div>
@@ -18,7 +18,7 @@
         </div>
       </div>
       
-      <div class="stat-card">
+      <div class="stat-card clickable" @click="goToTasks('running')">
         <div class="stat-icon" style="background: linear-gradient(135deg, #10b981 0%, #34d399 100%);">
           <el-icon :size="24"><VideoPlay /></el-icon>
         </div>
@@ -28,7 +28,7 @@
         </div>
       </div>
       
-      <div class="stat-card">
+      <div class="stat-card clickable" @click="goToTasks('paused')">
         <div class="stat-icon" style="background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%);">
           <el-icon :size="24"><VideoPause /></el-icon>
         </div>
@@ -38,7 +38,7 @@
         </div>
       </div>
       
-      <div class="stat-card">
+      <div class="stat-card clickable" @click="goToTasks('completed')">
         <div class="stat-icon" style="background: linear-gradient(135deg, #2563eb 0%, #06b6d4 100%);">
           <el-icon :size="24"><CircleCheck /></el-icon>
         </div>
@@ -147,8 +147,11 @@
 
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
 import api from '@/api'
 import { ElMessage } from 'element-plus'
+
+const router = useRouter()
 
 const stats = ref({
   totalTasks: 0,
@@ -188,6 +191,14 @@ const pauseTask = async (id) => {
     fetchData()
   } catch (err) {
     ElMessage.error('暂停失败')
+  }
+}
+
+const goToTasks = (status) => {
+  if (status === 'all') {
+    router.push('/tasks')
+  } else {
+    router.push({ path: '/tasks', query: { status } })
   }
 }
 
@@ -254,6 +265,10 @@ onUnmounted(() => {
   box-shadow: var(--shadow-card);
   border: 1px solid var(--border-light);
   transition: all 0.3s ease;
+  
+  &.clickable {
+    cursor: pointer;
+  }
   
   &:hover {
     transform: translateY(-4px);

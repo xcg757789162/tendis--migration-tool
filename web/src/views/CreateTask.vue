@@ -474,6 +474,51 @@
                 </el-col>
               </el-row>
             </div>
+            
+            <!-- 重试配置 -->
+            <div class="retry-config-section">
+              <h4>重试配置</h4>
+              
+              <el-row :gutter="24">
+                <el-col :span="8">
+                  <el-form-item label="最大重试次数">
+                    <el-input-number 
+                      v-model="form.options.retry_config.max_retries" 
+                      :min="0" 
+                      :max="10"
+                      style="width: 100%"
+                    />
+                    <div class="form-tip">迁移失败时的重试次数，0表示不重试</div>
+                  </el-form-item>
+                </el-col>
+                
+                <el-col :span="8">
+                  <el-form-item label="全量重试间隔(ms)">
+                    <el-input-number 
+                      v-model="form.options.retry_config.full_retry_interval_ms" 
+                      :min="50" 
+                      :max="5000"
+                      :step="50"
+                      style="width: 100%"
+                    />
+                    <div class="form-tip">全量迁移阶段重试间隔基数</div>
+                  </el-form-item>
+                </el-col>
+                
+                <el-col :span="8">
+                  <el-form-item label="增量重试间隔(ms)">
+                    <el-input-number 
+                      v-model="form.options.retry_config.incr_retry_interval_ms" 
+                      :min="100" 
+                      :max="10000"
+                      :step="100"
+                      style="width: 100%"
+                    />
+                    <div class="form-tip">增量同步阶段重试间隔基数</div>
+                  </el-form-item>
+                </el-col>
+              </el-row>
+            </div>
           </div>
         </div>
         
@@ -523,24 +568,28 @@
     </el-dialog>
 
     <!-- 加载模板对话框 -->
-    <el-dialog v-model="loadTemplateDialog" title="从模板加载" width="700px">
+    <el-dialog v-model="loadTemplateDialog" title="从模板加载" width="800px">
       <el-table :data="templateList" v-loading="loadingTemplates" style="width: 100%" max-height="400">
-        <el-table-column prop="name" label="模板名称" width="180" />
-        <el-table-column prop="description" label="描述" show-overflow-tooltip />
-        <el-table-column prop="migration_mode" label="迁移模式" width="120">
+        <el-table-column prop="name" label="模板名称" min-width="120" />
+        <el-table-column prop="description" label="描述" min-width="200" show-overflow-tooltip />
+        <el-table-column prop="migration_mode" label="迁移模式" width="100" align="center">
           <template #default="{ row }">
-            {{ row.migration_mode === 'full_only' ? '全量' : '全量+增量' }}
+            <el-tag :type="row.migration_mode === 'full_only' ? 'info' : 'success'" size="small">
+              {{ row.migration_mode === 'full_only' ? '全量' : '全量+增量' }}
+            </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="created_at" label="创建时间" width="160">
+        <el-table-column prop="created_at" label="创建时间" width="170" align="center">
           <template #default="{ row }">
             {{ formatTime(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="140" align="center" fixed="right">
           <template #default="{ row }">
-            <el-button type="primary" text @click="loadFromTemplate(row)">加载</el-button>
-            <el-button type="danger" text @click="deleteTemplateConfirm(row)">删除</el-button>
+            <el-button type="primary" size="small" @click="loadFromTemplate(row)">
+              <el-icon><Check /></el-icon> 加载
+            </el-button>
+            <el-button type="danger" size="small" text @click="deleteTemplateConfirm(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -615,6 +664,11 @@ const form = reactive({
       pipeline_size: 100,
       pipeline_timeout_ms: 5000,
       max_bandwidth_mbps: 0
+    },
+    retry_config: {
+      max_retries: 3,
+      full_retry_interval_ms: 100,
+      incr_retry_interval_ms: 1000
     }
   }
 })
@@ -717,6 +771,9 @@ const loadFromTemplate = (template) => {
     }
     if (template.options.rate_limit) {
       form.options.rate_limit = { ...template.options.rate_limit }
+    }
+    if (template.options.retry_config) {
+      form.options.retry_config = { ...template.options.retry_config }
     }
   }
   
@@ -1085,6 +1142,12 @@ const submitForm = async () => {
 }
 
 .rate-limit-section {
+  margin-top: 24px;
+  padding-top: 24px;
+  border-top: 1px dashed var(--border-light);
+}
+
+.retry-config-section {
   margin-top: 24px;
   padding-top: 24px;
   border-top: 1px dashed var(--border-light);

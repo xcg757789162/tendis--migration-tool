@@ -130,13 +130,14 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 
 const router = useRouter()
+const route = useRoute()
 
 const tasks = ref([])
 const total = ref(0)
@@ -145,6 +146,12 @@ const pageSize = ref(20)
 const searchText = ref('')
 const statusFilter = ref('')
 let refreshTimer = null
+
+// 监听路由参数变化
+watch(() => route.query.status, (newStatus) => {
+  statusFilter.value = newStatus || ''
+  fetchTasks()
+}, { immediate: true })
 
 const filteredTasks = computed(() => {
   let result = tasks.value

@@ -53,6 +53,11 @@ export default {
     return api.post(`/tasks/${id}/resume`)
   },
   
+  // 更新任务配置（运行时调整）
+  updateTaskConfig(id, data) {
+    return api.put(`/tasks/${id}/config`, data)
+  },
+  
   getProgress(id) {
     return api.get(`/tasks/${id}/progress`)
   },

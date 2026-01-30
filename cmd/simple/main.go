@@ -63,15 +63,23 @@ type TaskTemplate struct {
 
 // TaskOptions 任务配置选项
 type TaskOptions struct {
-	WorkerCount       int        `json:"worker_count"`
-	ScanBatchSize     int        `json:"scan_batch_size"`
-	ConflictPolicy    string     `json:"conflict_policy"`     // skip, replace, error, skip_full_only
-	LargeKeyThreshold int64      `json:"large_key_threshold"`
-	EnableCompression bool       `json:"enable_compression"`
-	SkipFullSync      bool       `json:"skip_full_sync"`
-	SkipIncremental   bool       `json:"skip_incremental"`
-	KeyFilter         *KeyFilter `json:"key_filter,omitempty"`
-	RateLimit         *RateLimit `json:"rate_limit,omitempty"`
+	WorkerCount          int          `json:"worker_count"`
+	ScanBatchSize        int          `json:"scan_batch_size"`
+	ConflictPolicy       string       `json:"conflict_policy"`     // skip, replace, error, skip_full_only
+	LargeKeyThreshold    int64        `json:"large_key_threshold"`
+	EnableCompression    bool         `json:"enable_compression"`
+	SkipFullSync         bool         `json:"skip_full_sync"`
+	SkipIncremental      bool         `json:"skip_incremental"`
+	KeyFilter            *KeyFilter   `json:"key_filter,omitempty"`
+	RateLimit            *RateLimit   `json:"rate_limit,omitempty"`
+	RetryConfig          *RetryConfig `json:"retry_config,omitempty"`
+}
+
+// RetryConfig 重试配置
+type RetryConfig struct {
+	MaxRetries         int `json:"max_retries"`          // 最大重试次数，默认3
+	FullRetryIntervalMs  int `json:"full_retry_interval_ms"`   // 全量迁移重试间隔基数(毫秒)，默认100
+	IncrRetryIntervalMs  int `json:"incr_retry_interval_ms"`   // 增量同步重试间隔基数(毫秒)，默认1000
 }
 
 // RateLimit 限速配置
@@ -128,6 +136,27 @@ type ErrorKey struct {
 	Reason    string `json:"reason"`
 	Detail    string `json:"detail"`
 	Timestamp string `json:"timestamp"`
+}
+
+// getRetryConfig 获取重试配置，返回默认值如果未配置
+func getRetryConfig(opts *TaskOptions) (maxRetries int, fullIntervalMs int, incrIntervalMs int) {
+	// 默认值
+	maxRetries = 3
+	fullIntervalMs = 100
+	incrIntervalMs = 1000
+
+	if opts != nil && opts.RetryConfig != nil {
+		if opts.RetryConfig.MaxRetries > 0 {
+			maxRetries = opts.RetryConfig.MaxRetries
+		}
+		if opts.RetryConfig.FullRetryIntervalMs > 0 {
+			fullIntervalMs = opts.RetryConfig.FullRetryIntervalMs
+		}
+		if opts.RetryConfig.IncrRetryIntervalMs > 0 {
+			incrIntervalMs = opts.RetryConfig.IncrRetryIntervalMs
+		}
+	}
+	return
 }
 
 var (
@@ -271,8 +300,43 @@ func jsonResponse(w http.ResponseWriter, data interface{}) {
 }
 
 func initDemoData() {
-	// 不再初始化demo数据，让用户创建真实任务
-	logger.Info("System initialized", map[string]interface{}{"mode": "production"})
+	// 预置模板任务
+	now := time.Now().Format("2006-01-02 15:04:05")
+	templates["template-default"] = &TaskTemplate{
+		ID:            "template-default",
+		Name:          "Template",
+		Description:   "预置迁移模板：源端到目标端的全量+增量迁移",
+		SourceCluster: "10.248.37.11:8901,10.248.37.11:8902,10.248.37.11:8903",
+		TargetCluster: "10.31.165.39:8901,10.31.165.39:8902,10.31.165.39:8903",
+		MigrationMode: "full_and_incremental",
+		Options: &TaskOptions{
+			WorkerCount:       8,
+			ScanBatchSize:     1000,
+			ConflictPolicy:    "skip",
+			LargeKeyThreshold: 10485760, // 10MB
+			KeyFilter: &KeyFilter{
+				Mode:     "prefix",
+				Prefixes: []string{"testkey"},
+			},
+			RateLimit: &RateLimit{
+				SourceQPS:         0,
+				TargetQPS:         0,
+				SourceConnections: 50,
+				TargetConnections: 50,
+			},
+			RetryConfig: &RetryConfig{
+				MaxRetries:          3,
+				FullRetryIntervalMs: 100,
+				IncrRetryIntervalMs: 1000,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	logger.Info("System initialized", map[string]interface{}{
+		"mode":      "production",
+		"templates": len(templates),
+	})
 }
 
 // ==================== 日志 API ====================
@@ -680,6 +744,8 @@ func taskHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogg
 		getTaskHandler(w, r, id, log)
 	case action == "" && r.Method == "DELETE":
 		deleteTaskHandler(w, r, id, log, taskLog)
+	case action == "config" && r.Method == "PUT":
+		updateTaskConfigHandler(w, r, id, log, taskLog)
 	case action == "start" && r.Method == "POST":
 		startTaskHandler(w, r, id, log, taskLog)
 	case action == "pause" && r.Method == "POST":
@@ -721,6 +787,34 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 		phase = "full"
 	}
 
+	// 构建配置信息
+	configData := map[string]interface{}{
+		"worker_count":       8,
+		"scan_batch_size":    1000,
+		"conflict_policy":    "skip",
+		"large_key_threshold": 10485760,
+		"rate_limit": map[string]interface{}{
+			"source_qps":         0,
+			"target_qps":         0,
+			"source_connections": 50,
+			"target_connections": 50,
+		},
+	}
+	if task.Options != nil {
+		configData["worker_count"] = task.Options.WorkerCount
+		configData["scan_batch_size"] = task.Options.ScanBatchSize
+		configData["conflict_policy"] = task.Options.ConflictPolicy
+		configData["large_key_threshold"] = task.Options.LargeKeyThreshold
+		if task.Options.RateLimit != nil {
+			configData["rate_limit"] = map[string]interface{}{
+				"source_qps":         task.Options.RateLimit.SourceQPS,
+				"target_qps":         task.Options.RateLimit.TargetQPS,
+				"source_connections": task.Options.RateLimit.SourceConnections,
+				"target_connections": task.Options.RateLimit.TargetConnections,
+			}
+		}
+	}
+
 	jsonResponse(w, map[string]interface{}{
 		"code":    0,
 		"message": "success",
@@ -736,6 +830,8 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 			"started_at":     task.StartedAt,
 			"full_start_at":  task.FullStartAt,
 			"incr_start_at":  task.IncrStartAt,
+			"keys_filtered":  task.KeysFiltered,
+			"config":         configData,
 			"progress": map[string]interface{}{
 				"percentage":     task.Progress,
 				"total_keys":     task.KeysTotal,
@@ -808,6 +904,78 @@ func deleteTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *l
 	taskLog.Info("Task deleted")
 	
 	jsonResponse(w, map[string]interface{}{"code": 0, "message": "success"})
+}
+
+// updateTaskConfigHandler 动态调整任务配置（优雅调整）
+func updateTaskConfigHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger, taskLog *logger.TaskLogger) {
+	tasksMu.Lock()
+	task, ok := tasks[id]
+	tasksMu.Unlock()
+
+	if !ok {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Task not found"})
+		return
+	}
+
+	// 解析请求体
+	var req struct {
+		WorkerCount    int `json:"worker_count"`
+		ScanBatchSize  int `json:"scan_batch_size"`
+		RateLimit      *RateLimit `json:"rate_limit"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "Invalid request body"})
+		return
+	}
+
+	// 更新配置
+	tasksMu.Lock()
+	if task.Options == nil {
+		task.Options = &TaskOptions{}
+	}
+	
+	oldWorkerCount := task.Options.WorkerCount
+	oldScanBatchSize := task.Options.ScanBatchSize
+	
+	if req.WorkerCount > 0 {
+		task.Options.WorkerCount = req.WorkerCount
+	}
+	if req.ScanBatchSize > 0 {
+		task.Options.ScanBatchSize = req.ScanBatchSize
+	}
+	if req.RateLimit != nil {
+		if task.Options.RateLimit == nil {
+			task.Options.RateLimit = &RateLimit{}
+		}
+		task.Options.RateLimit.SourceQPS = req.RateLimit.SourceQPS
+		task.Options.RateLimit.TargetQPS = req.RateLimit.TargetQPS
+	}
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	tasksMu.Unlock()
+
+	log.Info("Task config updated", map[string]interface{}{
+		"task_id":            id,
+		"old_worker_count":   oldWorkerCount,
+		"new_worker_count":   task.Options.WorkerCount,
+		"old_scan_batch":     oldScanBatchSize,
+		"new_scan_batch":     task.Options.ScanBatchSize,
+	})
+	taskLog.Info("Config updated (graceful)", map[string]interface{}{
+		"worker_count":    task.Options.WorkerCount,
+		"scan_batch_size": task.Options.ScanBatchSize,
+		"source_qps":      task.Options.RateLimit.SourceQPS,
+		"target_qps":      task.Options.RateLimit.TargetQPS,
+	})
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "Config updated, will take effect after current batch completes",
+		"data": map[string]interface{}{
+			"worker_count":    task.Options.WorkerCount,
+			"scan_batch_size": task.Options.ScanBatchSize,
+			"rate_limit":      task.Options.RateLimit,
+		},
+	})
 }
 
 func startTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger, taskLog *logger.TaskLogger) {
@@ -1176,8 +1344,23 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 					continue
 				}
 
-				// 迁移Key
-				migrated, bytes, reason := migrateKeyWithPolicy(ctx, sourceClient, targetClient, key, conflictPolicy)
+				// 迁移Key（带重试机制）
+				var migrated bool
+				var bytes int64
+				var reason string
+				maxRetries, fullIntervalMs, _ := getRetryConfig(task.Options)
+				
+				for retry := 0; retry < maxRetries; retry++ {
+					migrated, bytes, reason = migrateKeyWithPolicy(ctx, sourceClient, targetClient, key, conflictPolicy)
+					if migrated || reason == "skipped" || reason == "filtered" || reason == "" {
+						// 成功、被跳过、被过滤、或无错误，退出重试
+						break
+					}
+					// 网络错误等临时性错误，等待后重试
+					if retry < maxRetries-1 {
+						time.Sleep(time.Duration((retry+1)*fullIntervalMs) * time.Millisecond) // 退避
+					}
+				}
 
 				if migrated {
 					atomic.AddInt64(&migratedCount, 1)
@@ -1188,7 +1371,7 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 					atomic.AddInt64(&filteredCount, 1)
 				} else {
 					atomic.AddInt64(&failedCount, 1)
-					addErrorKey(task.ID, key, "string", "failed", reason)
+					addErrorKey(task.ID, key, "string", "failed", reason+" (after "+fmt.Sprintf("%d", maxRetries)+" retries)")
 				}
 			}
 		}(i)
@@ -1637,8 +1820,28 @@ func doIncrementalSync(ctx context.Context, task *Task, sourceClient, targetClie
 						continue
 					}
 
-					// 发现新key，同步到目标
-					migrated, bytes, reason := migrateKeyWithPolicy(ctx, sourceClient, targetClient, key, "replace")
+					// 发现新key，同步到目标（带重试机制）
+					var migrated bool
+					var bytes int64
+					var reason string
+					maxRetries, _, incrIntervalMs := getRetryConfig(task.Options)
+					
+					for retry := 0; retry < maxRetries; retry++ {
+						migrated, bytes, reason = migrateKeyWithPolicy(ctx, sourceClient, targetClient, key, "replace")
+						if migrated || reason == "skipped" || reason == "" {
+							// 成功、被跳过、或无错误，退出重试
+							break
+						}
+						// 网络错误等临时性错误，等待后重试
+						if retry < maxRetries-1 {
+							taskLog.Debug("Retrying incremental key sync", map[string]interface{}{
+								"key":     key,
+								"retry":   retry + 1,
+								"reason":  reason,
+							})
+							time.Sleep(time.Duration((retry+1)*incrIntervalMs) * time.Millisecond) // 退避
+						}
+					}
 					knownKeys[key] = true
 
 					if migrated {
@@ -1668,11 +1871,12 @@ func doIncrementalSync(ctx context.Context, task *Task, sourceClient, targetClie
 						task.KeysFailed++
 						task.UpdatedAt = time.Now().Format(time.RFC3339)
 						tasksMu.Unlock()
-						taskLog.Warn("Failed to sync incremental key", map[string]interface{}{
-							"key":    key,
-							"reason": reason,
+						taskLog.Warn("Failed to sync incremental key after retries", map[string]interface{}{
+							"key":      key,
+							"reason":   reason,
+							"retries":  maxRetries,
 						})
-						addErrorKey(task.ID, key, "string", "failed", reason+" (incremental)")
+						addErrorKey(task.ID, key, "string", "failed", reason+" (incremental, after "+fmt.Sprintf("%d", maxRetries)+" retries)")
 					}
 				}
 			}

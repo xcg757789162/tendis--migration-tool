@@ -143,24 +143,51 @@
       </div>
       
       <!-- 任务配置 -->
-      <div class="info-card card">
-        <h3><el-icon><Setting /></el-icon> 任务配置</h3>
+      <div class="info-card card config-card">
+        <div class="config-header">
+          <h3><el-icon><Setting /></el-icon> 运行参数</h3>
+          <el-button 
+            v-if="task.status === 'running'" 
+            type="primary" 
+            size="small" 
+            text
+            @click="openConfigDialog"
+          >
+            <el-icon><Edit /></el-icon> 调整参数
+          </el-button>
+        </div>
         <div class="config-info">
           <div class="config-row">
             <span class="label">Worker数量</span>
-            <span class="value">{{ config?.worker_count || 4 }}</span>
+            <span class="value highlight">{{ config?.worker_count || 4 }}</span>
+          </div>
+          <div class="config-row">
+            <span class="label">扫描批次大小</span>
+            <span class="value">{{ config?.scan_batch_size || 1000 }}</span>
+          </div>
+          <div class="config-row">
+            <span class="label">源端QPS限制</span>
+            <span class="value">{{ config?.rate_limit?.source_qps || '不限制' }}</span>
+          </div>
+          <div class="config-row">
+            <span class="label">目标端QPS限制</span>
+            <span class="value">{{ config?.rate_limit?.target_qps || '不限制' }}</span>
+          </div>
+          <div class="config-row">
+            <span class="label">源端连接数</span>
+            <span class="value">{{ config?.rate_limit?.source_connections || 50 }}</span>
+          </div>
+          <div class="config-row">
+            <span class="label">目标端连接数</span>
+            <span class="value">{{ config?.rate_limit?.target_connections || 50 }}</span>
           </div>
           <div class="config-row">
             <span class="label">冲突策略</span>
-            <span class="value">{{ config?.conflict_policy || 'skip_full_only' }}</span>
+            <span class="value">{{ getConflictPolicyText(config?.conflict_policy) }}</span>
           </div>
           <div class="config-row">
             <span class="label">大Key阈值</span>
             <span class="value">{{ formatBytes(config?.large_key_threshold || 10485760) }}</span>
-          </div>
-          <div class="config-row">
-            <span class="label">启用压缩</span>
-            <span class="value">{{ config?.enable_compression ? '是' : '否' }}</span>
           </div>
         </div>
       </div>
@@ -335,10 +362,71 @@
     <el-icon class="loading-icon"><Loading /></el-icon>
     <span>加载中...</span>
   </div>
+  
+  <!-- 参数调整对话框 -->
+  <el-dialog v-model="configDialogVisible" title="调整运行参数" width="500px">
+    <el-alert type="warning" :closable="false" style="margin-bottom: 20px">
+      <template #title>
+        <strong>优雅调整说明</strong>
+      </template>
+      参数调整将在当前批次完成后生效，确保正在迁移的数据完整性。调整期间任务会短暂暂停。
+    </el-alert>
+    
+    <el-form :model="configForm" label-width="120px">
+      <el-form-item label="Worker数量">
+        <el-input-number 
+          v-model="configForm.worker_count" 
+          :min="1" 
+          :max="100"
+          style="width: 100%"
+        />
+        <div class="form-tip">增加Worker可提高速度，但会增加源端负载</div>
+      </el-form-item>
+      
+      <el-form-item label="扫描批次大小">
+        <el-input-number 
+          v-model="configForm.scan_batch_size" 
+          :min="100" 
+          :max="10000"
+          :step="100"
+          style="width: 100%"
+        />
+      </el-form-item>
+      
+      <el-form-item label="源端QPS限制">
+        <el-input-number 
+          v-model="configForm.source_qps" 
+          :min="0" 
+          :max="100000"
+          :step="1000"
+          style="width: 100%"
+        />
+        <div class="form-tip">0 表示不限制</div>
+      </el-form-item>
+      
+      <el-form-item label="目标端QPS限制">
+        <el-input-number 
+          v-model="configForm.target_qps" 
+          :min="0" 
+          :max="100000"
+          :step="1000"
+          style="width: 100%"
+        />
+        <div class="form-tip">0 表示不限制</div>
+      </el-form-item>
+    </el-form>
+    
+    <template #footer>
+      <el-button @click="configDialogVisible = false">取消</el-button>
+      <el-button type="primary" @click="applyConfig" :loading="applyingConfig">
+        应用参数
+      </el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
@@ -358,6 +446,16 @@ const refreshing = ref(false)
 const errorKeys = ref({ total: 0, failed: 0, skipped: 0, large_keys: 0 })
 const errorKeysList = ref([])
 let refreshTimer = null
+
+// 参数调整相关
+const configDialogVisible = ref(false)
+const applyingConfig = ref(false)
+const configForm = reactive({
+  worker_count: 8,
+  scan_batch_size: 1000,
+  source_qps: 0,
+  target_qps: 0
+})
 
 const sourceCluster = computed(() => {
   if (!task.value?.source_cluster) return {}
@@ -596,6 +694,49 @@ const getStatusText = (status) => {
     failed: '失败'
   }
   return map[status] || status
+}
+
+const getConflictPolicyText = (policy) => {
+  const map = {
+    skip: '跳过已存在',
+    replace: '覆盖',
+    error: '报错',
+    skip_full_only: '仅全量跳过'
+  }
+  return map[policy] || policy || 'skip'
+}
+
+// 打开参数调整对话框
+const openConfigDialog = () => {
+  const cfg = config.value || {}
+  configForm.worker_count = cfg.worker_count || 8
+  configForm.scan_batch_size = cfg.scan_batch_size || 1000
+  configForm.source_qps = cfg.rate_limit?.source_qps || 0
+  configForm.target_qps = cfg.rate_limit?.target_qps || 0
+  configDialogVisible.value = true
+}
+
+// 应用参数调整
+const applyConfig = async () => {
+  applyingConfig.value = true
+  try {
+    await api.updateTaskConfig(taskId.value, {
+      worker_count: configForm.worker_count,
+      scan_batch_size: configForm.scan_batch_size,
+      rate_limit: {
+        source_qps: configForm.source_qps,
+        target_qps: configForm.target_qps
+      }
+    })
+    ElMessage.success('参数调整已提交，将在当前批次完成后生效')
+    configDialogVisible.value = false
+    // 延迟刷新任务信息
+    setTimeout(fetchTask, 2000)
+  } catch (err) {
+    ElMessage.error('参数调整失败: ' + (err.message || '未知错误'))
+  } finally {
+    applyingConfig.value = false
+  }
 }
 
 const getPhaseText = (phase) => {

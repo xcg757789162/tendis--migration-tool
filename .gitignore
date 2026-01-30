@@ -1,0 +1,29 @@
+# 打包文件
+*.tar.gz
+*.zip
+
+# 编译产物
+tendis-migrate
+tendis-migrate-package/
+
+# 日志和数据
+logs/
+data/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Node.js
+web/node_modules/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib

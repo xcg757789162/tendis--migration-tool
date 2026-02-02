@@ -196,7 +196,7 @@ func updateTaskProgress(db *storage.SQLiteDB, taskID string) error {
 func checkTaskCompletion(db *storage.SQLiteDB, taskID string) {
 	completed, _ := db.CountSlotsByStatus(taskID, "completed")
 	if completed == 16384 {
-		log.Printf("[Task %s] All slots completed! (16384/16384)\n", taskID)
+		log.Printf("[Task %s] All slots completed! (16384/16384) - Starting incremental sync...\n", taskID)
 
 		// 更新任务状态
 		db.UpdateTask(taskID, map[string]interface{}{

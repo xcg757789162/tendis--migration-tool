@@ -91,6 +91,70 @@ func (s *SQLiteDB) UpdateSlotCheckpoint(taskID string, slot int, cursor string, 
 	return err
 }
 
+// GetSlotCheckpoint 获取 Slot 断点信息
+func (s *SQLiteDB) GetSlotCheckpoint(taskID string, slot int) (string, error) {
+	var cursor string
+	err := s.db.QueryRow(`
+		SELECT last_cursor FROM slot_status 
+		WHERE task_id = ? AND slot = ?
+	`, taskID, slot).Scan(&cursor)
+	
+	if err != nil {
+		return "", err
+	}
+	return cursor, nil
+}
+
+// GetAllPendingSlots 获取所有待处理的 Slot（用于断点恢复）
+func (s *SQLiteDB) GetAllPendingSlots(taskID string) ([]int, error) {
+	rows, err := s.db.Query(`
+		SELECT slot FROM slot_status 
+		WHERE task_id = ? AND status IN ('pending', 'in_progress')
+		ORDER BY slot
+	`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var slots []int
+	for rows.Next() {
+		var slot int
+		if err := rows.Scan(&slot); err != nil {
+			return nil, err
+		}
+		slots = append(slots, slot)
+	}
+
+	return slots, nil
+}
+
+// GetTaskProgress 获取任务进度摘要
+func (s *SQLiteDB) GetTaskProgress(taskID string) (map[string]interface{}, error) {
+	var completed, inProgress, failed, pending int
+	err := s.db.QueryRow(`
+		SELECT 
+			COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
+			COUNT(CASE WHEN status = 'in_progress' THEN 1 END) as in_progress,
+			COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed,
+			COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending
+		FROM slot_status 
+		WHERE task_id = ?
+	`, taskID).Scan(&completed, &inProgress, &failed, &pending)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"completed":   completed,
+		"in_progress": inProgress,
+		"failed":      failed,
+		"pending":     pending,
+		"total":       16384,
+	}, nil
+}
+
 // UpdateSlotStatus 更新 Slot 状态
 func (s *SQLiteDB) UpdateSlotStatus(taskID string, slot int, status string) error {
 	query := `

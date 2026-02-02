@@ -25,8 +25,11 @@ type KeyChange struct {
 	NodeID    string `json:"node_id"`
 }
 
+// ChangeRecord 变更记录（别名，用于兼容）
+type ChangeRecord = KeyChange
+
 // NewLevelDBQueue 创建新的 LevelDB 队列
-func NewLevelDBQueue(basePath string, nodeID string) (*LevelDBQueue, error) {
+func NewLevelDBQueue(basePath string) (*LevelDBQueue, error) {
 	// 打开 LevelDB（优化配置）
 	opts := &opt.Options{
 		WriteBuffer:            32 * 1024 * 1024, // 32MB 写缓冲
@@ -53,7 +56,7 @@ func NewLevelDBQueue(basePath string, nodeID string) (*LevelDBQueue, error) {
 
 	return &LevelDBQueue{
 		db:       db,
-		nodeID:   nodeID,
+		nodeID:   "",
 		basePath: basePath,
 		seqID:    seqID,
 	}, nil
@@ -94,8 +97,20 @@ func (q *LevelDBQueue) EnqueueBatch(changes []*KeyChange) error {
 	return q.db.Write(batch, nil)
 }
 
-// Dequeue 出队（Worker 进程调用）
-func (q *LevelDBQueue) Dequeue(batchSize int) ([]*KeyChange, error) {
+// Dequeue 出队单条记录
+func (q *LevelDBQueue) Dequeue() (*ChangeRecord, error) {
+	changes, err := q.DequeueBatch(1)
+	if err != nil {
+		return nil, err
+	}
+	if len(changes) == 0 {
+		return nil, nil
+	}
+	return changes[0], nil
+}
+
+// DequeueBatch 出队（Worker 进程调用）
+func (q *LevelDBQueue) DequeueBatch(batchSize int) ([]*KeyChange, error) {
 	iter := q.db.NewIterator(nil, nil)
 	defer iter.Release()
 
@@ -184,7 +199,9 @@ func (q *LevelDBQueue) GetStats() map[string]interface{} {
 	stats := make(map[string]interface{})
 
 	// 队列长度
-	stats["count"] = q.Count()
+	count := q.Count()
+	stats["size"] = int64(count)
+	stats["count"] = count
 
 	// LevelDB 内部统计
 	if dbStats, err := q.db.GetProperty("leveldb.stats"); err == nil {

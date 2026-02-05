@@ -1788,6 +1788,23 @@ func createTaskHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 		return
 	}
 
+	// 验证必填字段
+	if req.Name == "" {
+		log.Warn("Task name is required", nil)
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "name is required"})
+		return
+	}
+	if req.SourceCluster.Addrs == nil || len(req.SourceCluster.Addrs) == 0 {
+		log.Warn("Source cluster addrs is required", nil)
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "source_cluster.addrs is required"})
+		return
+	}
+	if req.TargetCluster.Addrs == nil || len(req.TargetCluster.Addrs) == 0 {
+		log.Warn("Target cluster addrs is required", nil)
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "target_cluster.addrs is required"})
+		return
+	}
+
 	mode := req.MigrationMode
 	if mode == "" {
 		mode = "full_and_incremental"
@@ -2004,6 +2021,8 @@ func taskHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogg
 		exportTaskConfigHandler(w, r, id, log)
 	case action == "report" && r.Method == "GET":
 		exportTaskReportHandler(w, r, id, log)
+	case action == "stop" && r.Method == "POST":
+		stopTaskHandler(w, r, id, log, taskLog)
 	case action == "stop-incremental" && r.Method == "POST":
 		stopIncrementalHandler(w, r, id, log, taskLog)
 	case action == "complete" && r.Method == "POST":
@@ -2404,22 +2423,23 @@ func updateTaskConfigHandler(w http.ResponseWriter, r *http.Request, id string, 
 func startTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger, taskLog *logger.TaskLogger) {
 	tasksMu.Lock()
 	task, ok := tasks[id]
-	if ok {
-		task.Status = "running"
-		task.UpdatedAt = time.Now().Format(time.RFC3339)
-		task.StartedAt = time.Now().Format("2006-01-02 15:04:05")
-		go simulateProgress(task)
+	if !ok {
+		tasksMu.Unlock()
+		log.Warn("Task not found for start", map[string]interface{}{"task_id": id})
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Task not found"})
+		return
 	}
+	
+	task.Status = "running"
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	task.StartedAt = time.Now().Format("2006-01-02 15:04:05")
+	go simulateProgress(task)
 	tasksMu.Unlock()
 	
-	if ok {
-		log.Info("Task started", map[string]interface{}{"task_id": id})
-		taskLog.Info("Task started", map[string]interface{}{
-			"keys_total": task.KeysTotal,
-		})
-	} else {
-		log.Warn("Task not found for start", map[string]interface{}{"task_id": id})
-	}
+	log.Info("Task started", map[string]interface{}{"task_id": id})
+	taskLog.Info("Task started", map[string]interface{}{
+		"keys_total": task.KeysTotal,
+	})
 	
 	jsonResponse(w, map[string]interface{}{"code": 0, "message": "success"})
 }
@@ -2427,22 +2447,25 @@ func startTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *lo
 func pauseTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger, taskLog *logger.TaskLogger) {
 	tasksMu.Lock()
 	task, ok := tasks[id]
-	if ok {
-		task.Status = "paused"
-		task.Speed = 0
-		now := time.Now()
-		task.PausedAt = now.Format(time.RFC3339)  // 记录暂停时间
-		task.UpdatedAt = now.Format(time.RFC3339)
+	if !ok {
+		tasksMu.Unlock()
+		log.Warn("Task not found for pause", map[string]interface{}{"task_id": id})
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Task not found"})
+		return
 	}
+	
+	task.Status = "paused"
+	task.Speed = 0
+	now := time.Now()
+	task.PausedAt = now.Format(time.RFC3339)  // 记录暂停时间
+	task.UpdatedAt = now.Format(time.RFC3339)
 	tasksMu.Unlock()
 	
-	if ok {
-		log.Info("Task paused", map[string]interface{}{"task_id": id})
-		taskLog.Info("Task paused", map[string]interface{}{
-			"progress":  task.Progress,
-			"paused_at": task.PausedAt,
-		})
-	}
+	log.Info("Task paused", map[string]interface{}{"task_id": id})
+	taskLog.Info("Task paused", map[string]interface{}{
+		"progress":  task.Progress,
+		"paused_at": task.PausedAt,
+	})
 	
 	jsonResponse(w, map[string]interface{}{"code": 0, "message": "success"})
 }
@@ -8060,6 +8083,46 @@ func systemBackupHandler(w http.ResponseWriter, r *http.Request, log *logger.Req
 }
 
 // stopIncrementalHandler 停止增量同步（任务进入准备完成状态）
+// stopTaskHandler 停止任务（通用停止接口）
+func stopTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger, taskLog *logger.TaskLogger) {
+	tasksMu.Lock()
+	task, ok := tasks[id]
+	if !ok {
+		tasksMu.Unlock()
+		log.Warn("Task not found for stop", map[string]interface{}{"task_id": id})
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Task not found"})
+		return
+	}
+
+	if task.Status != "running" && task.Status != "paused" {
+		tasksMu.Unlock()
+		jsonResponse(w, map[string]interface{}{
+			"code":    400,
+			"message": "Task is not in running or paused state",
+		})
+		return
+	}
+
+	// 设置任务状态为已停止
+	task.Status = "stopped"
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	tasksMu.Unlock()
+
+	taskLog.Info("Task stopped", map[string]interface{}{
+		"task_id": id,
+		"phase":   task.Phase,
+	})
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "Task stopped",
+		"data": map[string]interface{}{
+			"task_id": id,
+			"status":  "stopped",
+		},
+	})
+}
+
 func stopIncrementalHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger, taskLog *logger.TaskLogger) {
 	tasksMu.Lock()
 	task, ok := tasks[id]

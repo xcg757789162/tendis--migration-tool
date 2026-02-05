@@ -25,6 +25,18 @@
             </el-button>
           </template>
         </el-popconfirm>
+        <el-popconfirm
+          title="确定要清理过期日志文件吗？将删除超过保留期限的日志文件。"
+          confirm-button-text="确定清理"
+          cancel-button-text="取消"
+          @confirm="cleanupOldLogs"
+        >
+          <template #reference>
+            <el-button type="warning" plain>
+              <el-icon><Brush /></el-icon>清理旧文件
+            </el-button>
+          </template>
+        </el-popconfirm>
         <el-dropdown @command="handleExport">
           <el-button type="primary">
             <el-icon><Download /></el-icon>导出日志
@@ -426,6 +438,25 @@ const clearAllLogs = async () => {
     refreshLogs()
   } catch (error) {
     ElMessage.error('清除失败: ' + error.message)
+  }
+}
+
+const cleanupOldLogs = async () => {
+  try {
+    const result = await api.cleanupLogs()
+    const beforeFiles = result?.before?.total_files || 0
+    const afterFiles = result?.after?.total_files || 0
+    const removed = beforeFiles - afterFiles
+    
+    if (removed > 0) {
+      ElMessage.success(`已清理 ${removed} 个过期日志文件`)
+    } else {
+      ElMessage.info('没有需要清理的过期日志文件')
+    }
+    
+    fetchStats()
+  } catch (error) {
+    ElMessage.error('清理失败: ' + error.message)
   }
 }
 

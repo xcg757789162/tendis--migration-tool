@@ -13,6 +13,24 @@ import (
 	"time"
 )
 
+// RotationConfig 日志轮转配置
+type RotationConfig struct {
+	MaxFileSize    int64 // 单个文件最大大小（字节），默认 100MB
+	MaxFiles       int   // 最多保留的日志文件数量，默认 7
+	MaxAge         int   // 日志文件最大保留天数，默认 30
+	CleanupEnabled bool  // 是否启用自动清理，默认 true
+}
+
+// DefaultRotationConfig 默认轮转配置
+func DefaultRotationConfig() *RotationConfig {
+	return &RotationConfig{
+		MaxFileSize:    100 * 1024 * 1024, // 100MB
+		MaxFiles:       7,
+		MaxAge:         30,
+		CleanupEnabled: true,
+	}
+}
+
 // Level 日志级别
 type Level int
 
@@ -74,14 +92,19 @@ type LogEntry struct {
 
 // Logger 日志记录器
 type Logger struct {
-	mu          sync.RWMutex
-	level       Level
-	entries     []LogEntry
-	maxEntries  int
-	logFile     *os.File
-	logDir      string
-	entryID     int64
-	writers     []io.Writer
+	mu             sync.RWMutex
+	level          Level
+	entries        []LogEntry
+	maxEntries     int
+	logFile        *os.File
+	logDir         string
+	entryID        int64
+	writers        []io.Writer
+	rotationConfig *RotationConfig
+	currentLogPath string
+	currentLogSize int64
+	cleanupTicker  *time.Ticker
+	stopCleanup    chan struct{}
 }
 
 var (
@@ -108,12 +131,23 @@ func Default() *Logger {
 
 // NewLogger 创建新的日志器
 func NewLogger(logDir string, level Level) (*Logger, error) {
+	return NewLoggerWithRotation(logDir, level, DefaultRotationConfig())
+}
+
+// NewLoggerWithRotation 创建带轮转配置的日志器
+func NewLoggerWithRotation(logDir string, level Level, rotation *RotationConfig) (*Logger, error) {
+	if rotation == nil {
+		rotation = DefaultRotationConfig()
+	}
+
 	l := &Logger{
-		level:      level,
-		entries:    make([]LogEntry, 0, 10000),
-		maxEntries: 10000,
-		logDir:     logDir,
-		writers:    []io.Writer{os.Stdout},
+		level:          level,
+		entries:        make([]LogEntry, 0, 50000),
+		maxEntries:     50000, // 增加日志保留量，支持更多任务的日志查询
+		logDir:         logDir,
+		writers:        []io.Writer{os.Stdout},
+		rotationConfig: rotation,
+		stopCleanup:    make(chan struct{}),
 	}
 
 	// 创建日志目录
@@ -122,15 +156,245 @@ func NewLogger(logDir string, level Level) (*Logger, error) {
 	}
 
 	// 打开日志文件
-	logFile := filepath.Join(logDir, fmt.Sprintf("tendis-migrate-%s.log", time.Now().Format("2006-01-02")))
-	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("open log file: %w", err)
+	if err := l.openLogFile(); err != nil {
+		return nil, err
 	}
-	l.logFile = f
-	l.writers = append(l.writers, f)
+
+	// 启动自动清理（如果启用）
+	if rotation.CleanupEnabled {
+		l.startCleanupRoutine()
+	}
+
+	// 初始化时执行一次清理
+	go l.cleanupOldLogs()
 
 	return l, nil
+}
+
+// openLogFile 打开当天的日志文件
+func (l *Logger) openLogFile() error {
+	logPath := filepath.Join(l.logDir, fmt.Sprintf("tendis-migrate-%s.log", time.Now().Format("2006-01-02")))
+
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("open log file: %w", err)
+	}
+
+	// 获取当前文件大小
+	stat, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return fmt.Errorf("stat log file: %w", err)
+	}
+
+	// 如果之前有打开的文件，先关闭
+	if l.logFile != nil {
+		l.logFile.Close()
+	}
+
+	l.logFile = f
+	l.currentLogPath = logPath
+	l.currentLogSize = stat.Size()
+
+	// 更新 writers（替换旧的文件 writer）
+	l.writers = []io.Writer{os.Stdout, f}
+
+	return nil
+}
+
+// rotateIfNeeded 检查是否需要轮转
+func (l *Logger) rotateIfNeeded() {
+	// 检查是否需要按日期轮转
+	expectedPath := filepath.Join(l.logDir, fmt.Sprintf("tendis-migrate-%s.log", time.Now().Format("2006-01-02")))
+	if l.currentLogPath != expectedPath {
+		l.openLogFile()
+		return
+	}
+
+	// 检查是否需要按大小轮转
+	if l.rotationConfig.MaxFileSize > 0 && l.currentLogSize >= l.rotationConfig.MaxFileSize {
+		l.rotateBySize()
+	}
+}
+
+// rotateBySize 按大小轮转日志文件
+func (l *Logger) rotateBySize() {
+	if l.logFile == nil {
+		return
+	}
+
+	// 关闭当前文件
+	l.logFile.Close()
+
+	// 重命名当前文件，添加时间戳后缀
+	timestamp := time.Now().Format("150405")
+	newPath := strings.TrimSuffix(l.currentLogPath, ".log") + "-" + timestamp + ".log"
+	os.Rename(l.currentLogPath, newPath)
+
+	// 打开新文件
+	l.openLogFile()
+}
+
+// startCleanupRoutine 启动定时清理任务
+func (l *Logger) startCleanupRoutine() {
+	l.cleanupTicker = time.NewTicker(1 * time.Hour) // 每小时检查一次
+	go func() {
+		for {
+			select {
+			case <-l.cleanupTicker.C:
+				l.cleanupOldLogs()
+			case <-l.stopCleanup:
+				l.cleanupTicker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+// cleanupOldLogs 清理过期的日志文件
+func (l *Logger) cleanupOldLogs() {
+	if l.rotationConfig == nil {
+		return
+	}
+
+	// 获取所有日志文件
+	files, err := l.getLogFiles()
+	if err != nil {
+		return
+	}
+
+	if len(files) == 0 {
+		return
+	}
+
+	now := time.Now()
+	var removedCount, removedSize int64
+
+	// 按修改时间排序（最新的在前）
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].ModTime().After(files[j].ModTime())
+	})
+
+	for i, f := range files {
+		fullPath := filepath.Join(l.logDir, f.Name())
+
+		// 不删除当前正在使用的文件
+		if fullPath == l.currentLogPath {
+			continue
+		}
+
+		shouldDelete := false
+
+		// 按数量清理（保留最新的 MaxFiles 个文件）
+		if l.rotationConfig.MaxFiles > 0 && i >= l.rotationConfig.MaxFiles {
+			shouldDelete = true
+		}
+
+		// 按时间清理（删除超过 MaxAge 天的文件）
+		if l.rotationConfig.MaxAge > 0 {
+			age := now.Sub(f.ModTime()).Hours() / 24
+			if int(age) > l.rotationConfig.MaxAge {
+				shouldDelete = true
+			}
+		}
+
+		if shouldDelete {
+			if err := os.Remove(fullPath); err == nil {
+				removedCount++
+				removedSize += f.Size()
+			}
+		}
+	}
+
+	if removedCount > 0 {
+		// 输出到 stdout（不使用 l.Info 避免递归）
+		fmt.Printf("[%s] [INFO] Log cleanup completed: removed %d files, freed %s\n",
+			time.Now().Format("2006-01-02 15:04:05"),
+			removedCount,
+			formatBytes(removedSize))
+	}
+}
+
+// getLogFiles 获取日志目录中的所有日志文件
+func (l *Logger) getLogFiles() ([]os.FileInfo, error) {
+	entries, err := os.ReadDir(l.logDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var files []os.FileInfo
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, "tendis-migrate-") && strings.HasSuffix(name, ".log") {
+			info, err := entry.Info()
+			if err == nil {
+				files = append(files, info)
+			}
+		}
+	}
+	return files, nil
+}
+
+// formatBytes 格式化字节数
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// GetRotationConfig 获取轮转配置
+func (l *Logger) GetRotationConfig() *RotationConfig {
+	return l.rotationConfig
+}
+
+// SetRotationConfig 设置轮转配置
+func (l *Logger) SetRotationConfig(config *RotationConfig) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rotationConfig = config
+}
+
+// GetLogStats 获取日志统计信息
+func (l *Logger) GetLogStats() map[string]interface{} {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	files, _ := l.getLogFiles()
+	var totalSize int64
+	for _, f := range files {
+		totalSize += f.Size()
+	}
+
+	return map[string]interface{}{
+		"log_dir":           l.logDir,
+		"current_file":      l.currentLogPath,
+		"current_file_size": formatBytes(l.currentLogSize),
+		"total_files":       len(files),
+		"total_size":        formatBytes(totalSize),
+		"memory_entries":    len(l.entries),
+		"max_entries":       l.maxEntries,
+		"rotation_config": map[string]interface{}{
+			"max_file_size":    formatBytes(l.rotationConfig.MaxFileSize),
+			"max_files":        l.rotationConfig.MaxFiles,
+			"max_age_days":     l.rotationConfig.MaxAge,
+			"cleanup_enabled":  l.rotationConfig.CleanupEnabled,
+		},
+	}
+}
+
+// CleanupNow 立即执行日志清理
+func (l *Logger) CleanupNow() {
+	l.cleanupOldLogs()
 }
 
 // SetLevel 设置日志级别
@@ -148,6 +412,9 @@ func (l *Logger) log(level Level, requestID, taskID, msg string, fields map[stri
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// 检查是否需要轮转
+	l.rotateIfNeeded()
 
 	l.entryID++
 	entry := LogEntry{
@@ -181,7 +448,11 @@ func (l *Logger) log(level Level, requestID, taskID, msg string, fields map[stri
 	// 写入到所有 writer
 	logLine := l.formatEntry(entry)
 	for _, w := range l.writers {
-		w.Write([]byte(logLine))
+		n, _ := w.Write([]byte(logLine))
+		// 更新当前文件大小
+		if w == l.logFile {
+			l.currentLogSize += int64(n)
+		}
 	}
 }
 
@@ -340,10 +611,10 @@ func (l *Logger) Export(filter LogFilter, format string) ([]byte, error) {
 		return json.MarshalIndent(entries, "", "  ")
 	case "text":
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("=== Tendis Migrate Log Export ===\n"))
-		sb.WriteString(fmt.Sprintf("Export Time: %s\n", time.Now().Format("2006-01-02 15:04:05")))
-		sb.WriteString(fmt.Sprintf("Total Entries: %d\n", len(entries)))
-		sb.WriteString(fmt.Sprintf("Filter: level=%s, keyword=%s, task=%s\n", filter.Level, filter.Keyword, filter.TaskID))
+		sb.WriteString("=== Tendis Migrate Log Export ===\n")
+		fmt.Fprintf(&sb, "Export Time: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(&sb, "Total Entries: %d\n", len(entries))
+		fmt.Fprintf(&sb, "Filter: level=%s, keyword=%s, task=%s\n", filter.Level, filter.Keyword, filter.TaskID)
 		sb.WriteString(strings.Repeat("=", 50) + "\n\n")
 		
 		for _, e := range entries {
@@ -383,6 +654,15 @@ func (l *Logger) ClearTaskLogs(taskID string) {
 
 // Close 关闭日志器
 func (l *Logger) Close() error {
+	// 停止清理任务
+	if l.stopCleanup != nil {
+		close(l.stopCleanup)
+	}
+	if l.cleanupTicker != nil {
+		l.cleanupTicker.Stop()
+	}
+
+	// 关闭日志文件
 	if l.logFile != nil {
 		return l.logFile.Close()
 	}

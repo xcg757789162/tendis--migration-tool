@@ -31,6 +31,16 @@ type WorkerPoolManager struct {
 	workers   map[int]*WorkerProcess // workerID -> process
 	workersMu sync.RWMutex
 
+	// 任务配置（用于重启）
+	task *storage.Task
+
+	// 自动重启配置
+	autoRestart       bool          // 是否自动重启
+	maxRestartCount   int           // 最大重启次数
+	restartCooldown   time.Duration // 重启冷却时间
+	restartCounts     map[int]int   // workerID -> 重启次数
+	lastRestartTimes  map[int]time.Time // workerID -> 最后重启时间
+
 	// 控制
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -60,17 +70,22 @@ func NewWorkerPoolManager(
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &WorkerPoolManager{
-		taskID:       taskID,
-		numWorkers:   numWorkers,
-		workerBinary: workerBinary,
-		socketPath:   socketPath,
-		db:           db,
-		slotManager:  slotManager,
-		ipcServer:    ipcServer,
-		logger:       logger,
-		workers:      make(map[int]*WorkerProcess),
-		ctx:          ctx,
-		cancel:       cancel,
+		taskID:           taskID,
+		numWorkers:       numWorkers,
+		workerBinary:     workerBinary,
+		socketPath:       socketPath,
+		db:               db,
+		slotManager:      slotManager,
+		ipcServer:        ipcServer,
+		logger:           logger,
+		workers:          make(map[int]*WorkerProcess),
+		autoRestart:      true,                    // 默认开启自动重启
+		maxRestartCount:  3,                       // 最大重启 3 次
+		restartCooldown:  30 * time.Second,        // 冷却时间 30 秒
+		restartCounts:    make(map[int]int),
+		lastRestartTimes: make(map[int]time.Time),
+		ctx:              ctx,
+		cancel:           cancel,
 	}
 }
 
@@ -234,14 +249,156 @@ func (wpm *WorkerPoolManager) waitForWorker(worker *WorkerProcess, logFile *os.F
 	}
 }
 
-// onWorkerCrashed Worker 崩溃处理
+// onWorkerCrashed Worker 崩溃处理（自动重启）
 func (wpm *WorkerPoolManager) onWorkerCrashed(workerID int) {
-	wpm.logger.Warn("Worker crashed, attempting recovery", map[string]interface{}{
+	wpm.logger.Warn("Worker crashed, checking auto-restart", map[string]interface{}{
 		"worker_id": workerID,
 	})
 
-	// 可以在这里实现重启逻辑
-	// 暂时不自动重启，等待手动干预
+	// 检查是否开启自动重启
+	if !wpm.autoRestart {
+		wpm.logger.Info("Auto-restart disabled, manual intervention required", map[string]interface{}{
+			"worker_id": workerID,
+		})
+		return
+	}
+
+	// 检查重启次数
+	wpm.workersMu.Lock()
+	restartCount := wpm.restartCounts[workerID]
+	lastRestart := wpm.lastRestartTimes[workerID]
+	wpm.workersMu.Unlock()
+
+	if restartCount >= wpm.maxRestartCount {
+		wpm.logger.Error("Worker exceeded max restart count, giving up", map[string]interface{}{
+			"worker_id":     workerID,
+			"restart_count": restartCount,
+			"max_restarts":  wpm.maxRestartCount,
+		})
+		// 标记该 Worker 的 Slot 为失败
+		wpm.markWorkerSlotsFailed(workerID)
+		return
+	}
+
+	// 检查冷却时间
+	if time.Since(lastRestart) < wpm.restartCooldown {
+		wpm.logger.Warn("Worker restart in cooldown period", map[string]interface{}{
+			"worker_id":        workerID,
+			"cooldown_seconds": wpm.restartCooldown.Seconds(),
+			"wait_seconds":     (wpm.restartCooldown - time.Since(lastRestart)).Seconds(),
+		})
+		// 等待冷却时间后重启
+		go func() {
+			waitTime := wpm.restartCooldown - time.Since(lastRestart)
+			time.Sleep(waitTime)
+			wpm.restartWorker(workerID)
+		}()
+		return
+	}
+
+	// 立即重启
+	wpm.restartWorker(workerID)
+}
+
+// restartWorker 重启 Worker
+func (wpm *WorkerPoolManager) restartWorker(workerID int) {
+	wpm.workersMu.Lock()
+	wpm.restartCounts[workerID]++
+	wpm.lastRestartTimes[workerID] = time.Now()
+	restartCount := wpm.restartCounts[workerID]
+	wpm.workersMu.Unlock()
+
+	wpm.logger.Info("Restarting worker", map[string]interface{}{
+		"worker_id":     workerID,
+		"restart_count": restartCount,
+		"max_restarts":  wpm.maxRestartCount,
+	})
+
+	// 重置该 Worker 的 in_progress Slot 为 pending
+	if err := wpm.resetWorkerSlots(workerID); err != nil {
+		wpm.logger.Error("Failed to reset worker slots", map[string]interface{}{
+			"worker_id": workerID,
+			"error":     err.Error(),
+		})
+	}
+
+	// 启动新 Worker
+	if wpm.task != nil {
+		if err := wpm.StartWorker(workerID, wpm.task); err != nil {
+			wpm.logger.Error("Failed to restart worker", map[string]interface{}{
+				"worker_id": workerID,
+				"error":     err.Error(),
+			})
+		} else {
+			wpm.logger.Info("Worker restarted successfully", map[string]interface{}{
+				"worker_id":     workerID,
+				"restart_count": restartCount,
+			})
+		}
+	}
+}
+
+// resetWorkerSlots 重置 Worker 的 in_progress Slot
+func (wpm *WorkerPoolManager) resetWorkerSlots(workerID int) error {
+	slots := wpm.slotManager.GetWorkerSlots(workerID)
+	for _, slot := range slots {
+		status, err := wpm.db.GetSlotStatus(wpm.taskID, slot)
+		if err != nil {
+			continue
+		}
+		if status.Status == "in_progress" {
+			wpm.db.UpdateSlotStatus(wpm.taskID, slot, "pending")
+			wpm.logger.Debug("Reset slot to pending", map[string]interface{}{
+				"slot":      slot,
+				"worker_id": workerID,
+			})
+		}
+	}
+	return nil
+}
+
+// markWorkerSlotsFailed 标记 Worker 的所有未完成 Slot 为失败
+func (wpm *WorkerPoolManager) markWorkerSlotsFailed(workerID int) {
+	slots := wpm.slotManager.GetWorkerSlots(workerID)
+	for _, slot := range slots {
+		status, err := wpm.db.GetSlotStatus(wpm.taskID, slot)
+		if err != nil {
+			continue
+		}
+		if status.Status != "completed" {
+			wpm.db.UpdateSlotStatus(wpm.taskID, slot, "failed")
+			wpm.logger.Warn("Marked slot as failed", map[string]interface{}{
+				"slot":      slot,
+				"worker_id": workerID,
+			})
+		}
+	}
+}
+
+// SetTask 设置任务信息（用于 Worker 重启）
+func (wpm *WorkerPoolManager) SetTask(task *storage.Task) {
+	wpm.task = task
+}
+
+// SetAutoRestart 设置自动重启配置
+func (wpm *WorkerPoolManager) SetAutoRestart(enabled bool, maxCount int, cooldown time.Duration) {
+	wpm.workersMu.Lock()
+	defer wpm.workersMu.Unlock()
+	wpm.autoRestart = enabled
+	if maxCount > 0 {
+		wpm.maxRestartCount = maxCount
+	}
+	if cooldown > 0 {
+		wpm.restartCooldown = cooldown
+	}
+}
+
+// ResetRestartCounts 重置所有 Worker 的重启计数
+func (wpm *WorkerPoolManager) ResetRestartCounts() {
+	wpm.workersMu.Lock()
+	defer wpm.workersMu.Unlock()
+	wpm.restartCounts = make(map[int]int)
+	wpm.lastRestartTimes = make(map[int]time.Time)
 }
 
 // monitorWorkers 监控 Worker 健康状态

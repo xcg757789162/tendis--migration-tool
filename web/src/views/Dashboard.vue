@@ -118,6 +118,18 @@
           <el-icon><Monitor /></el-icon>
           系统状态
         </h2>
+        <div class="system-actions">
+          <el-popconfirm
+            title="确定要创建系统备份吗？"
+            @confirm="createBackup"
+          >
+            <template #reference>
+              <el-button size="small" :loading="backingUp">
+                <el-icon><FolderAdd /></el-icon> 系统备份
+              </el-button>
+            </template>
+          </el-popconfirm>
+        </div>
       </div>
       
       <div class="system-info">
@@ -127,7 +139,12 @@
           </div>
           <div class="info-content">
             <div class="info-label">Worker 进程</div>
-            <div class="info-value">{{ systemStatus.worker_count || 0 }} 个运行中</div>
+            <div class="info-value">
+              <span v-if="systemStatus.running_tasks > 0">
+                {{ systemStatus.active_workers || 0 }} / {{ systemStatus.target_workers || 0 }} 活跃
+              </span>
+              <span v-else class="idle">空闲</span>
+            </div>
           </div>
         </div>
         
@@ -139,6 +156,55 @@
             <div class="info-label">系统状态</div>
             <div class="info-value" :class="systemStatus.status">{{ systemStatus.status === 'running' ? '正常运行' : '检查中' }}</div>
           </div>
+        </div>
+        
+        <div class="info-card">
+          <div class="info-icon">
+            <el-icon :size="20"><Odometer /></el-icon>
+          </div>
+          <div class="info-content">
+            <div class="info-label">内存使用</div>
+            <div class="info-value">{{ formatBytes(systemStatus.memory_usage || 0) }}</div>
+          </div>
+        </div>
+        
+        <div class="info-card">
+          <div class="info-icon">
+            <el-icon :size="20"><Timer /></el-icon>
+          </div>
+          <div class="info-content">
+            <div class="info-label">运行时长</div>
+            <div class="info-value">{{ systemStatus.uptime || '-' }}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- 智能重试状态 -->
+    <div class="section" v-if="smartRetryStatus && smartRetryStatus.enabled">
+      <div class="section-header">
+        <h2>
+          <el-icon><RefreshRight /></el-icon>
+          智能重试
+        </h2>
+      </div>
+      
+      <div class="smart-retry-info">
+        <div class="retry-stat">
+          <span class="stat-value">{{ smartRetryStatus.pending_keys || 0 }}</span>
+          <span class="stat-label">待重试Key</span>
+        </div>
+        <div class="retry-stat">
+          <span class="stat-value success">{{ smartRetryStatus.success_keys || 0 }}</span>
+          <span class="stat-label">重试成功</span>
+        </div>
+        <div class="retry-stat">
+          <span class="stat-value warning">{{ smartRetryStatus.failed_keys || 0 }}</span>
+          <span class="stat-label">重试失败</span>
+        </div>
+        <div class="retry-stat">
+          <span class="stat-value">{{ smartRetryStatus.next_retry_in || '-' }}</span>
+          <span class="stat-label">下次重试</span>
         </div>
       </div>
     </div>
@@ -162,6 +228,8 @@ const stats = ref({
 
 const runningTasks = ref([])
 const systemStatus = ref({})
+const smartRetryStatus = ref(null)
+const backingUp = ref(false)
 let refreshTimer = null
 
 const fetchData = async () => {
@@ -175,10 +243,21 @@ const fetchData = async () => {
     stats.value.pausedTasks = tasks.filter(t => t.status === 'paused').length
     stats.value.completedTasks = tasks.filter(t => t.status === 'completed').length
     
-    runningTasks.value = tasks.filter(t => t.status === 'running').slice(0, 3)
+    runningTasks.value = tasks
+      .filter(t => t.status === 'running')
+      .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+      .slice(0, 3)
     
     // 获取系统状态
     systemStatus.value = await api.getSystemStatus()
+    
+    // 获取智能重试状态
+    try {
+      smartRetryStatus.value = await api.getSmartRetryStatus()
+    } catch {
+      // 忽略错误，可能功能未启用
+      smartRetryStatus.value = null
+    }
   } catch (err) {
     console.error('Fetch data failed:', err)
   }
@@ -203,10 +282,32 @@ const goToTasks = (status) => {
 }
 
 const formatNumber = (num) => {
-  if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B'
-  if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M'
-  if (num >= 1000) return (num / 1000).toFixed(1) + 'K'
-  return num.toString()
+  // 精确显示，不使用 K/M/B 缩写，添加千分位分隔符
+  if (num === null || num === undefined) return '0'
+  return num.toLocaleString('zh-CN')
+}
+
+const formatBytes = (bytes) => {
+  if (!bytes || bytes === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let i = 0
+  while (bytes >= 1024 && i < units.length - 1) {
+    bytes /= 1024
+    i++
+  }
+  return bytes.toFixed(2) + ' ' + units[i]
+}
+
+const createBackup = async () => {
+  backingUp.value = true
+  try {
+    const result = await api.createSystemBackup()
+    ElMessage.success('系统备份创建成功: ' + (result?.backup_file || ''))
+  } catch (err) {
+    ElMessage.error('备份失败: ' + (err.message || '未知错误'))
+  } finally {
+    backingUp.value = false
+  }
 }
 
 onMounted(() => {
@@ -445,6 +546,56 @@ onUnmounted(() => {
       &.running {
         color: var(--success-color);
       }
+      
+      .idle {
+        color: var(--text-tertiary);
+        font-weight: normal;
+      }
+    }
+  }
+}
+
+.system-actions {
+  display: flex;
+  gap: 12px;
+}
+
+// 智能重试状态样式
+.smart-retry-info {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 20px;
+  
+  @media (max-width: 768px) {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  
+  .retry-stat {
+    text-align: center;
+    padding: 20px;
+    background: var(--bg-primary);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-light);
+    
+    .stat-value {
+      display: block;
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-bottom: 4px;
+      
+      &.success {
+        color: var(--el-color-success);
+      }
+      
+      &.warning {
+        color: var(--el-color-warning);
+      }
+    }
+    
+    .stat-label {
+      font-size: 13px;
+      color: var(--text-secondary);
     }
   }
 }

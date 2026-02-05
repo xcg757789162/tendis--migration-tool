@@ -32,12 +32,63 @@
           <el-button type="primary" @click="triggerVerify">
             <el-icon><Checked /></el-icon> 校验
           </el-button>
+          <!-- 增量同步阶段显示完成按钮 -->
+          <el-popconfirm 
+            v-if="progress?.phase === 'incremental'"
+            title="确定要停止增量同步并完成任务吗？"
+            confirm-button-text="完成任务"
+            cancel-button-text="取消"
+            @confirm="completeTask"
+          >
+            <template #reference>
+              <el-button type="success">
+                <el-icon><CircleCheck /></el-icon> 完成任务
+              </el-button>
+            </template>
+          </el-popconfirm>
         </template>
         <template v-else-if="task.status === 'paused'">
           <el-button type="primary" @click="resumeTask">
             <el-icon><VideoPlay /></el-icon> 恢复
           </el-button>
         </template>
+        <template v-else-if="task.status === 'incremental_stopped'">
+          <el-button type="primary" @click="triggerVerify">
+            <el-icon><Checked /></el-icon> 执行校验
+          </el-button>
+          <el-button type="success" @click="markComplete">
+            <el-icon><CircleCheck /></el-icon> 标记完成
+          </el-button>
+        </template>
+        
+        <!-- 更多操作下拉菜单 -->
+        <el-dropdown @command="handleMoreActions" trigger="click">
+          <el-button>
+            <el-icon><MoreFilled /></el-icon> 更多
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="export-report-csv">
+                <el-icon><Download /></el-icon> 导出报告 (CSV)
+              </el-dropdown-item>
+              <el-dropdown-item command="export-report-json">
+                <el-icon><Download /></el-icon> 导出报告 (JSON)
+              </el-dropdown-item>
+              <el-dropdown-item command="export-config" divided>
+                <el-icon><Document /></el-icon> 导出配置
+              </el-dropdown-item>
+              <el-dropdown-item command="view-health">
+                <el-icon><Promotion /></el-icon> 健康状态
+              </el-dropdown-item>
+              <el-dropdown-item command="toggle-auto-recovery" divided>
+                <el-icon><Refresh /></el-icon> 自动恢复设置
+              </el-dropdown-item>
+              <el-dropdown-item command="retry-failed" :disabled="errorKeys.failed === 0">
+                <el-icon><RefreshRight /></el-icon> 重试失败Key
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
     </div>
     
@@ -46,12 +97,23 @@
       <div class="overview-header">
         <h2>迁移进度</h2>
         <div class="header-right">
-          <el-select v-model="refreshInterval" size="small" style="width: 120px" @change="changeRefreshInterval">
-            <el-option label="手动刷新" :value="0" />
+          <el-select v-model="refreshInterval" size="small" style="width: 140px" @change="changeRefreshInterval">
+            <el-option label="实时更新" :value="0">
+              <span class="realtime-option">
+                <span class="dot" :class="{ connected: wsConnected }"></span>
+                实时更新
+              </span>
+            </el-option>
             <el-option label="每 10 秒" :value="10000" />
             <el-option label="每 30 秒" :value="30000" />
             <el-option label="每 1 分钟" :value="60000" />
           </el-select>
+          <el-tooltip v-if="refreshInterval === 0" :content="wsConnected ? 'WebSocket 已连接' : 'WebSocket 未连接'" placement="top">
+            <span class="ws-status" :class="{ connected: wsConnected }">
+              <span class="status-dot"></span>
+              {{ wsConnected ? '实时' : '离线' }}
+            </span>
+          </el-tooltip>
           <el-button size="small" @click="fetchTask" :loading="refreshing">
             <el-icon><Refresh /></el-icon> 刷新
           </el-button>
@@ -75,22 +137,30 @@
           </div>
         </div>
         
-        <div class="progress-stats">
-          <div class="stat-row">
+        <div class="progress-stats compact-layout">
+          <div class="stat-grid">
             <div class="stat-item">
               <span class="label">已迁移Key</span>
               <span class="value stat-number">{{ formatNumber(progress.migrated_keys || 0) }}</span>
             </div>
             <div class="stat-item">
+              <span class="label">待迁移Key</span>
+              <span class="value highlight" :class="{ warning: progress.keys_to_migrate === 0 && progress.total_keys > 0 }">
+                {{ formatNumber(progress.keys_to_migrate || 0) }}
+              </span>
+              <el-tooltip v-if="progress.keys_to_migrate === 0 && progress.total_keys > 0" effect="dark" placement="top">
+                <template #content>没有匹配前缀过滤条件的Key，请检查过滤配置</template>
+                <el-icon class="warning-icon"><Warning /></el-icon>
+              </el-tooltip>
+            </div>
+            <div class="stat-item">
               <span class="label">总Key数</span>
-              <span class="value">{{ formatNumber(progress.total_keys || 0) }}</span>
+              <span class="value muted">{{ formatNumber(progress.total_keys || 0) }}</span>
             </div>
             <div class="stat-item">
               <span class="label">过滤Key</span>
               <span class="value filtered">{{ formatNumber(task.keys_filtered || 0) }}</span>
             </div>
-          </div>
-          <div class="stat-row">
             <div class="stat-item">
               <span class="label">已迁移数据</span>
               <span class="value">{{ formatBytes(progress.migrated_bytes || 0) }}</span>
@@ -99,8 +169,6 @@
               <span class="label">总数据量</span>
               <span class="value">{{ formatBytes(progress.total_bytes || 0) }}</span>
             </div>
-          </div>
-          <div class="stat-row">
             <div class="stat-item">
               <span class="label">当前速度</span>
               <span class="value highlight">{{ formatNumber(progress.current_speed || 0) }} keys/s</span>
@@ -111,7 +179,7 @@
             </div>
             <div class="stat-item">
               <span class="label">已耗时间</span>
-              <span class="value elapsed">{{ progress.elapsed_time || '-' }}</span>
+              <span class="value elapsed">{{ elapsedTimeDisplay }}</span>
             </div>
           </div>
         </div>
@@ -264,6 +332,125 @@
       </div>
     </div>
     
+    <!-- 影子模式统计（仅在影子模式时显示） -->
+    <div class="shadow-stats-section card" v-if="isShadowMode && shadowStats">
+      <h3><el-icon><View /></el-icon> 影子模式统计</h3>
+      <el-alert type="info" :closable="false" style="margin-bottom: 16px;">
+        <template #title>
+          <strong>影子模式</strong> - 仅读取源端数据，不写入目标端
+        </template>
+        用于验证筛选规则和预估迁移工作量，对目标端生产环境零影响。
+      </el-alert>
+      
+      <div class="shadow-stats-grid">
+        <div class="stat-item">
+          <span class="stat-value">{{ formatNumber(shadowStats.keys_scanned || 0) }}</span>
+          <span class="stat-label">已扫描 Key</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value highlight">{{ formatNumber(shadowStats.keys_matched || 0) }}</span>
+          <span class="stat-label">匹配规则 Key</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value warning">{{ formatNumber(shadowStats.keys_skipped || 0) }}</span>
+          <span class="stat-label">被过滤 Key</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value">{{ formatBytes(shadowStats.bytes_read || 0) }}</span>
+          <span class="stat-label">读取数据量</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value info">{{ formatNumber(shadowStats.large_keys_found || 0) }}</span>
+          <span class="stat-label">大 Key 数量</span>
+        </div>
+      </div>
+      
+      <!-- 数据类型分布 -->
+      <div class="type-distribution" v-if="shadowStats.type_distribution">
+        <h4>数据类型分布</h4>
+        <div class="type-grid">
+          <div class="type-item" v-for="(count, type) in shadowStats.type_distribution" :key="type">
+            <span class="type-name">{{ type }}</span>
+            <span class="type-count">{{ formatNumber(count) }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- 增量同步统计（仅在增量同步阶段或有增量数据时显示） -->
+    <div class="incremental-stats-section card" v-if="showIncrementalStats">
+      <div class="section-header">
+        <h3><el-icon><DataLine /></el-icon> 增量同步统计</h3>
+        <div class="header-right">
+          <el-tag :type="incrSyncMode === 'binlog' ? 'success' : 'warning'" size="small">
+            {{ incrSyncMode === 'binlog' ? 'Binlog 模式' : '时间窗口模式' }}
+          </el-tag>
+          <span class="sync-status" :class="{ syncing: progress?.phase === 'incremental' }">
+            <span class="dot"></span>
+            {{ progress?.phase === 'incremental' ? '同步中' : '已停止' }}
+          </span>
+        </div>
+      </div>
+      
+      <el-alert v-if="incrSyncMode === 'binlog'" type="success" :closable="false" style="margin-bottom: 16px;">
+        <template #title>
+          <strong>Binlog 实时同步</strong> - 伪装成 Tendis Slave 接收增量数据
+        </template>
+        低延迟、高效率，适用于 40 亿 Key 级别的大规模数据同步。
+      </el-alert>
+      <el-alert v-else type="warning" :closable="false" style="margin-bottom: 16px;">
+        <template #title>
+          <strong>时间窗口模式</strong> - 定时扫描检测变更 Key
+        </template>
+        备用方案，适用于非 Tendis 数据源或不支持 INCRSYNC 协议的场景。
+      </el-alert>
+      
+      <div class="incr-stats-grid">
+        <div class="stat-item">
+          <span class="stat-value highlight">{{ formatNumber(task.incr_keys_synced || 0) }}</span>
+          <span class="stat-label">已同步 Key</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value warning">{{ formatNumber(task.incr_keys_skipped || 0) }}</span>
+          <span class="stat-label">冲突跳过</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value error">{{ formatNumber(task.incr_keys_failed || 0) }}</span>
+          <span class="stat-label">同步失败</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value filtered">{{ formatNumber(task.incr_keys_filtered || 0) }}</span>
+          <span class="stat-label">被过滤</span>
+        </div>
+      </div>
+      
+      <!-- Binlog 模式特有指标 -->
+      <div class="binlog-stats" v-if="incrSyncMode === 'binlog'">
+        <div class="binlog-stats-row">
+          <div class="binlog-item">
+            <span class="label">Binlog 位置</span>
+            <span class="value mono">{{ task.incr_binlog_pos || '-' }}</span>
+          </div>
+          <div class="binlog-item">
+            <span class="label">同步延迟</span>
+            <span class="value" :class="{ 'lag-warning': (task.incr_lag_ms || 0) > 1000 }">
+              {{ task.incr_lag_ms ? task.incr_lag_ms + ' ms' : '-' }}
+            </span>
+          </div>
+          <div class="binlog-item">
+            <span class="label">心跳数</span>
+            <span class="value">{{ formatNumber(task.incr_heartbeats || 0) }}</span>
+          </div>
+          <div class="binlog-item">
+            <span class="label">重连次数</span>
+            <span class="value" :class="{ 'warning': (task.incr_reconnects || 0) > 5 }">
+              {{ task.incr_reconnects || 0 }}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+    
     <!-- 校验结果 -->
     <div class="verify-section card" v-if="verifyResults.length">
       <h3><el-icon><Checked /></el-icon> 校验结果</h3>
@@ -300,31 +487,57 @@
     </div>
     
     <!-- 异常/跳过Key统计 -->
-    <div class="error-keys-section card" v-if="task.status === 'completed' || task.status === 'failed' || errorKeys.total > 0">
+    <div class="error-keys-section card" v-if="task.status === 'completed' || task.status === 'failed' || errorKeys.total > 0 || task.status === 'running'">
       <div class="section-header">
         <h3><el-icon><Warning /></el-icon> 异常/跳过Key统计</h3>
-        <el-button 
-          type="primary" 
-          size="small" 
-          @click="downloadErrorKeys"
-          :disabled="errorKeys.total === 0"
-        >
-          <el-icon><Download /></el-icon> 下载详情
-        </el-button>
+        <div class="header-actions">
+          <el-button 
+            v-if="errorKeys.failed > 0 && task.status !== 'completed'"
+            type="warning" 
+            size="small" 
+            @click="retryFailedKeys"
+            :loading="retryingKeys"
+          >
+            <el-icon><RefreshRight /></el-icon> 重试失败Key
+          </el-button>
+          <el-button 
+            type="primary" 
+            size="small" 
+            @click="downloadErrorKeys"
+            :disabled="errorKeys.total === 0 && errorKeysList.length === 0"
+          >
+            <el-icon><Download /></el-icon> 下载详情
+          </el-button>
+        </div>
       </div>
       
       <div class="error-stats">
-        <div class="stat-item">
+        <div 
+          class="stat-item clickable" 
+          :class="{ active: errorFilter === 'failed' }"
+          @click="toggleErrorFilter('failed')"
+        >
           <span class="stat-value error">{{ errorKeys.failed || 0 }}</span>
           <span class="stat-label">迁移失败</span>
+          <span class="click-hint" v-if="errorKeys.failed > 0 && errorKeys.failed <= 1000">点击查看</span>
         </div>
-        <div class="stat-item">
+        <div 
+          class="stat-item clickable" 
+          :class="{ active: errorFilter === 'skipped' }"
+          @click="toggleErrorFilter('skipped')"
+        >
           <span class="stat-value warning">{{ errorKeys.skipped || 0 }}</span>
           <span class="stat-label">冲突跳过</span>
+          <span class="click-hint" v-if="errorKeys.skipped > 0 && errorKeys.skipped <= 1000">点击查看</span>
         </div>
-        <div class="stat-item">
+        <div 
+          class="stat-item clickable" 
+          :class="{ active: errorFilter === 'large_key' }"
+          @click="toggleErrorFilter('large_key')"
+        >
           <span class="stat-value info">{{ errorKeys.large_keys || 0 }}</span>
           <span class="stat-label">大Key处理</span>
+          <span class="click-hint" v-if="errorKeys.large_keys > 0 && errorKeys.large_keys <= 1000">点击查看</span>
         </div>
         <div class="stat-item">
           <span class="stat-value">{{ errorKeys.total || 0 }}</span>
@@ -333,22 +546,36 @@
       </div>
       
       <!-- 异常Key列表 -->
-      <div class="error-keys-list" v-if="errorKeysList.length > 0">
-        <el-table :data="errorKeysList" style="width: 100%" max-height="300">
+      <div class="error-keys-list" v-if="filteredErrorKeysList.length > 0">
+        <div class="filter-info" v-if="errorFilter">
+          <el-tag closable @close="errorFilter = ''">
+            筛选: {{ getErrorFilterText(errorFilter) }}
+          </el-tag>
+          <span class="filter-count">显示 {{ filteredErrorKeysList.length }} 条</span>
+        </div>
+        <el-table :data="filteredErrorKeysList" style="width: 100%" max-height="400">
           <el-table-column label="Key名称" min-width="200">
             <template #default="{ row }">
-              <span class="mono">{{ row.key }}</span>
+              <el-tooltip :content="row.key" placement="top" :show-after="500">
+                <span class="mono key-name">{{ row.key }}</span>
+              </el-tooltip>
             </template>
           </el-table-column>
-          <el-table-column label="类型" width="100" prop="type" />
-          <el-table-column label="原因" width="120">
+          <el-table-column label="类型" width="80" prop="type" />
+          <el-table-column label="原因" width="100">
             <template #default="{ row }">
               <el-tag :type="getErrorTagType(row.reason)" size="small">
                 {{ getErrorReasonText(row.reason) }}
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="详情" min-width="200" prop="detail" />
+          <el-table-column label="详情" min-width="250">
+            <template #default="{ row }">
+              <el-tooltip :content="row.detail" placement="top" :show-after="300">
+                <span class="error-detail">{{ row.detail }}</span>
+              </el-tooltip>
+            </template>
+          </el-table-column>
           <el-table-column label="时间" width="100">
             <template #default="{ row }">
               {{ formatLogTime(row.timestamp) }}
@@ -356,15 +583,21 @@
           </el-table-column>
         </el-table>
         
-        <div class="list-footer" v-if="errorKeys.total > errorKeysList.length">
-          <span>显示前 {{ errorKeysList.length }} 条，共 {{ errorKeys.total }} 条</span>
-          <el-button text type="primary" @click="downloadErrorKeys">查看全部并下载</el-button>
+        <div class="list-footer" v-if="errorKeys.total > filteredErrorKeysList.length">
+          <span>显示前 {{ filteredErrorKeysList.length }} 条，共 {{ errorKeys.total }} 条</span>
+          <el-button text type="primary" @click="downloadErrorKeys">下载全部</el-button>
         </div>
       </div>
       
-      <div class="no-errors" v-else-if="errorKeys.total === 0">
+      <div class="no-errors" v-else-if="errorKeys.total === 0 && errorKeysList.length === 0">
         <el-icon><SuccessFilled /></el-icon>
         <span>暂无异常Key</span>
+      </div>
+      
+      <div class="no-errors filter-empty" v-else-if="errorFilter && filteredErrorKeysList.length === 0">
+        <el-icon><InfoFilled /></el-icon>
+        <span>当前筛选条件无匹配数据</span>
+        <el-button text type="primary" @click="errorFilter = ''">清除筛选</el-button>
       </div>
     </div>
     
@@ -421,20 +654,21 @@
         <el-input-number 
           v-model="configForm.worker_count" 
           :min="1" 
-          :max="100"
+          :max="1024"
           style="width: 100%"
         />
-        <div class="form-tip">增加Worker可提高速度，但会增加源端负载</div>
+        <div class="form-tip">系统上限1024，增加Worker可提高速度但会增加负载</div>
       </el-form-item>
       
       <el-form-item label="扫描批次大小">
         <el-input-number 
           v-model="configForm.scan_batch_size" 
           :min="100" 
-          :max="10000"
-          :step="100"
+          :max="100000"
+          :step="1000"
           style="width: 100%"
         />
+        <div class="form-tip">系统上限100000，推荐1000-10000</div>
       </el-form-item>
       
       <el-form-item label="源端QPS限制">
@@ -445,7 +679,7 @@
           :step="1000"
           style="width: 100%"
         />
-        <div class="form-tip">0 表示不限制</div>
+        <div class="form-tip">0 表示不限制，系统上限100000</div>
       </el-form-item>
       
       <el-form-item label="目标端QPS限制">
@@ -456,7 +690,7 @@
           :step="1000"
           style="width: 100%"
         />
-        <div class="form-tip">0 表示不限制</div>
+        <div class="form-tip">0 表示不限制，系统上限100000</div>
       </el-form-item>
     </el-form>
     
@@ -467,13 +701,83 @@
       </el-button>
     </template>
   </el-dialog>
+  
+  <!-- 自动恢复设置对话框 -->
+  <el-dialog v-model="showAutoRecoveryDialog" title="自动恢复设置" width="500px">
+    <el-alert type="info" :closable="false" style="margin-bottom: 20px">
+      <template #title>
+        <strong>自动恢复功能说明</strong>
+      </template>
+      当任务因网络中断等原因暂停时，系统会定期检测集群健康状态，一旦恢复正常会自动继续任务。
+    </el-alert>
+    
+    <!-- 当前状态 -->
+    <div class="auto-recovery-status" v-if="autoRecoveryStatus">
+      <div class="status-row">
+        <span class="label">源端健康:</span>
+        <el-tag :type="autoRecoveryStatus.source_healthy ? 'success' : 'danger'" size="small">
+          {{ autoRecoveryStatus.source_healthy ? '正常' : '异常' }}
+        </el-tag>
+      </div>
+      <div class="status-row">
+        <span class="label">目标端健康:</span>
+        <el-tag :type="autoRecoveryStatus.target_healthy ? 'success' : 'danger'" size="small">
+          {{ autoRecoveryStatus.target_healthy ? '正常' : '异常' }}
+        </el-tag>
+      </div>
+      <div class="status-row" v-if="autoRecoveryStatus.pause_reason">
+        <span class="label">暂停原因:</span>
+        <span class="value">{{ autoRecoveryStatus.pause_reason }}</span>
+      </div>
+      <div class="status-row" v-if="autoRecoveryStatus.resume_attempts > 0">
+        <span class="label">恢复尝试:</span>
+        <span class="value">{{ autoRecoveryStatus.resume_attempts }} 次</span>
+      </div>
+    </div>
+    
+    <el-divider />
+    
+    <el-form :model="autoRecoveryForm" label-width="140px">
+      <el-form-item label="启用自动恢复">
+        <el-switch v-model="autoRecoveryForm.enabled" />
+      </el-form-item>
+      
+      <el-form-item label="健康检测间隔" v-if="autoRecoveryForm.enabled">
+        <el-input-number 
+          v-model="autoRecoveryForm.healthCheckIntervalSec" 
+          :min="10" 
+          :max="300"
+          style="width: 100%"
+        />
+        <div class="form-tip">单位：秒，推荐 30 秒</div>
+      </el-form-item>
+      
+      <el-form-item label="最大恢复尝试" v-if="autoRecoveryForm.enabled">
+        <el-input-number 
+          v-model="autoRecoveryForm.maxAutoResumeAttempts" 
+          :min="1" 
+          :max="100"
+          style="width: 100%"
+        />
+        <div class="form-tip">超过此次数后需手动恢复</div>
+      </el-form-item>
+    </el-form>
+    
+    <template #footer>
+      <el-button @click="showAutoRecoveryDialog = false">取消</el-button>
+      <el-button type="primary" @click="toggleAutoRecovery">
+        保存设置
+      </el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
+import wsService from '@/api/websocket'
 import dayjs from 'dayjs'
 
 const route = useRoute()
@@ -485,11 +789,32 @@ const verifyResults = ref([])
 const taskLogs = ref([])
 const logLevel = ref('')
 const logsContainer = ref(null)
-const refreshInterval = ref(10000)
+const refreshInterval = ref(0) // 默认使用 WebSocket，0 表示不轮询
 const refreshing = ref(false)
 const errorKeys = ref({ total: 0, failed: 0, skipped: 0, large_keys: 0 })
 const errorKeysList = ref([])
+const errorFilter = ref('')  // 错误类型筛选
+const retryingKeys = ref(false)
+const shadowStats = ref(null)
 let refreshTimer = null
+let elapsedTimer = null  // 已耗时间定时器
+
+// 已耗时间实时显示
+const elapsedTimeDisplay = ref('-')
+
+// 自动恢复相关
+const showAutoRecoveryDialog = ref(false)
+const autoRecoveryStatus = ref(null)
+const autoRecoveryForm = reactive({
+  enabled: false,
+  healthCheckIntervalSec: 30,
+  maxAutoResumeAttempts: 10
+})
+
+// WebSocket 相关状态
+const wsConnected = ref(false)
+const wsRealtimeEnabled = ref(true)
+let wsUnsubscribers = []
 
 // 参数调整相关
 const configDialogVisible = ref(false)
@@ -538,11 +863,40 @@ const targetCluster = computed(() => {
 })
 
 const config = computed(() => {
+  // 后端直接返回对象，不需要 JSON.parse
+  if (task.value?.config && typeof task.value.config === 'object') {
+    return task.value.config
+  }
+  // 兼容旧格式：尝试解析 JSON 字符串
   try {
     return JSON.parse(task.value?.config || '{}')
   } catch {
     return {}
   }
+})
+
+// 判断是否为影子模式
+const isShadowMode = computed(() => {
+  return task.value?.options?.shadow_mode === true || config.value?.shadow_mode === true
+})
+
+// 判断是否显示增量同步统计
+const showIncrementalStats = computed(() => {
+  // 在增量阶段或有增量数据时显示
+  const isIncrPhase = progress.value?.phase === 'incremental'
+  const hasIncrData = (task.value?.incr_keys_synced || 0) > 0 || 
+                      (task.value?.incr_keys_skipped || 0) > 0 ||
+                      (task.value?.incr_keys_failed || 0) > 0 ||
+                      (task.value?.incr_keys_filtered || 0) > 0
+  // 检查迁移模式是否包含增量
+  const hasIncrMode = task.value?.options?.migration_mode === 'full_and_incremental' ||
+                      task.value?.options?.migration_mode === 'incremental_only'
+  return isIncrPhase || hasIncrData || (hasIncrMode && task.value?.status === 'running')
+})
+
+// 获取增量同步模式
+const incrSyncMode = computed(() => {
+  return task.value?.incr_sync_mode || 'binlog'
 })
 
 const fetchTask = async () => {
@@ -551,10 +905,127 @@ const fetchTask = async () => {
     const data = await api.getTask(taskId.value)
     task.value = data
     progress.value = data.progress
+    
+    // 如果是影子模式，获取影子统计
+    if (data?.options?.shadow_mode) {
+      fetchShadowStats()
+    }
   } catch (err) {
     console.error('Fetch task failed:', err)
   } finally {
     refreshing.value = false
+  }
+}
+
+// 获取影子模式统计
+const fetchShadowStats = async () => {
+  try {
+    const data = await api.getShadowStats(taskId.value)
+    shadowStats.value = data
+  } catch (err) {
+    console.error('Fetch shadow stats failed:', err)
+    shadowStats.value = null
+  }
+}
+
+// 更多操作处理
+const handleMoreActions = async (command) => {
+  switch (command) {
+    case 'export-report-csv':
+      downloadReport('csv')
+      break
+    case 'export-report-json':
+      downloadReport('json')
+      break
+    case 'export-config':
+      exportConfig()
+      break
+    case 'view-health':
+      viewTaskHealth()
+      break
+    case 'toggle-auto-recovery':
+      showAutoRecoveryDialog.value = true
+      fetchAutoRecoveryStatus()
+      break
+    case 'retry-failed':
+      retryFailedKeys()
+      break
+  }
+}
+
+// 下载报告
+const downloadReport = async (format) => {
+  try {
+    const blob = await api.downloadTaskReport(taskId.value, format)
+    const url = window.URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `task-report-${taskId.value.substring(0, 8)}-${dayjs().format('YYYYMMDDHHmmss')}.${format}`
+    document.body.appendChild(a)
+    a.click()
+    window.URL.revokeObjectURL(url)
+    document.body.removeChild(a)
+    ElMessage.success('报告下载成功')
+  } catch (err) {
+    ElMessage.error('下载失败: ' + (err.message || '未知错误'))
+  }
+}
+
+// 导出配置
+const exportConfig = async () => {
+  try {
+    const config = await api.exportTaskConfig(taskId.value)
+    const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' })
+    const url = window.URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `task-config-${taskId.value.substring(0, 8)}.json`
+    document.body.appendChild(a)
+    a.click()
+    window.URL.revokeObjectURL(url)
+    document.body.removeChild(a)
+    ElMessage.success('配置导出成功')
+  } catch (err) {
+    ElMessage.error('导出失败: ' + (err.message || '未知错误'))
+  }
+}
+
+// 查看任务健康状态
+const viewTaskHealth = async () => {
+  try {
+    const health = await api.getTaskHealth(taskId.value)
+    ElMessage.info(`任务健康状态: ${health.status || 'unknown'}`)
+  } catch (err) {
+    ElMessage.error('获取健康状态失败')
+  }
+}
+
+// 获取自动恢复状态
+const fetchAutoRecoveryStatus = async () => {
+  try {
+    const status = await api.getAutoRecoveryStatus(taskId.value)
+    autoRecoveryStatus.value = status
+    autoRecoveryForm.enabled = status?.auto_resume_enabled || false
+    autoRecoveryForm.healthCheckIntervalSec = status?.health_check_interval_sec || 30
+    autoRecoveryForm.maxAutoResumeAttempts = status?.max_auto_resume_attempts || 10
+  } catch (err) {
+    console.error('Fetch auto recovery status failed:', err)
+    autoRecoveryStatus.value = null
+  }
+}
+
+// 切换自动恢复设置
+const toggleAutoRecovery = async () => {
+  try {
+    await api.toggleAutoRecovery(taskId.value, {
+      enabled: autoRecoveryForm.enabled,
+      health_check_interval_sec: autoRecoveryForm.healthCheckIntervalSec,
+      max_auto_resume_attempts: autoRecoveryForm.maxAutoResumeAttempts
+    })
+    ElMessage.success(autoRecoveryForm.enabled ? '自动恢复已启用' : '自动恢复已禁用')
+    showAutoRecoveryDialog.value = false
+  } catch (err) {
+    ElMessage.error('设置失败: ' + (err.message || '未知错误'))
   }
 }
 
@@ -563,13 +1034,177 @@ const changeRefreshInterval = () => {
     clearInterval(refreshTimer)
     refreshTimer = null
   }
+  
+  // 如果选择轮询模式，禁用 WebSocket 实时更新
   if (refreshInterval.value > 0) {
+    wsRealtimeEnabled.value = false
     refreshTimer = setInterval(() => {
-      if (task.value?.status === 'running') {
+      // 【修复】不仅在 running 状态，也在增量同步和暂停状态时刷新日志
+      const activeStatus = ['running', 'incremental', 'sync_incremental', 'paused']
+      if (task.value?.status && activeStatus.includes(task.value.status)) {
         fetchTask()
         fetchTaskLogs()
       }
     }, refreshInterval.value)
+  } else {
+    // 选择实时模式，启用 WebSocket
+    wsRealtimeEnabled.value = true
+    initWebSocket()
+  }
+}
+
+// ========== WebSocket 相关函数 ==========
+
+// 初始化 WebSocket 连接
+const initWebSocket = () => {
+  if (!wsRealtimeEnabled.value) return
+  
+  // 连接 WebSocket
+  if (!wsService.isConnected) {
+    wsService.connect()
+  }
+  
+  // 设置连接状态回调
+  wsService.onConnected = () => {
+    wsConnected.value = true
+    // 连接成功后订阅当前任务
+    if (taskId.value) {
+      wsService.subscribe(taskId.value)
+    }
+  }
+  
+  wsService.onDisconnected = () => {
+    wsConnected.value = false
+  }
+  
+  // 注册消息处理器
+  const unsubMetrics = wsService.on('metrics', handleMetricsUpdate)
+  const unsubLog = wsService.on('log', handleLogUpdate)
+  const unsubStatus = wsService.on('status', handleStatusUpdate)
+  
+  wsUnsubscribers = [unsubMetrics, unsubLog, unsubStatus]
+  
+  // 如果已连接，直接订阅
+  if (wsService.isConnected && taskId.value) {
+    wsService.subscribe(taskId.value)
+    wsConnected.value = true
+  }
+  
+  // 【修复】WebSocket 模式下也启动日志轮询定时器（因为后端暂未实现 WS 日志推送）
+  // 每 5 秒刷新一次日志，确保用户能看到最新日志
+  if (!refreshTimer) {
+    refreshTimer = setInterval(() => {
+      const activeStatus = ['running', 'incremental', 'sync_incremental', 'paused']
+      if (task.value?.status && activeStatus.includes(task.value.status)) {
+        fetchTaskLogs()
+      }
+    }, 5000) // 5 秒轮询一次日志
+  }
+}
+
+// 清理 WebSocket 连接
+const cleanupWebSocket = () => {
+  // 取消订阅
+  if (taskId.value) {
+    wsService.unsubscribe(taskId.value)
+  }
+  
+  // 注销处理器
+  wsUnsubscribers.forEach(unsub => unsub && unsub())
+  wsUnsubscribers = []
+  
+  // 重置回调
+  wsService.onConnected = null
+  wsService.onDisconnected = null
+}
+
+// 处理 metrics 更新
+const handleMetricsUpdate = ({ taskId: tid, payload }) => {
+  if (tid !== taskId.value) return
+  
+  console.log('[WS] Metrics update:', payload)
+  
+  // 更新任务状态
+  if (task.value && payload) {
+    task.value.status = payload.status || task.value.status
+  }
+  
+  // 更新进度信息
+  if (progress.value && payload) {
+    progress.value.percentage = payload.progress || progress.value.percentage
+    progress.value.migrated_keys = payload.processed_keys || progress.value.migrated_keys
+    progress.value.total_keys = payload.total_keys || progress.value.total_keys
+    progress.value.current_speed = payload.current_qps || progress.value.current_speed
+    
+    // 更新数据量
+    if (payload.bytes_written) {
+      progress.value.migrated_bytes = payload.bytes_written
+    }
+  }
+  
+  // 更新异常Key统计
+  if (payload) {
+    if (payload.failed_keys !== undefined || payload.skipped_keys !== undefined) {
+      // 【修复】异常总数 = 失败数 + 跳过数（移除重复的 conflict_keys）
+      errorKeys.value = {
+        total: (payload.failed_keys || 0) + (payload.skipped_keys || 0),
+        failed: payload.failed_keys || 0,
+        skipped: payload.skipped_keys || 0,
+        large_keys: payload.bigkey_found || 0
+      }
+    }
+  }
+}
+
+// 处理日志更新
+const handleLogUpdate = ({ taskId: tid, payload }) => {
+  if (tid !== taskId.value) return
+  
+  console.log('[WS] Log update:', payload)
+  
+  // 根据日志级别过滤
+  if (logLevel.value && payload.level !== logLevel.value) {
+    return
+  }
+  
+  // 添加新日志到列表开头
+  const newLog = {
+    id: Date.now(),
+    level: payload.level,
+    message: payload.message,
+    timestamp: payload.timestamp
+  }
+  
+  taskLogs.value = [newLog, ...taskLogs.value.slice(0, 99)]
+  
+  // 自动滚动到顶部
+  if (logsContainer.value) {
+    logsContainer.value.scrollTop = 0
+  }
+}
+
+// 处理状态更新
+const handleStatusUpdate = ({ taskId: tid, payload }) => {
+  if (tid !== taskId.value) return
+  
+  console.log('[WS] Status update:', payload)
+  
+  if (task.value && payload.status) {
+    const oldStatus = task.value.status
+    task.value.status = payload.status
+    
+    // 状态变化提示
+    if (oldStatus !== payload.status) {
+      const statusText = getStatusText(payload.status)
+      ElMessage.info(`任务状态已更新: ${statusText}`)
+      
+      // 如果任务完成或失败，刷新完整数据
+      if (payload.status === 'completed' || payload.status === 'failed') {
+        fetchTask()
+        fetchVerifyResults()
+        fetchErrorKeys()
+      }
+    }
   }
 }
 
@@ -632,6 +1267,64 @@ const getErrorReasonText = (reason) => {
     conflict: '键冲突'
   }
   return map[reason] || reason
+}
+
+// 筛选后的错误Key列表
+const filteredErrorKeysList = computed(() => {
+  if (!errorFilter.value) {
+    return errorKeysList.value
+  }
+  return errorKeysList.value.filter(item => {
+    if (errorFilter.value === 'failed') {
+      return item.reason === 'failed' || item.reason === 'timeout'
+    }
+    if (errorFilter.value === 'skipped') {
+      return item.reason === 'skipped' || item.reason === 'conflict'
+    }
+    if (errorFilter.value === 'large_key') {
+      return item.reason === 'large_key'
+    }
+    return true
+  })
+})
+
+// 切换错误筛选
+const toggleErrorFilter = (filter) => {
+  if (errorFilter.value === filter) {
+    errorFilter.value = ''
+  } else {
+    errorFilter.value = filter
+  }
+}
+
+// 获取筛选文本
+const getErrorFilterText = (filter) => {
+  const map = {
+    failed: '迁移失败',
+    skipped: '冲突跳过',
+    large_key: '大Key处理'
+  }
+  return map[filter] || filter
+}
+
+// 重试失败的Key
+const retryFailedKeys = async () => {
+  if (errorKeys.value.failed === 0) {
+    ElMessage.warning('没有失败的Key需要重试')
+    return
+  }
+  
+  retryingKeys.value = true
+  try {
+    await api.retryFailedKeys(taskId.value)
+    ElMessage.success('已开始重试失败的Key')
+    // 2秒后刷新错误Key列表
+    setTimeout(fetchErrorKeys, 2000)
+  } catch (err) {
+    ElMessage.error('重试失败: ' + (err.message || '未知错误'))
+  } finally {
+    retryingKeys.value = false
+  }
 }
 
 const fetchTaskLogs = async () => {
@@ -699,6 +1392,29 @@ const triggerVerify = async () => {
   }
 }
 
+// 完成任务（停止增量同步并标记完成）
+const completeTask = async () => {
+  try {
+    await api.completeTask(taskId.value, false)
+    ElMessage.success('任务已完成')
+    fetchTask()
+    fetchVerifyResults()
+  } catch (err) {
+    ElMessage.error('完成任务失败: ' + (err.message || '未知错误'))
+  }
+}
+
+// 标记任务完成（跳过校验）
+const markComplete = async () => {
+  try {
+    await api.completeTask(taskId.value, true)
+    ElMessage.success('任务已标记完成')
+    fetchTask()
+  } catch (err) {
+    ElMessage.error('标记完成失败: ' + (err.message || '未知错误'))
+  }
+}
+
 const copyToClipboard = (text) => {
   if (navigator.clipboard && window.isSecureContext) {
     return navigator.clipboard.writeText(text)
@@ -735,7 +1451,8 @@ const getStatusText = (status) => {
     running: '运行中',
     paused: '已暂停',
     completed: '已完成',
-    failed: '失败'
+    failed: '失败',
+    incremental_stopped: '增量已停止'
   }
   return map[status] || status
 }
@@ -802,10 +1519,9 @@ const getPhaseText = (phase) => {
 }
 
 const formatNumber = (num) => {
-  if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B'
-  if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M'
-  if (num >= 1000) return (num / 1000).toFixed(1) + 'K'
-  return num.toString()
+  // 精确显示，不使用 K/M/B 缩写，添加千分位分隔符
+  if (num === null || num === undefined) return '0'
+  return num.toLocaleString('zh-CN')
 }
 
 const formatBytes = (bytes) => {
@@ -818,6 +1534,53 @@ const formatBytes = (bytes) => {
 
 const formatTime = (time) => {
   return dayjs(time).format('YYYY-MM-DD HH:mm:ss')
+}
+
+// 计算并更新已耗时间（每秒调用一次）
+const updateElapsedTime = () => {
+  if (!task.value?.started_at) {
+    elapsedTimeDisplay.value = '-'
+    return
+  }
+  
+  const start = dayjs(task.value.started_at)
+  // 如果任务已完成，用完成时间；否则用当前时间
+  const end = task.value.completed_at ? dayjs(task.value.completed_at) : dayjs()
+  const diff = end.diff(start, 'second')
+  
+  const hours = Math.floor(diff / 3600)
+  const minutes = Math.floor((diff % 3600) / 60)
+  const seconds = diff % 60
+  
+  if (hours > 0) {
+    elapsedTimeDisplay.value = `${hours}h ${minutes}m ${seconds}s`
+  } else if (minutes > 0) {
+    elapsedTimeDisplay.value = `${minutes}m ${seconds}s`
+  } else {
+    elapsedTimeDisplay.value = `${seconds}s`
+  }
+}
+
+// 启动已耗时间定时器
+const startElapsedTimer = () => {
+  // 先立即更新一次
+  updateElapsedTime()
+  
+  // 清理旧定时器
+  if (elapsedTimer) {
+    clearInterval(elapsedTimer)
+  }
+  
+  // 每秒更新一次
+  elapsedTimer = setInterval(updateElapsedTime, 1000)
+}
+
+// 停止已耗时间定时器
+const stopElapsedTimer = () => {
+  if (elapsedTimer) {
+    clearInterval(elapsedTimer)
+    elapsedTimer = null
+  }
 }
 
 const getRunningTime = () => {
@@ -840,10 +1603,19 @@ onMounted(() => {
   fetchVerifyResults()
   fetchTaskLogs()
   fetchErrorKeys()
-  // 默认10秒刷新
-  if (refreshInterval.value > 0) {
+  
+  // 启动已耗时间定时器（每秒更新）
+  startElapsedTimer()
+  
+  // 默认使用 WebSocket 实时更新
+  if (wsRealtimeEnabled.value) {
+    initWebSocket()
+  } else if (refreshInterval.value > 0) {
+    // 使用轮询模式
     refreshTimer = setInterval(() => {
-      if (task.value?.status === 'running') {
+      // 【修复】不仅在 running 状态，也在增量同步(incremental/sync_incremental)和暂停(paused)状态时刷新日志
+      const activeStatus = ['running', 'incremental', 'sync_incremental', 'paused']
+      if (task.value?.status && activeStatus.includes(task.value.status)) {
         fetchTask()
         fetchTaskLogs()
         fetchErrorKeys()
@@ -853,7 +1625,34 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  if (refreshTimer) clearInterval(refreshTimer)
+  // 清理轮询定时器
+  if (refreshTimer) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
+  
+  // 清理已耗时间定时器
+  stopElapsedTimer()
+  
+  // 清理 WebSocket
+  cleanupWebSocket()
+})
+
+// 监听任务ID变化，重新订阅
+watch(taskId, (newId, oldId) => {
+  if (oldId) {
+    wsService.unsubscribe(oldId)
+  }
+  if (newId) {
+    fetchTask()
+    fetchVerifyResults()
+    fetchTaskLogs()
+    fetchErrorKeys()
+    
+    if (wsRealtimeEnabled.value && wsService.isConnected) {
+      wsService.subscribe(newId)
+    }
+  }
 })
 </script>
 
@@ -953,6 +1752,64 @@ onUnmounted(() => {
       display: flex;
       align-items: center;
       gap: 12px;
+    }
+    
+    .realtime-option {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      
+      .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #ccc;
+        
+        &.connected {
+          background: #52c41a;
+        }
+      }
+    }
+    
+    .ws-status {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 12px;
+      color: #999;
+      padding: 4px 8px;
+      border-radius: 4px;
+      background: var(--bg-primary);
+      
+      .status-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #ccc;
+      }
+      
+      &.connected {
+        color: #52c41a;
+        background: rgba(82, 196, 26, 0.1);
+        
+        .status-dot {
+          background: #52c41a;
+          box-shadow: 0 0 0 2px rgba(82, 196, 26, 0.2);
+          animation: pulse 2s infinite;
+        }
+      }
+    }
+    
+    @keyframes pulse {
+      0% {
+        box-shadow: 0 0 0 0 rgba(82, 196, 26, 0.4);
+      }
+      70% {
+        box-shadow: 0 0 0 6px rgba(82, 196, 26, 0);
+      }
+      100% {
+        box-shadow: 0 0 0 0 rgba(82, 196, 26, 0);
+      }
     }
     
     .phase-tag {
@@ -1069,6 +1926,52 @@ onUnmounted(() => {
         
         &.filtered {
           color: var(--el-color-info);
+        }
+        
+        &.muted {
+          color: var(--text-tertiary);
+          font-size: 16px;
+        }
+        
+        &.warning {
+          color: var(--el-color-warning);
+        }
+      }
+      
+      .warning-icon {
+        color: var(--el-color-warning);
+        margin-left: 4px;
+        vertical-align: middle;
+        cursor: help;
+      }
+    }
+    
+    // 紧凑布局样式
+    &.compact-layout {
+      .stat-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px 24px;
+        
+        @media (max-width: 600px) {
+          grid-template-columns: repeat(2, 1fr);
+        }
+        
+        .stat-item {
+          padding: 8px 0;
+          
+          .label {
+            font-size: 12px;
+            margin-bottom: 2px;
+          }
+          
+          .value {
+            font-size: 18px;
+            
+            &.muted {
+              font-size: 15px;
+            }
+          }
         }
       }
     }
@@ -1291,6 +2194,225 @@ onUnmounted(() => {
   }
 }
 
+// 影子模式统计样式
+.shadow-stats-section {
+  h3 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 16px;
+  }
+  
+  .shadow-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 16px;
+    margin-bottom: 20px;
+    
+    @media (max-width: 900px) {
+      grid-template-columns: repeat(3, 1fr);
+    }
+    
+    .stat-item {
+      text-align: center;
+      padding: 16px;
+      background: var(--bg-primary);
+      border-radius: var(--radius-md);
+      
+      .stat-value {
+        display: block;
+        font-size: 24px;
+        font-weight: 700;
+        color: var(--text-primary);
+        margin-bottom: 4px;
+        
+        &.highlight { color: var(--primary-color); }
+        &.warning { color: var(--el-color-warning); }
+        &.info { color: var(--el-color-info); }
+      }
+      
+      .stat-label {
+        font-size: 13px;
+        color: var(--text-secondary);
+      }
+    }
+  }
+  
+  .type-distribution {
+    h4 {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-bottom: 12px;
+    }
+    
+    .type-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      
+      .type-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 16px;
+        background: var(--bg-primary);
+        border-radius: var(--radius-sm);
+        
+        .type-name {
+          font-size: 13px;
+          color: var(--text-secondary);
+          text-transform: uppercase;
+        }
+        
+        .type-count {
+          font-size: 14px;
+          font-weight: 600;
+          color: var(--primary-color);
+        }
+      }
+    }
+  }
+}
+
+// 增量同步统计样式
+.incremental-stats-section {
+  .section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    
+    h3 {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      margin: 0;
+    }
+    
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      
+      .sync-status {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--text-secondary);
+        
+        .dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          background: var(--text-muted);
+        }
+        
+        &.syncing {
+          color: var(--success-color);
+          
+          .dot {
+            background: var(--success-color);
+            animation: pulse 1.5s infinite;
+          }
+        }
+      }
+    }
+  }
+  
+  .incr-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 20px;
+    
+    @media (max-width: 768px) {
+      grid-template-columns: repeat(2, 1fr);
+    }
+    
+    .stat-item {
+      text-align: center;
+      padding: 16px;
+      background: var(--bg-primary);
+      border-radius: var(--radius-md);
+      
+      .stat-value {
+        display: block;
+        font-size: 24px;
+        font-weight: 700;
+        color: var(--text-primary);
+        margin-bottom: 4px;
+        
+        &.highlight { color: var(--success-color); }
+        &.warning { color: var(--el-color-warning); }
+        &.error { color: var(--error-color); }
+        &.filtered { color: var(--el-color-info); }
+      }
+      
+      .stat-label {
+        font-size: 13px;
+        color: var(--text-secondary);
+      }
+    }
+  }
+  
+  .binlog-stats {
+    background: var(--bg-primary);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    
+    .binlog-stats-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 24px;
+      
+      @media (max-width: 768px) {
+        grid-template-columns: repeat(2, 1fr);
+      }
+      
+      .binlog-item {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        
+        .label {
+          font-size: 12px;
+          color: var(--text-secondary);
+        }
+        
+        .value {
+          font-size: 15px;
+          font-weight: 600;
+          color: var(--text-primary);
+          
+          &.mono {
+            font-family: monospace;
+            font-size: 13px;
+          }
+          
+          &.lag-warning {
+            color: var(--el-color-warning);
+          }
+          
+          &.warning {
+            color: var(--error-color);
+          }
+        }
+      }
+    }
+  }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
 .verify-section {
   h3 {
     display: flex;
@@ -1334,6 +2456,11 @@ onUnmounted(() => {
       font-weight: 600;
       margin: 0;
     }
+    
+    .header-actions {
+      display: flex;
+      gap: 8px;
+    }
   }
   
   .error-stats {
@@ -1347,6 +2474,22 @@ onUnmounted(() => {
       padding: 16px;
       background: var(--bg-primary);
       border-radius: var(--radius-md);
+      position: relative;
+      transition: all 0.2s ease;
+      
+      &.clickable {
+        cursor: pointer;
+        
+        &:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        
+        &.active {
+          border: 2px solid var(--primary-color);
+          background: var(--primary-lighter);
+        }
+      }
       
       .stat-value {
         display: block;
@@ -1363,13 +2506,60 @@ onUnmounted(() => {
         font-size: 13px;
         color: var(--text-secondary);
       }
+      
+      .click-hint {
+        display: block;
+        font-size: 11px;
+        color: var(--primary-color);
+        margin-top: 4px;
+        opacity: 0;
+        transition: opacity 0.2s;
+      }
+      
+      &:hover .click-hint {
+        opacity: 1;
+      }
     }
   }
   
   .error-keys-list {
+    .filter-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      padding: 8px 12px;
+      background: var(--bg-primary);
+      border-radius: var(--radius-sm);
+      
+      .filter-count {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+    }
+    
     .mono {
       font-family: 'Consolas', 'Monaco', monospace;
       font-size: 12px;
+    }
+    
+    .key-name {
+      display: inline-block;
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+    
+    .error-detail {
+      display: inline-block;
+      max-width: 230px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+      color: var(--text-secondary);
     }
     
     .list-footer {
@@ -1393,6 +2583,12 @@ onUnmounted(() => {
     
     .el-icon {
       font-size: 20px;
+    }
+    
+    &.filter-empty {
+      color: var(--text-secondary);
+      flex-direction: column;
+      gap: 12px;
     }
   }
 }
@@ -1506,5 +2702,41 @@ onUnmounted(() => {
       text-overflow: ellipsis;
     }
   }
+}
+
+// 自动恢复设置对话框样式
+.auto-recovery-status {
+  background: var(--bg-primary);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  margin-bottom: 16px;
+  
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 0;
+    font-size: 13px;
+    
+    &:not(:last-child) {
+      border-bottom: 1px dashed var(--border-light);
+    }
+    
+    .label {
+      width: 100px;
+      color: var(--text-secondary);
+      flex-shrink: 0;
+    }
+    
+    .value {
+      color: var(--text-primary);
+    }
+  }
+}
+
+.form-tip {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-top: 4px;
 }
 </style>

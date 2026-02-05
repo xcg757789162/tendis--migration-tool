@@ -5,9 +5,14 @@
         <h1>迁移任务</h1>
         <p>管理所有数据迁移任务</p>
       </div>
-      <el-button type="primary" @click="$router.push('/create')">
-        <el-icon><Plus /></el-icon> 创建任务
-      </el-button>
+      <div class="header-actions">
+        <el-button @click="showImportDialog = true">
+          <el-icon><Upload /></el-icon> 导入配置
+        </el-button>
+        <el-button type="primary" @click="$router.push('/create')">
+          <el-icon><Plus /></el-icon> 创建任务
+        </el-button>
+      </div>
     </div>
     
     <!-- 筛选栏 -->
@@ -46,9 +51,7 @@
           <template #default="{ row }">
             <div class="task-name-cell">
               <span class="name">{{ row.name }}</span>
-              <el-tooltip :content="row.id" placement="top">
-                <span class="id" @click.stop="copyTaskId(row.id)">{{ row.id }}</span>
-              </el-tooltip>
+              <span class="id" @click.stop="copyTaskId(row.id)">{{ row.id }}</span>
             </div>
           </template>
         </el-table-column>
@@ -126,6 +129,73 @@
         />
       </div>
     </div>
+    
+    <!-- 配置导入对话框 -->
+    <el-dialog v-model="showImportDialog" title="导入任务配置" width="600px">
+      <el-tabs v-model="importTab">
+        <el-tab-pane label="上传文件" name="file">
+          <el-upload
+            ref="importUploadRef"
+            :auto-upload="false"
+            :limit="1"
+            accept=".json"
+            :on-change="handleImportFileChange"
+            :file-list="importFileList"
+            drag
+            class="import-upload"
+          >
+            <el-icon class="el-icon--upload"><Upload /></el-icon>
+            <div class="el-upload__text">
+              拖拽配置文件到此处，或<em>点击上传</em>
+            </div>
+            <template #tip>
+              <div class="el-upload__tip">
+                仅支持 JSON 格式的任务配置文件（通过「导出配置」功能生成）
+              </div>
+            </template>
+          </el-upload>
+        </el-tab-pane>
+        
+        <el-tab-pane label="粘贴JSON" name="paste">
+          <el-input
+            v-model="importJsonText"
+            type="textarea"
+            :rows="10"
+            placeholder="粘贴任务配置 JSON..."
+          />
+        </el-tab-pane>
+      </el-tabs>
+      
+      <!-- 配置预览 -->
+      <div class="import-preview" v-if="importPreview">
+        <h4>配置预览</h4>
+        <div class="preview-item">
+          <span class="label">任务名称:</span>
+          <span class="value">{{ importPreview.name }}</span>
+        </div>
+        <div class="preview-item">
+          <span class="label">迁移模式:</span>
+          <el-tag size="small" :type="importPreview.migration_mode === 'full_only' ? 'info' : 'success'">
+            {{ importPreview.migration_mode === 'full_only' ? '全量迁移' : '全量+增量' }}
+          </el-tag>
+        </div>
+        <div class="preview-item">
+          <span class="label">源集群:</span>
+          <span class="value mono">{{ formatCluster(importPreview.source_cluster) }}</span>
+        </div>
+        <div class="preview-item">
+          <span class="label">目标集群:</span>
+          <span class="value mono">{{ formatCluster(importPreview.target_cluster) }}</span>
+        </div>
+      </div>
+      
+      <template #footer>
+        <el-button @click="showImportDialog = false">取消</el-button>
+        <el-button type="primary" @click="doImportConfig" :loading="importing" :disabled="!importPreview">
+          创建任务
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -146,6 +216,15 @@ const pageSize = ref(20)
 const searchText = ref('')
 const statusFilter = ref('')
 let refreshTimer = null
+
+// 配置导入相关
+const showImportDialog = ref(false)
+const importTab = ref('file')
+const importUploadRef = ref(null)
+const importFileList = ref([])
+const importJsonText = ref('')
+const importPreview = ref(null)
+const importing = ref(false)
 
 // 监听路由参数变化
 watch(() => route.query.status, (newStatus) => {
@@ -242,10 +321,9 @@ const getRowClass = ({ row }) => {
 }
 
 const formatNumber = (num) => {
-  if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B'
-  if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M'
-  if (num >= 1000) return (num / 1000).toFixed(1) + 'K'
-  return num.toString()
+  // 精确显示，不使用 K/M/B 缩写，添加千分位分隔符
+  if (num === null || num === undefined) return '0'
+  return num.toLocaleString('zh-CN')
 }
 
 const formatTime = (time) => {
@@ -280,6 +358,75 @@ const copyTaskId = async (id) => {
   } catch (err) {
     ElMessage.error('复制失败')
   }
+}
+
+// 配置导入相关方法
+const handleImportFileChange = (file) => {
+  if (!file.raw) return
+  
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    try {
+      const config = JSON.parse(e.target.result)
+      importPreview.value = config
+      importJsonText.value = e.target.result
+    } catch (err) {
+      ElMessage.error('JSON 格式解析失败')
+      importPreview.value = null
+    }
+  }
+  reader.readAsText(file.raw)
+}
+
+// 监听 JSON 文本变化
+watch(importJsonText, (newVal) => {
+  if (importTab.value === 'paste' && newVal.trim()) {
+    try {
+      importPreview.value = JSON.parse(newVal)
+    } catch {
+      importPreview.value = null
+    }
+  }
+})
+
+// 执行导入
+const doImportConfig = async () => {
+  if (!importPreview.value) {
+    ElMessage.error('请先上传或粘贴有效的配置')
+    return
+  }
+  
+  importing.value = true
+  try {
+    const result = await api.importTaskConfig(importPreview.value)
+    ElMessage.success('任务创建成功')
+    showImportDialog.value = false
+    
+    // 重置状态
+    importPreview.value = null
+    importJsonText.value = ''
+    importFileList.value = []
+    
+    // 跳转到任务详情
+    const taskId = result?.task_id || result?.id
+    if (taskId) {
+      router.push(`/tasks/${taskId}`)
+    } else {
+      fetchTasks()
+    }
+  } catch (err) {
+    ElMessage.error('导入失败: ' + (err.message || '未知错误'))
+  } finally {
+    importing.value = false
+  }
+}
+
+// 格式化集群地址
+const formatCluster = (cluster) => {
+  if (!cluster) return '-'
+  if (typeof cluster === 'string') return cluster
+  if (cluster.addrs) return cluster.addrs.join(', ')
+  return JSON.stringify(cluster)
 }
 
 onMounted(() => {
@@ -401,5 +548,62 @@ onUnmounted(() => {
   display: flex;
   justify-content: flex-end;
   border-top: 1px solid var(--border-light);
+}
+
+.header-actions {
+  display: flex;
+  gap: 12px;
+}
+
+// 导入对话框样式
+.import-upload {
+  width: 100%;
+  
+  :deep(.el-upload-dragger) {
+    padding: 30px 20px;
+  }
+}
+
+.import-preview {
+  margin-top: 20px;
+  padding: 16px;
+  background: var(--bg-primary);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-light);
+  
+  h4 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+  }
+  
+  .preview-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 0;
+    font-size: 13px;
+    
+    &:not(:last-child) {
+      border-bottom: 1px dashed var(--border-light);
+    }
+    
+    .label {
+      width: 80px;
+      color: var(--text-secondary);
+      flex-shrink: 0;
+    }
+    
+    .value {
+      color: var(--text-primary);
+      
+      &.mono {
+        font-family: 'Consolas', 'Monaco', monospace;
+        font-size: 12px;
+        word-break: break-all;
+      }
+    }
+  }
 }
 </style>

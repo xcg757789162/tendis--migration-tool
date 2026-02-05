@@ -18,6 +18,7 @@ type Server struct {
 	master *engine.Master
 	router *gin.Engine
 	port   int
+	wsHub  *WebSocketHub // WebSocket Hub
 }
 
 // NewServer 创建API服务器
@@ -36,10 +37,14 @@ func NewServer(master *engine.Master, port int) *Server {
 		MaxAge:           12 * time.Hour,
 	}))
 
+	// 创建 WebSocket Hub
+	wsHub := NewWebSocketHub()
+
 	s := &Server{
 		master: master,
 		router: router,
 		port:   port,
+		wsHub:  wsHub,
 	}
 
 	s.setupRoutes()
@@ -61,11 +66,18 @@ func (s *Server) setupRoutes() {
 			tasks.POST("/:id/start", s.startTask)
 			tasks.POST("/:id/pause", s.pauseTask)
 			tasks.POST("/:id/resume", s.resumeTask)
+			tasks.POST("/:id/stop", s.stopTask)      // 停止任务（也是停止增量同步）
+			tasks.POST("/:id/complete", s.completeTask) // 完成任务（停止+可选校验+标记完成）
 			tasks.GET("/:id/progress", s.getProgress)
 			tasks.GET("/:id/metrics", s.getMetrics)
 			tasks.POST("/:id/verify", s.triggerVerify)
 			tasks.GET("/:id/verify/results", s.getVerifyResults)
 			tasks.GET("/:id/report", s.getReport)
+			
+			// 冲突 Key 管理（这是我们相比 Redis-Shake 的重要优势）
+			tasks.GET("/:id/conflicts", s.getConflictKeys)          // 查询冲突 Key
+			tasks.GET("/:id/conflicts/summary", s.getConflictSummary) // 获取统计摘要
+			tasks.GET("/:id/conflicts/export", s.exportConflictKeys) // 导出冲突 Key
 		}
 
 		// 系统信息
@@ -76,6 +88,9 @@ func (s *Server) setupRoutes() {
 		// 测试连接
 		v1.POST("/test-connection", s.testConnection)
 	}
+
+	// WebSocket 路由 (实时监控)
+	s.router.GET("/ws", s.wsHub.HandleWebSocket)
 
 	// 静态文件（前端）
 	s.router.Static("/assets", "./web/dist/assets")
@@ -89,6 +104,32 @@ func (s *Server) setupRoutes() {
 func (s *Server) Run() error {
 	addr := ":" + strconv.Itoa(s.port)
 	return s.router.Run(addr)
+}
+
+// GetWebSocketHub 获取 WebSocket Hub
+func (s *Server) GetWebSocketHub() *WebSocketHub {
+	return s.wsHub
+}
+
+// BroadcastTaskMetrics 广播任务指标 (供外部调用)
+func (s *Server) BroadcastTaskMetrics(taskId string, metrics *TaskMetrics) {
+	if s.wsHub != nil {
+		s.wsHub.BroadcastMetrics(taskId, metrics)
+	}
+}
+
+// BroadcastTaskStatus 广播任务状态变更
+func (s *Server) BroadcastTaskStatus(taskId string, status string) {
+	if s.wsHub != nil {
+		s.wsHub.BroadcastStatus(taskId, status)
+	}
+}
+
+// BroadcastTaskLog 广播任务日志
+func (s *Server) BroadcastTaskLog(taskId string, level string, message string) {
+	if s.wsHub != nil {
+		s.wsHub.BroadcastLog(taskId, level, message)
+	}
 }
 
 // Response 通用响应
@@ -294,6 +335,38 @@ func (s *Server) resumeTask(c *gin.Context) {
 	}
 
 	success(c, nil)
+}
+
+// stopTask 停止任务（也是停止增量同步的方式）
+// 简化设计：停止增量同步 = 停止任务
+func (s *Server) stopTask(c *gin.Context) {
+	taskID := c.Param("id")
+
+	if err := s.master.StopTask(taskID); err != nil {
+		fail(c, 500, "Stop task failed: "+err.Error())
+		return
+	}
+
+	success(c, map[string]interface{}{
+		"message": "Task stopped (incremental sync also stopped)",
+	})
+}
+
+// completeTask 完成任务（停止任务，可选触发校验，标记完成）
+func (s *Server) completeTask(c *gin.Context) {
+	taskID := c.Param("id")
+	
+	// 可选参数：是否跳过校验
+	skipVerify := c.Query("skip_verify") == "true"
+
+	if err := s.master.CompleteTask(taskID, skipVerify); err != nil {
+		fail(c, 500, "Complete task failed: "+err.Error())
+		return
+	}
+
+	success(c, map[string]interface{}{
+		"message": "Task completed successfully",
+	})
 }
 
 func (s *Server) getProgress(c *gin.Context) {
@@ -638,3 +711,139 @@ func splitLines(s string) []string {
 	}
 	return lines
 }
+
+// =====================================================
+// 冲突 Key 管理 API（这是我们相比 Redis-Shake 的重要优势）
+// Redis-Shake 不支持跳过已存在的 Key，也不记录冲突 Key
+// =====================================================
+
+// getConflictKeys 查询冲突 Key 列表
+// GET /api/v1/tasks/:id/conflict-keys?page=1&size=100&prefix=&type=&phase=&action=
+func (s *Server) getConflictKeys(c *gin.Context) {
+	taskID := c.Param("id")
+	
+	// 解析分页参数
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	size, _ := strconv.Atoi(c.DefaultQuery("size", "100"))
+	
+	if page < 1 {
+		page = 1
+	}
+	if size <= 0 {
+		size = 100
+	}
+	if size > 1000 {
+		size = 1000 // 最大1000条
+	}
+	
+	// 解析过滤参数
+	filter := &engine.ConflictKeyFilter{
+		KeyPrefix: c.Query("prefix"),
+		KeyType:   c.Query("type"),
+		Phase:     c.Query("phase"),
+		Action:    c.Query("action"),
+	}
+	
+	// 解析时间范围
+	if startTime := c.Query("start_time"); startTime != "" {
+		if t, err := time.Parse(time.RFC3339, startTime); err == nil {
+			filter.StartTime = &t
+		}
+	}
+	if endTime := c.Query("end_time"); endTime != "" {
+		if t, err := time.Parse(time.RFC3339, endTime); err == nil {
+			filter.EndTime = &t
+		}
+	}
+	
+	// 获取冲突 Key 存储
+	conflictStore := s.master.GetConflictKeyStore(taskID)
+	if conflictStore == nil {
+		// 如果没有冲突 Key 存储，返回空结果
+		success(c, map[string]interface{}{
+			"total": 0,
+			"page":  page,
+			"size":  size,
+			"keys":  []interface{}{},
+		})
+		return
+	}
+	
+	// 查询
+	result, err := conflictStore.Query(page, size, filter)
+	if err != nil {
+		fail(c, 500, "Query conflict keys failed: "+err.Error())
+		return
+	}
+	
+	success(c, result)
+}
+
+// getConflictSummary 获取冲突 Key 统计摘要
+// GET /api/v1/tasks/:id/conflict-keys/summary
+func (s *Server) getConflictSummary(c *gin.Context) {
+	taskID := c.Param("id")
+	
+	conflictStore := s.master.GetConflictKeyStore(taskID)
+	if conflictStore == nil {
+		success(c, map[string]interface{}{
+			"total_count":   0,
+			"memory_count":  0,
+			"disk_count":    0,
+			"by_phase":      map[string]int64{},
+			"by_action":     map[string]int64{},
+			"by_type":       map[string]int64{},
+		})
+		return
+	}
+	
+	summary := conflictStore.GetSummary()
+	success(c, summary)
+}
+
+// exportConflictKeys 导出冲突 Key
+// GET /api/v1/tasks/:id/conflict-keys/export?format=jsonl|json|csv
+func (s *Server) exportConflictKeys(c *gin.Context) {
+	taskID := c.Param("id")
+	format := c.DefaultQuery("format", "jsonl")
+	
+	conflictStore := s.master.GetConflictKeyStore(taskID)
+	if conflictStore == nil {
+		fail(c, 404, "No conflict keys found for this task")
+		return
+	}
+	
+	// 解析过滤参数
+	filter := &engine.ConflictKeyFilter{
+		KeyPrefix: c.Query("prefix"),
+		KeyType:   c.Query("type"),
+		Phase:     c.Query("phase"),
+		Action:    c.Query("action"),
+	}
+	
+	// 设置响应头
+	var contentType string
+	var filename string
+	switch format {
+	case "json":
+		contentType = "application/json"
+		filename = taskID + "_conflict_keys.json"
+	case "csv":
+		contentType = "text/csv"
+		filename = taskID + "_conflict_keys.csv"
+	default:
+		contentType = "application/x-ndjson"
+		filename = taskID + "_conflict_keys.jsonl"
+		format = "jsonl"
+	}
+	
+	c.Header("Content-Type", contentType)
+	c.Header("Content-Disposition", "attachment; filename=\""+filename+"\"")
+	
+	// 导出
+	if err := conflictStore.Export(c.Writer, format, filter); err != nil {
+		// 已经开始写入响应，无法返回错误JSON
+		c.Writer.WriteString("\n\nExport error: " + err.Error())
+	}
+}
+

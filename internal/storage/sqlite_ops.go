@@ -401,3 +401,205 @@ func (s *SQLiteDB) GetProgressSnapshots(taskID string, limit int) ([]*ProgressSn
 
 	return snapshots, rows.Err()
 }
+
+// ========== 容错增强操作 ==========
+
+// GetFailedSlots 获取所有失败的 Slot（用于自动重试）
+func (s *SQLiteDB) GetFailedSlots(taskID string) ([]int, error) {
+	rows, err := s.db.Query(`
+		SELECT slot FROM slot_status 
+		WHERE task_id = ? AND status = 'failed'
+		ORDER BY slot
+	`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var slots []int
+	for rows.Next() {
+		var slot int
+		if err := rows.Scan(&slot); err != nil {
+			return nil, err
+		}
+		slots = append(slots, slot)
+	}
+
+	return slots, nil
+}
+
+// ResetFailedSlots 重置失败的 Slot 为 pending 状态（用于重试）
+func (s *SQLiteDB) ResetFailedSlots(taskID string) (int64, error) {
+	result, err := s.db.Exec(`
+		UPDATE slot_status
+		SET status = 'pending', last_cursor = '0', updated_at = ?
+		WHERE task_id = ? AND status = 'failed'
+	`, time.Now().Format(time.RFC3339), taskID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// ResetInProgressSlots 重置进行中的 Slot 为 pending（用于崩溃恢复）
+func (s *SQLiteDB) ResetInProgressSlots(taskID string) (int64, error) {
+	result, err := s.db.Exec(`
+		UPDATE slot_status
+		SET status = 'pending', updated_at = ?
+		WHERE task_id = ? AND status = 'in_progress'
+	`, time.Now().Format(time.RFC3339), taskID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// GetResumableTask 获取可恢复的任务（状态为 running 或 paused）
+func (s *SQLiteDB) GetResumableTask(taskID string) (*Task, error) {
+	query := `
+		SELECT id, name, status, phase, created_at, updated_at,
+		       source_cluster, target_cluster, source_password, target_password,
+		       migration_mode, num_workers, keys_total, keys_migrated, keys_failed,
+		       keys_skipped, keys_filtered, bytes_migrated, bytes_total,
+		       full_start_at, incr_start_at, completed_at, options
+		FROM tasks 
+		WHERE id = ? AND status IN ('running', 'paused', 'failed')
+	`
+
+	task := &Task{}
+	err := s.db.QueryRow(query, taskID).Scan(
+		&task.ID, &task.Name, &task.Status, &task.Phase, &task.CreatedAt, &task.UpdatedAt,
+		&task.SourceCluster, &task.TargetCluster, &task.SourcePassword, &task.TargetPassword,
+		&task.MigrationMode, &task.NumWorkers, &task.KeysTotal, &task.KeysMigrated, &task.KeysFailed,
+		&task.KeysSkipped, &task.KeysFiltered, &task.BytesMigrated, &task.BytesTotal,
+		&task.FullStartAt, &task.IncrStartAt, &task.CompletedAt, &task.Options,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("no resumable task found: %s", taskID)
+	}
+
+	return task, err
+}
+
+// GetAllResumableTasks 获取所有可恢复的任务
+func (s *SQLiteDB) GetAllResumableTasks() ([]*Task, error) {
+	query := `
+		SELECT id, name, status, phase, created_at, updated_at,
+		       source_cluster, target_cluster, migration_mode, num_workers,
+		       keys_total, keys_migrated, keys_failed, bytes_migrated
+		FROM tasks 
+		WHERE status IN ('running', 'paused')
+		ORDER BY updated_at DESC
+	`
+
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tasks := []*Task{}
+	for rows.Next() {
+		task := &Task{}
+		err := rows.Scan(
+			&task.ID, &task.Name, &task.Status, &task.Phase, &task.CreatedAt, &task.UpdatedAt,
+			&task.SourceCluster, &task.TargetCluster, &task.MigrationMode, &task.NumWorkers,
+			&task.KeysTotal, &task.KeysMigrated, &task.KeysFailed, &task.BytesMigrated,
+		)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+
+	return tasks, rows.Err()
+}
+
+// RecordSlotRetry 记录 Slot 重试信息
+func (s *SQLiteDB) RecordSlotRetry(taskID string, slot int, retryCount int, lastError string) error {
+	// 注意：需要在 slot_status 表中添加 retry_count 和 last_error 字段
+	// 这里先使用简单方案：更新 updated_at 并保持状态
+	query := `
+		UPDATE slot_status
+		SET updated_at = ?
+		WHERE task_id = ? AND slot = ?
+	`
+	_, err := s.db.Exec(query, time.Now().Format(time.RFC3339), taskID, slot)
+	return err
+}
+
+// ========== 增量同步断点操作 ==========
+
+// IncrementalCheckpoint 增量同步断点结构
+type IncrementalCheckpoint struct {
+	TaskID      string `json:"task_id"`
+	NodeID      string `json:"node_id"`
+	LastEventID string `json:"last_event_id"` // 最后处理的事件 ID
+	LastOffset  int64  `json:"last_offset"`   // 消费位点
+	UpdatedAt   string `json:"updated_at"`
+}
+
+// SaveIncrementalCheckpoint 保存增量同步断点
+func (s *SQLiteDB) SaveIncrementalCheckpoint(cp *IncrementalCheckpoint) error {
+	query := `
+		INSERT INTO incremental_checkpoints (task_id, node_id, last_event_id, last_offset, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(task_id, node_id) DO UPDATE SET
+			last_event_id = excluded.last_event_id,
+			last_offset = excluded.last_offset,
+			updated_at = excluded.updated_at
+	`
+	_, err := s.db.Exec(query, cp.TaskID, cp.NodeID, cp.LastEventID, cp.LastOffset, time.Now().Format(time.RFC3339))
+	return err
+}
+
+// GetIncrementalCheckpoint 获取增量同步断点
+func (s *SQLiteDB) GetIncrementalCheckpoint(taskID, nodeID string) (*IncrementalCheckpoint, error) {
+	query := `
+		SELECT task_id, node_id, last_event_id, last_offset, updated_at
+		FROM incremental_checkpoints
+		WHERE task_id = ? AND node_id = ?
+	`
+	cp := &IncrementalCheckpoint{}
+	err := s.db.QueryRow(query, taskID, nodeID).Scan(
+		&cp.TaskID, &cp.NodeID, &cp.LastEventID, &cp.LastOffset, &cp.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return cp, err
+}
+
+// ========== 数据库备份操作 ==========
+
+// BackupDatabase 备份数据库到指定路径
+func (s *SQLiteDB) BackupDatabase(backupPath string) error {
+	// 使用 VACUUM INTO 进行在线备份（SQLite 3.27+）
+	_, err := s.db.Exec(fmt.Sprintf("VACUUM INTO '%s'", backupPath))
+	return err
+}
+
+// GetDatabaseStats 获取数据库统计信息
+func (s *SQLiteDB) GetDatabaseStats() (map[string]interface{}, error) {
+	stats := make(map[string]interface{})
+
+	// 获取各表行数
+	tables := []string{"tasks", "slot_status", "worker_status", "queue_metadata", "progress_snapshots"}
+	for _, table := range tables {
+		var count int
+		err := s.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count)
+		if err != nil {
+			continue
+		}
+		stats[table+"_count"] = count
+	}
+
+	// 获取数据库大小（页数 * 页大小）
+	var pageCount, pageSize int
+	s.db.QueryRow("PRAGMA page_count").Scan(&pageCount)
+	s.db.QueryRow("PRAGMA page_size").Scan(&pageSize)
+	stats["database_size_bytes"] = pageCount * pageSize
+
+	return stats, nil
+}

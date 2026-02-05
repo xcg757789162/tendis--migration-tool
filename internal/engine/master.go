@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	"tendis-migrate/internal/ipc"
 	"tendis-migrate/internal/model"
@@ -46,6 +47,10 @@ type Master struct {
 	
 	tasks        map[string]*TaskRunner
 	tasksMu      sync.RWMutex
+	
+	// 冲突 Key 存储（每个任务一个）
+	conflictStores   map[string]*ConflictKeyStore
+	conflictStoresMu sync.RWMutex
 	
 	state        atomic.Int32
 	
@@ -90,11 +95,12 @@ func NewMaster(cfg *Config) (*Master, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	m := &Master{
-		config:     cfg,
-		store:      store,
-		tasks:      make(map[string]*TaskRunner),
-		ctx:        ctx,
-		cancel:     cancel,
+		config:         cfg,
+		store:          store,
+		tasks:          make(map[string]*TaskRunner),
+		conflictStores: make(map[string]*ConflictKeyStore),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 
 	// 创建IPC服务
@@ -191,7 +197,7 @@ func (m *Master) heartbeatLoop() {
 
 // recoverTasks 恢复未完成的任务
 func (m *Master) recoverTasks() error {
-	tasks, _, err := m.store.ListTasks("running", 1, 100)
+	tasks, _, err := m.store.ListTasksWithFilter("running", 1, 100)
 	if err != nil {
 		return err
 	}
@@ -216,7 +222,7 @@ func (m *Master) CreateTask(req *CreateTaskRequest) (*model.Task, error) {
 		Config:        storage.ToJSON(req.Options),
 	}
 
-	if err := m.store.CreateTask(task); err != nil {
+	if err := m.store.CreateTaskModel(task); err != nil {
 		return nil, err
 	}
 
@@ -228,7 +234,7 @@ func (m *Master) CreateTask(req *CreateTaskRequest) (*model.Task, error) {
 
 // StartTask 启动任务
 func (m *Master) StartTask(taskID string) error {
-	task, err := m.store.GetTask(taskID)
+	task, err := m.store.GetTaskModel(taskID)
 	if err != nil {
 		return err
 	}
@@ -291,7 +297,8 @@ func (m *Master) ResumeTask(taskID string) error {
 	return m.StartTask(taskID)
 }
 
-// StopTask 停止任务
+// StopTask 停止任务（也是停止增量同步的方式）
+// 简化设计：停止增量同步 = 停止任务
 func (m *Master) StopTask(taskID string) error {
 	m.tasksMu.Lock()
 	runner, ok := m.tasks[taskID]
@@ -307,6 +314,31 @@ func (m *Master) StopTask(taskID string) error {
 	return m.store.UpdateTaskStatus(taskID, model.TaskStatusPaused)
 }
 
+// CompleteTask 完成任务（停止任务，可选触发校验，标记完成）
+// 这是用户主动结束迁移任务的方式
+func (m *Master) CompleteTask(taskID string, skipVerify bool) error {
+	// 检查任务是否还在运行
+	m.tasksMu.Lock()
+	runner, ok := m.tasks[taskID]
+	if ok {
+		delete(m.tasks, taskID)
+		runner.Stop()
+	}
+	m.tasksMu.Unlock()
+
+	// 如果需要校验
+	if !skipVerify && ok {
+		// 触发最终校验
+		_, err := runner.TriggerVerify()
+		if err != nil {
+			log.Printf("Final verification failed: %v", err)
+		}
+	}
+
+	// 标记任务完成
+	return m.store.UpdateTaskCompleted(taskID, model.TaskStatusCompleted)
+}
+
 // DeleteTask 删除任务
 func (m *Master) DeleteTask(taskID string) error {
 	// 先停止任务
@@ -316,17 +348,17 @@ func (m *Master) DeleteTask(taskID string) error {
 
 // GetTask 获取任务
 func (m *Master) GetTask(taskID string) (*model.Task, error) {
-	return m.store.GetTask(taskID)
+	return m.store.GetTaskModel(taskID)
 }
 
 // ListTasks 获取任务列表
 func (m *Master) ListTasks(status string, page, size int) ([]*model.Task, int, error) {
-	return m.store.ListTasks(status, page, size)
+	return m.store.ListTasksWithFilter(status, page, size)
 }
 
 // GetTaskProgress 获取任务进度
 func (m *Master) GetTaskProgress(taskID string) (*model.Progress, error) {
-	return m.store.GetTaskProgress(taskID)
+	return m.store.GetTaskProgressModel(taskID)
 }
 
 // GetTaskStats 获取任务统计
@@ -363,7 +395,7 @@ func (m *Master) handleCheckpointReport(conn net.Conn, msg *ipc.Message) error {
 	cp := &model.Checkpoint{
 		WorkerID:      report.WorkerID,
 		SlotID:        report.SlotID,
-		Cursor:        report.Cursor,
+		Cursor:        fmt.Sprintf("%d", report.Cursor), // 转换为字符串
 		KeysMigrated:  report.Keys,
 		BytesMigrated: report.Bytes,
 		LastKey:       report.LastKey,
@@ -433,6 +465,56 @@ func (m *Master) handlePong(conn net.Conn, msg *ipc.Message) error {
 // Store 获取存储
 func (m *Master) Store() *storage.SQLiteStore {
 	return m.store
+}
+
+// GetConflictKeyStore 获取冲突 Key 存储
+// 这是我们相比 Redis-Shake 的重要优势
+func (m *Master) GetConflictKeyStore(taskID string) *ConflictKeyStore {
+	m.conflictStoresMu.RLock()
+	store, ok := m.conflictStores[taskID]
+	m.conflictStoresMu.RUnlock()
+	
+	if ok {
+		return store
+	}
+	
+	return nil
+}
+
+// GetOrCreateConflictKeyStore 获取或创建冲突 Key 存储
+func (m *Master) GetOrCreateConflictKeyStore(taskID string, source, target redis.UniversalClient) (*ConflictKeyStore, error) {
+	m.conflictStoresMu.Lock()
+	defer m.conflictStoresMu.Unlock()
+	
+	if store, ok := m.conflictStores[taskID]; ok {
+		return store, nil
+	}
+	
+	// 创建新的冲突 Key 存储
+	config := &ConflictKeyStoreConfig{
+		TaskID:      taskID,
+		MemoryLimit: 100000, // 内存最多存储 10 万条
+		DiskDir:     filepath.Join(m.config.DataDir, "conflicts"),
+	}
+	
+	store, err := NewConflictKeyStore(config, source, target)
+	if err != nil {
+		return nil, err
+	}
+	
+	m.conflictStores[taskID] = store
+	return store, nil
+}
+
+// CloseConflictKeyStore 关闭冲突 Key 存储
+func (m *Master) CloseConflictKeyStore(taskID string) {
+	m.conflictStoresMu.Lock()
+	defer m.conflictStoresMu.Unlock()
+	
+	if store, ok := m.conflictStores[taskID]; ok {
+		store.Close()
+		delete(m.conflictStores, taskID)
+	}
 }
 
 // IPCServer 获取IPC服务

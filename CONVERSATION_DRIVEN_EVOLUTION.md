@@ -322,6 +322,71 @@
 
 ---
 
+## 第七阶段：v2.3.0 BUG 修复版（2026-02-09）
+
+### 7.1 BUG-1: key_filter.prefixes 参数不生效
+
+**问题描述**：用户配置 `key_filter.prefixes: ["testkey"]` 后，过滤不生效。
+
+**根因分析**：配置时只设置了 `prefixes`，但 `mode` 字段为空，导致过滤器未启用。
+
+**修复方案**：
+```go
+// NormalizeKeyFilter 自动设置 mode
+if len(config.Prefixes) > 0 && config.Mode == "" {
+    config.Mode = "prefix"
+}
+```
+
+### 7.2 BUG-2: 增量同步 RocksDB Key 解析
+
+**问题描述**：增量同步时从 RocksDB RecordKey 中提取 Redis Key 不正确。
+
+**根因分析**：RocksDB RecordKey 格式包含 9 字节头部 + varint 长度前缀，原解析逻辑不完整。
+
+**修复方案**：改进 `extractRedisKey()` 函数，正确处理 varint 长度前缀。
+
+### 7.3 BUG-3: 增量失败 Key 记录
+
+**问题描述**：增量同步失败时部分路径未记录 ErrorKey。
+
+**修复方案**：确保所有失败路径都调用 `addErrorKeyWithDetails()`。
+
+### 7.4 增量 Key 过滤功能验证
+
+**测试环境**：Docker 服务器 192.168.1.19
+
+**测试步骤**：
+1. 创建带 `key_filter.prefixes: ["testkey"]` 的任务
+2. 启动任务，等待进入增量同步阶段
+3. 在源端写入 `testkey:*` 和 `otherkey:*` 数据
+4. 验证目标端只有 `testkey:*` 数据
+
+**测试结果**：
+
+| 测试项 | 数据类型 | Key | 预期行为 | 实际结果 |
+|--------|---------|-----|---------|---------|
+| 1 | String | `testkey:incr_filter_test` | ✅ 同步 | ✅ 已同步 |
+| 2 | String | `otherkey:incr_filter_test` | ❌ 过滤 | ✅ 已过滤 |
+| 3 | Hash | `testkey:hash_filter_test` | ✅ 同步 | ✅ 已同步 |
+| 4 | Hash | `otherkey:hash_filter_test` | ❌ 过滤 | ✅ 已过滤 |
+| 5 | List | `testkey:list_filter_test` | ✅ 同步 | ✅ 已同步 |
+| 6 | List | `otherkey:list_filter_test` | ❌ 过滤 | ✅ 已过滤 |
+
+**统计数据**：
+- `incr_keys_synced: 6` - 同步了 6 个 binlog entry
+- `incr_keys_filtered: 6` - 过滤了 6 个 binlog entry
+- `incr_heartbeats: 1397` - INCRSYNC 连接正常
+
+**日志证据**：
+```
+[FakeSlave] Filtered entry: opType=SET, key="otherkey:incr_filter_test"
+[FakeSlave] Filtered entry: opType=SET, key="otherkey:hash_filter_test"
+[FakeSlave] Filtered entry: opType=SET, key="otherkey:list_filter_test"
+```
+
+---
+
 ## 附录：关键对话片段
 
 ### A. 40 亿 Key 方案讨论
@@ -362,17 +427,18 @@
 
 | 指标 | 数量 |
 |------|------|
-| 总对话轮次 | 300+ |
+| 总对话轮次 | 316+ |
 | 需求变更次数 | 15+ |
 | 重大方案调整 | 5 |
-| 严重 Bug 修复 | 15+ |
+| 严重 Bug 修复 | 18+ |
 | 环境切换 | 2 |
 | 代码重构 | 3 |
 | UI 优化迭代 | 10+ |
 | 文档数量 | 15+ |
+| 版本发布 | 3 (v2.1, v2.2, **v2.3**) |
 
 ---
 
 *文档生成时间：2026-02-05*
-*最后更新：第 300 轮对话后*
+*最后更新：v2.3.0 发布后（2026-02-09）*
 *基于用户与 AI 助手的对话历史整理*

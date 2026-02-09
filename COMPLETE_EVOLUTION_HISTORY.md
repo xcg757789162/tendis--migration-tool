@@ -1400,6 +1400,126 @@ AI：部署完成，服务已启动（PID: 40315）：
 
 ---
 
+## 第二十阶段：v2.3.0 BUG 修复版（2026-02-09）
+
+### 对话 301-316：增量 Key 过滤功能验证与 BUG 修复
+
+**第 301-303 轮：BUG-1 key_filter.prefixes 不生效**
+
+用户发现配置 `key_filter.prefixes: ["testkey"]` 后过滤不生效。
+
+**问题排查**：
+```go
+// 原代码：prefixes 有值但 mode 为空
+options.key_filter = {
+    prefixes: ["testkey"],
+    mode: ""  // 空！导致过滤器未启用
+}
+```
+
+**修复方案**：
+```go
+func NormalizeKeyFilter(config *KeyFilterConfig) {
+    if len(config.Prefixes) > 0 && config.Mode == "" {
+        config.Mode = "prefix"  // 自动设置
+    }
+}
+```
+
+**第 304-306 轮：测试环境准备**
+
+用户要求验证增量同步的 Key 过滤功能。部署测试环境：
+- Docker 服务器：192.168.1.19
+- 源端 Tendis：7001
+- 目标端 Tendis：8001
+- 迁移工具：本地编译 darwin 版本
+
+**第 307-308 轮：创建测试任务**
+
+创建带 Key 过滤的迁移任务：
+```json
+{
+    "name": "增量Key过滤测试",
+    "migration_mode": "full_and_incremental",
+    "options": {
+        "key_filter": {
+            "prefixes": ["testkey"]
+        }
+    }
+}
+```
+
+任务启动后：
+- 全量同步完成
+- 进入增量同步阶段
+- INCRSYNC 连接成功，心跳正常
+
+**第 309-312 轮：增量过滤验证**
+
+在源端写入测试数据：
+```bash
+# 应该同步的 Key
+SET testkey:incr_filter_test match_value_should_sync
+HSET testkey:hash_filter_test field1 value1
+LPUSH testkey:list_filter_test item1 item2
+
+# 应该被过滤的 Key
+SET otherkey:incr_filter_test nomatch_value_should_filter
+HSET otherkey:hash_filter_test field1 value1
+LPUSH otherkey:list_filter_test item1 item2
+```
+
+**验证结果**：
+
+| Key 类型 | testkey:* | otherkey:* |
+|----------|-----------|------------|
+| String | ✅ 目标端存在 | ✅ 目标端不存在（已过滤） |
+| Hash | ✅ 目标端存在 | ✅ 目标端不存在（已过滤） |
+| List | ✅ 目标端存在 | ✅ 目标端不存在（已过滤） |
+
+**统计数据**：
+```
+incr_keys_synced: 6     ← 同步了 testkey:* 相关操作
+incr_keys_filtered: 6   ← 过滤了 otherkey:* 相关操作
+incr_heartbeats: 1397   ← INCRSYNC 连接稳定
+```
+
+**日志输出**：
+```
+[FakeSlave] Filtered entry: opType=SET, key="otherkey:incr_filter_test"
+[FakeSlave] Filtered entry: opType=SET, key="otherkey:hash_filter_test"
+[FakeSlave] Filtered entry: opType=SET, key="otherkey:list_filter_test"
+```
+
+**第 313-316 轮：版本发布**
+
+1. 添加版本常量：
+```go
+const (
+    Version   = "2.3.0"
+    BuildDate = "2026-02-09"
+)
+```
+
+2. 更新 README.md，添加 v2.3.0 更新内容
+
+3. Git 提交：
+```bash
+git commit -m "v2.3.0: BUG修复 - Key过滤、RocksDB解析、增量同步"
+git tag -a v2.3.0 -m "Version 2.3.0 - BUG修复版"
+git push origin main --tags
+```
+
+4. 推送到 GitHub：https://github.com/xcg757789162/tendis--migration-tool
+
+**小结**：301-316 轮，完成了 v2.3.0 版本的开发和发布：
+1. 修复 key_filter.prefixes 不生效问题
+2. 验证增量 Key 过滤功能（String/Hash/List 全部通过）
+3. 添加版本管理机制
+4. 更新文档并推送到 GitHub
+
+---
+
 ## 总结：项目演化的关键教训
 
 ### 需求演化
@@ -1416,6 +1536,7 @@ AI：部署完成，服务已启动（PID: 40315）：
 | 后期 | 内存存储 → 落盘机制 | ErrorKeys 太多 |
 | 后期 | 时间窗口 → Binlog 增量 | 延迟要求 |
 | **收尾** | **UI 细节优化** | **用户体验提升** |
+| **v2.3.0** | **key_filter 修复 + 增量验证** | **功能完善** |
 
 ### 踩过的坑
 
@@ -1436,6 +1557,7 @@ AI：部署完成，服务已启动（PID: 40315）：
 | **cmdStr 格式判断缺失** | 源码分析 | 理解数据来源 |
 | **Tooltip 影响点击** | 用户反馈 | UI 细节影响体验 |
 | **已耗时间不刷新** | 用户反馈 | 实时功能要真正实时 |
+| **key_filter.prefixes 不生效** | 功能测试 | 自动推导配置很重要 |
 
 ### 方案调整
 
@@ -1449,6 +1571,7 @@ AI：部署完成，服务已启动（PID: 40315）：
 | strings.Split 解析 | 基于长度解析 | 二进制安全 |
 | 三行统计布局 | 紧凑网格布局 | 空间利用 |
 | 轮询获取已耗时间 | 前端定时器计算 | 实时更新 |
+| 手动设置 key_filter.mode | 自动推导 mode | 用户体验 |
 
 ### 关键对话节点
 
@@ -1463,22 +1586,24 @@ AI：部署完成，服务已启动（PID: 40315）：
 | 179-180 | 增量断点丢失 | 增量断点持久化 |
 | **233-238** | **Binlog 解析 Bug** | **修复 3 个隐藏 Bug** |
 | **291-300** | **UI 细节优化** | **用户体验完善** |
+| **301-316** | **v2.3.0 发布** | **增量 Key 过滤验证通过** |
 
 ---
 
 ## 附录：数字统计
 
-- **总对话轮次**：约 300+ 轮
+- **总对话轮次**：约 316+ 轮
 - **需求变更次数**：15+ 次
 - **重大方案调整**：5 次
-- **严重 Bug 修复**：15+ 个
+- **严重 Bug 修复**：18+ 个
 - **部署环境切换**：2 次（家里 Mac → 公司 Linux）
 - **代码重构次数**：3 次（V1 → V1.1 → V2）
 - **UI 优化迭代**：10+ 次
 - **文档数量**：15+ 份
+- **版本发布**：3 次（v2.1, v2.2, **v2.3**）
 
 ---
 
 *文档整理时间：2026-02-05*
-*最后更新：第 300 轮对话后*
+*最后更新：v2.3.0 发布后（2026-02-09）*
 *记录方式：基于对话历史还原*

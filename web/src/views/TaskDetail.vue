@@ -454,18 +454,18 @@
     <!-- 校验结果 -->
     <div class="verify-section card" v-if="verifyResults.length">
       <h3><el-icon><Checked /></el-icon> 校验结果</h3>
-      <el-table :data="verifyResults" style="width: 100%">
+      <el-table :data="computedVerifyResults" style="width: 100%">
         <el-table-column label="批次ID" width="200">
           <template #default="{ row }">
             <span class="mono">{{ row.batch_id.slice(0, 8) }}...</span>
           </template>
         </el-table-column>
-        <el-table-column label="采样Key数" prop="total_keys" width="120" />
+        <el-table-column label="采样Key数" prop="sampled_keys" width="120" />
         <el-table-column label="匹配数" prop="matched_keys" width="100" />
         <el-table-column label="不一致" width="100">
           <template #default="{ row }">
-            <span :class="{ 'error-text': row.mismatched_keys > 0 }">
-              {{ row.mismatched_keys }}
+            <span :class="{ 'error-text': row.mismatch_keys > 0 }">
+              {{ row.mismatch_keys }}
             </span>
           </template>
         </el-table-column>
@@ -786,6 +786,17 @@ const taskId = computed(() => route.params.id)
 const task = ref(null)
 const progress = ref(null)
 const verifyResults = ref([])
+
+// 计算属性：为校验结果添加一致性计算
+const computedVerifyResults = computed(() => {
+  return verifyResults.value.map(row => ({
+    ...row,
+    // 一致性 = 匹配数 / 采样数 * 100
+    consistency_rate: row.sampled_keys > 0 
+      ? (row.matched_keys / row.sampled_keys) * 100 
+      : 0
+  }))
+})
 const taskLogs = ref([])
 const logLevel = ref('')
 const logsContainer = ref(null)
@@ -1131,6 +1142,20 @@ const handleMetricsUpdate = ({ taskId: tid, payload }) => {
   
   // 更新进度信息
   if (progress.value && payload) {
+    // 【修复】检测 phase 变化并提示用户
+    const oldPhase = progress.value.phase
+    const newPhase = payload.phase || progress.value.phase
+    
+    if (oldPhase !== newPhase) {
+      console.log('[WS] Phase changed:', oldPhase, '->', newPhase)
+      ElMessage.success(`迁移阶段已切换: ${getPhaseText(newPhase)}`)
+      
+      // 阶段切换时刷新完整任务数据
+      fetchTask()
+      fetchTaskLogs()
+    }
+    
+    progress.value.phase = newPhase
     progress.value.percentage = payload.progress || progress.value.percentage
     progress.value.migrated_keys = payload.processed_keys || progress.value.migrated_keys
     progress.value.total_keys = payload.total_keys || progress.value.total_keys

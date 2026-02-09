@@ -67,6 +67,7 @@ const navItems = [
   { path: '/dashboard', name: '控制台', icon: 'DataBoard' },
   { path: '/tasks', name: '迁移任务', icon: 'List' },
   { path: '/create', name: '创建任务', icon: 'Plus' },
+  { path: '/verify', name: '数据校验', icon: 'Select' },
   { path: '/logs', name: '系统日志', icon: 'Document' }
 ]
 

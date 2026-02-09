@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -96,6 +97,8 @@ type Logger struct {
 	level          Level
 	entries        []LogEntry
 	maxEntries     int
+	maxTaskEntries int            // 每个任务的最大日志条目数
+	taskEntries    map[string]int // 每个任务的当前日志条目数
 	logFile        *os.File
 	logDir         string
 	entryID        int64
@@ -142,8 +145,10 @@ func NewLoggerWithRotation(logDir string, level Level, rotation *RotationConfig)
 
 	l := &Logger{
 		level:          level,
-		entries:        make([]LogEntry, 0, 50000),
-		maxEntries:     50000, // 增加日志保留量，支持更多任务的日志查询
+		entries:        make([]LogEntry, 0, 100000),
+		maxEntries:     100000, // 增加总日志保留量
+		maxTaskEntries: 500,    // 每个任务至少保留 500 条日志
+		taskEntries:    make(map[string]int),
 		logDir:         logDir,
 		writers:        []io.Writer{os.Stdout},
 		rotationConfig: rotation,
@@ -441,8 +446,15 @@ func (l *Logger) log(level Level, requestID, taskID, msg string, fields map[stri
 
 	// 存储到内存
 	l.entries = append(l.entries, entry)
+	
+	// 更新任务日志计数
+	if entry.TaskID != "" {
+		l.taskEntries[entry.TaskID]++
+	}
+	
+	// 智能日志淘汰：优先删除没有任务ID的日志或任务日志过多的日志
 	if len(l.entries) > l.maxEntries {
-		l.entries = l.entries[len(l.entries)-l.maxEntries:]
+		l.smartEvictEntries()
 	}
 
 	// 写入到所有 writer
@@ -454,6 +466,65 @@ func (l *Logger) log(level Level, requestID, taskID, msg string, fields map[stri
 			l.currentLogSize += int64(n)
 		}
 	}
+}
+
+// smartEvictEntries 智能淘汰日志条目
+// 优先删除：1) 没有任务ID的日志 2) 任务日志数量超过阈值的旧日志
+func (l *Logger) smartEvictEntries() {
+	toRemove := len(l.entries) - l.maxEntries
+	if toRemove <= 0 {
+		return
+	}
+
+	// 创建新的 entries 切片
+	newEntries := make([]LogEntry, 0, l.maxEntries)
+	removed := 0
+	
+	// 重新统计任务日志数量
+	newTaskEntries := make(map[string]int)
+	
+	// 从旧到新遍历，优先删除没有任务ID的日志或任务日志过多的旧日志
+	for _, e := range l.entries {
+		shouldRemove := false
+		
+		if removed < toRemove {
+			if e.TaskID == "" {
+				// 没有任务ID的日志优先删除
+				shouldRemove = true
+			} else if newTaskEntries[e.TaskID] >= l.maxTaskEntries {
+				// 该任务的日志已经足够多，删除更旧的
+				shouldRemove = true
+			}
+		}
+		
+		if shouldRemove {
+			removed++
+		} else {
+			newEntries = append(newEntries, e)
+			if e.TaskID != "" {
+				newTaskEntries[e.TaskID]++
+			}
+		}
+	}
+	
+	// 如果还没删够，从头部继续删除
+	if removed < toRemove {
+		stillNeed := toRemove - removed
+		if stillNeed < len(newEntries) {
+			// 重新统计被保留的日志的任务计数
+			finalTaskEntries := make(map[string]int)
+			for _, e := range newEntries[stillNeed:] {
+				if e.TaskID != "" {
+					finalTaskEntries[e.TaskID]++
+				}
+			}
+			newEntries = newEntries[stillNeed:]
+			newTaskEntries = finalTaskEntries
+		}
+	}
+	
+	l.entries = newEntries
+	l.taskEntries = newTaskEntries
 }
 
 // formatEntry 格式化日志条目
@@ -593,7 +664,7 @@ func (l *Logger) matchFilter(e LogEntry, f LogFilter) bool {
 	return true
 }
 
-// Export 导出日志
+// Export 导出日志（仅内存中的日志）
 func (l *Logger) Export(filter LogFilter, format string) ([]byte, error) {
 	entries := l.GetEntries(LogFilter{
 		Level:     filter.Level,
@@ -631,11 +702,141 @@ func (l *Logger) Export(filter LogFilter, format string) ([]byte, error) {
 	}
 }
 
+// ExportFromDisk 从磁盘文件导出完整日志（包括所有历史日志）
+// 支持按任务ID、级别、关键词过滤
+func (l *Logger) ExportFromDisk(filter LogFilter, format string) ([]byte, error) {
+	l.mu.RLock()
+	logDir := l.logDir
+	l.mu.RUnlock()
+
+	// 获取所有日志文件
+	files, err := l.getLogFiles()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list log files: %w", err)
+	}
+
+	// 按时间排序（最旧的在前）
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].ModTime().Before(files[j].ModTime())
+	})
+
+	var sb strings.Builder
+	var matchedLines int64
+	var totalLines int64
+
+	// 写入头部
+	sb.WriteString("=== Tendis Migrate Full Log Export (Disk + Memory) ===\n")
+	fmt.Fprintf(&sb, "Export Time: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&sb, "Log Directory: %s\n", logDir)
+	fmt.Fprintf(&sb, "Log Files: %d\n", len(files))
+	fmt.Fprintf(&sb, "Filter: level=%s, keyword=%s, task=%s\n", filter.Level, filter.Keyword, filter.TaskID)
+	if filter.StartTime != "" {
+		fmt.Fprintf(&sb, "Start Time: %s\n", filter.StartTime)
+	}
+	if filter.EndTime != "" {
+		fmt.Fprintf(&sb, "End Time: %s\n", filter.EndTime)
+	}
+	sb.WriteString(strings.Repeat("=", 60) + "\n\n")
+
+	// 遍历所有日志文件
+	for _, fileInfo := range files {
+		filePath := filepath.Join(logDir, fileInfo.Name())
+		
+		file, err := os.Open(filePath)
+		if err != nil {
+			continue
+		}
+
+		scanner := bufio.NewScanner(file)
+		// 增大缓冲区以处理长行
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			totalLines++
+
+			// 应用过滤条件
+			if l.matchLineFilter(line, filter) {
+				sb.WriteString(line)
+				sb.WriteString("\n")
+				matchedLines++
+			}
+		}
+		file.Close()
+	}
+
+	// 添加统计信息
+	sb.WriteString("\n" + strings.Repeat("=", 60) + "\n")
+	fmt.Fprintf(&sb, "Total Lines Scanned: %d\n", totalLines)
+	fmt.Fprintf(&sb, "Matched Lines: %d\n", matchedLines)
+	sb.WriteString(strings.Repeat("=", 60) + "\n")
+
+	return []byte(sb.String()), nil
+}
+
+// matchLineFilter 检查日志行是否匹配过滤条件
+func (l *Logger) matchLineFilter(line string, filter LogFilter) bool {
+	// 空行跳过
+	if strings.TrimSpace(line) == "" {
+		return false
+	}
+
+	// 按任务ID过滤
+	if filter.TaskID != "" {
+		// 日志格式: [task:abc12345]
+		taskPattern := fmt.Sprintf("[task:%s", filter.TaskID[:min(8, len(filter.TaskID))])
+		if !strings.Contains(line, taskPattern) {
+			return false
+		}
+	}
+
+	// 按级别过滤
+	if filter.Level != "" {
+		levelPattern := fmt.Sprintf("[%s]", strings.ToUpper(filter.Level))
+		if !strings.Contains(line, levelPattern) {
+			return false
+		}
+	}
+
+	// 按关键词过滤
+	if filter.Keyword != "" {
+		if !strings.Contains(strings.ToLower(line), strings.ToLower(filter.Keyword)) {
+			return false
+		}
+	}
+
+	// 按时间范围过滤（日志格式: [2026-02-08 12:30:45.123]）
+	if filter.StartTime != "" || filter.EndTime != "" {
+		// 提取时间戳
+		if len(line) > 25 && line[0] == '[' {
+			timeStr := line[1:24] // "2026-02-08 12:30:45.123"
+			if filter.StartTime != "" && timeStr < filter.StartTime {
+				return false
+			}
+			if filter.EndTime != "" && timeStr > filter.EndTime {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// min 返回两个整数中的较小值
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // Clear 清除日志
 func (l *Logger) Clear() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.entries = make([]LogEntry, 0, l.maxEntries)
+	l.taskEntries = make(map[string]int)
 }
 
 // ClearTaskLogs 清除指定任务的日志
@@ -650,6 +851,7 @@ func (l *Logger) ClearTaskLogs(taskID string) {
 		}
 	}
 	l.entries = newEntries
+	delete(l.taskEntries, taskID)
 }
 
 // Close 关闭日志器

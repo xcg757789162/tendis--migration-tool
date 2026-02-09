@@ -254,5 +254,37 @@ export default {
       params,
       responseType: 'blob'
     }).then(res => res.data)
+  },
+
+  // ==================== 独立校验任务 API ====================
+  
+  // 获取校验任务列表
+  getVerifyTasks() {
+    return api.get('/verify-tasks')
+  },
+
+  // 获取校验任务详情
+  getVerifyTask(id) {
+    return api.get(`/verify-tasks/${id}`)
+  },
+
+  // 创建校验任务
+  createVerifyTask(data) {
+    return api.post('/verify-tasks', data)
+  },
+
+  // 删除校验任务
+  deleteVerifyTask(id) {
+    return api.delete(`/verify-tasks/${id}`)
+  },
+
+  // 启动校验任务
+  startVerifyTask(id) {
+    return api.post(`/verify-tasks/${id}/start`)
+  },
+
+  // 停止校验任务
+  stopVerifyTask(id) {
+    return api.post(`/verify-tasks/${id}/stop`)
   }
 }

@@ -3,6 +3,7 @@
 [![Go Version](https://img.shields.io/badge/Go-1.20+-blue.svg)](https://golang.org/)
 [![Vue Version](https://img.shields.io/badge/Vue-3.x-green.svg)](https://vuejs.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/Version-2.3.0-brightgreen.svg)](https://github.com/xcg757789162/tendis--migration-tool/releases)
 
 基于 Go + Vue3 + ElementPlus 的 **Tendis/Redis 集群数据迁移管理工具**。
 
@@ -237,13 +238,35 @@ tendis-migrate/
 
 本项目经过 **300+ 轮对话** 的持续迭代开发：
 
-| 阶段 | 内容 |
+| 版本 | 内容 |
 |------|------|
 | V1.0 | 基础全量迁移、Web UI |
 | V1.1 | 动态配置调整、增量同步 |
 | V2.0 | Master-Worker 架构、Slot 分片 |
 | V2.1 | FakeSlave 增量、Binlog 解析 |
 | V2.2 | 性能优化、UI 完善 |
+| **V2.3** | **BUG 修复：Key 过滤、RocksDB Key 解析、错误记录** |
+
+### V2.3.0 更新内容（2026-02-09）
+
+#### 🐛 BUG 修复
+
+1. **BUG-1: key_filter.prefixes 参数不生效**
+   - 修复：当配置 `prefixes` 时自动设置 `mode` 为 `"prefix"`
+   - 修复：API 返回完整的 `options.key_filter` 配置
+
+2. **BUG-2: 增量同步 RocksDB Key 解析**
+   - 改进 `extractRedisKey()` 函数，正确解析 RocksDB RecordKey 格式
+   - 支持从 9 字节头部 + varint 长度前缀中提取真正的 Redis Key
+
+3. **BUG-3: 增量失败 Key 记录**
+   - 确保所有增量同步失败路径都调用 `addErrorKeyWithDetails()`
+
+#### ✅ 测试验证
+
+- 增量 Key 过滤：String、Hash、List 类型全部验证通过
+- `incr_keys_synced` / `incr_keys_filtered` 统计正确
+- FakeSlave INCRSYNC 连接稳定，心跳正常
 
 详细演化历程见 [EVOLUTION_ONE_LINE_SUMMARY.md](./EVOLUTION_ONE_LINE_SUMMARY.md)
 
@@ -279,4 +302,4 @@ MIT License
 
 ---
 
-*最后更新：2026-02-05*
+*Version: 2.3.0 | 最后更新：2026-02-09*

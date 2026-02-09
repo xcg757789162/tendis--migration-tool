@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"math/rand"
@@ -22,8 +24,23 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	_ "github.com/mattn/go-sqlite3"
 	"tendis-migrate/internal/replication"
 	"tendis-migrate/pkg/logger"
+)
+
+// 版本信息
+const (
+	Version   = "2.3.0"
+	BuildDate = "2026-02-09"
+)
+
+// 命令行参数
+var (
+	flagPort    = flag.Int("port", 8088, "HTTP server port")
+	flagDataDir = flag.String("data", "./data", "Data directory path")
+	flagWorkers = flag.Int("workers", 4, "Default number of workers")
+	flagLogDir  = flag.String("logs", "./logs", "Log directory path")
 )
 
 type Task struct {
@@ -599,13 +616,46 @@ func getPrefixCheckpointKey(taskID string, nodeAddr string, prefix string) strin
 	return fmt.Sprintf("checkpoint:%s:%s:%s", taskID, nodeAddr, safePrefix)
 }
 
+// getMapKeys 获取 map 的所有 keys（用于调试日志）
+func getMapKeys(m map[string]uint64) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // ErrorKey 记录迁移失败或跳过的Key
+// 【P2-BUG5 修复】增强错误信息，包含源节点、目标节点、操作类型等
 type ErrorKey struct {
-	Key       string `json:"key"`
-	Type      string `json:"type"`
-	Reason    string `json:"reason"`
-	Detail    string `json:"detail"`
-	Timestamp string `json:"timestamp"`
+	Key         string `json:"key"`
+	Type        string `json:"type"`         // Key 类型：string, hash, list, set, zset
+	Reason      string `json:"reason"`       // 失败原因分类：failed, skipped, filtered
+	Detail      string `json:"detail"`       // 详细错误信息
+	SourceNode  string `json:"source_node"`  // 源节点地址
+	TargetNode  string `json:"target_node"`  // 目标节点地址
+	Operation   string `json:"operation"`    // 操作类型：dump, restore, pipeline
+	Phase       string `json:"phase"`        // 阶段：full, incremental
+	RetryCount  int    `json:"retry_count"`  // 重试次数
+	Timestamp   string `json:"timestamp"`
+}
+
+// getClientAddr 从 redis.UniversalClient 获取地址（辅助函数，用于错误日志）
+// 【P2-BUG5 修复】安全获取客户端地址，支持单机和集群模式
+func getClientAddr(client redis.UniversalClient) string {
+	if client == nil {
+		return "unknown"
+	}
+	// 尝试单机客户端
+	if c, ok := client.(*redis.Client); ok && c != nil {
+		return c.Options().Addr
+	}
+	// 尝试集群客户端（返回第一个节点作为标识）
+	if c, ok := client.(*redis.ClusterClient); ok && c != nil {
+		// 集群模式返回 "cluster:*" 标识
+		return "cluster:multi-nodes"
+	}
+	return "unknown"
 }
 
 // getRetryConfig 获取重试配置，返回默认值如果未配置
@@ -637,6 +687,7 @@ var (
 	errorKeys  = make(map[string][]ErrorKey) // taskID -> error keys
 	errorKeyMu sync.RWMutex
 	startTime  time.Time
+	dataDir    = "./data" // 数据目录，可通过命令行参数修改
 	
 	// WebSocket 相关
 	wsUpgrader = websocket.Upgrader{
@@ -702,18 +753,26 @@ type ConsecutiveFailureTracker struct {
 }
 
 func main() {
+	// 解析命令行参数
+	flag.Parse()
+	
 	startTime = time.Now()
 	
 	// 初始化日志系统
-	if err := logger.Init("./logs", logger.DEBUG); err != nil {
+	if err := logger.Init(*flagLogDir, logger.DEBUG); err != nil {
 		fmt.Printf("Failed to init logger: %v\n", err)
 	}
 	
 	logger.Info("🚀 Tendis Migration Tool starting", map[string]interface{}{
-		"port":    8088,
-		"version": "1.0.0",
+		"port":    *flagPort,
+		"data":    *flagDataDir,
+		"workers": *flagWorkers,
+		"version": Version,
 		"pid":     fmt.Sprintf("%d", getPID()),
 	})
+
+	// 设置数据目录
+	dataDir = *flagDataDir
 
 	// 初始化数据目录
 	initDataDirectories()
@@ -730,8 +789,9 @@ func main() {
 	startWSBroadcaster()
 
 	// 使用自定义 handler 统一处理
+	addr := fmt.Sprintf(":%d", *flagPort)
 	server := &http.Server{
-		Addr:         ":8088",
+		Addr:         addr,
 		Handler:      http.HandlerFunc(mainHandler),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
@@ -740,7 +800,7 @@ func main() {
 	// 设置优雅关闭
 	setupGracefulShutdown(server)
 
-	logger.Info("Server listening on http://localhost:8088")
+	logger.Info(fmt.Sprintf("Server listening on http://localhost:%d", *flagPort))
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Fatal("Server failed to start", map[string]interface{}{"error": err.Error()})
 	}
@@ -768,6 +828,10 @@ func setupGracefulShutdown(server *http.Server) {
 		// 2. 保存所有任务状态
 		logger.Info("Saving tasks state...")
 		saveTasksState()
+
+		// 2.1 保存校验任务状态
+		logger.Info("Saving verify tasks state...")
+		saveVerifyTasksState()
 
 		// 3. 保存所有全量断点
 		logger.Info("Saving full sync checkpoints...")
@@ -871,10 +935,10 @@ func saveAllIncrementalCheckpoints() {
 // initDataDirectories 初始化数据目录
 func initDataDirectories() {
 	dirs := []string{
-		"./data",
-		"./data/backups",
-		"./data/checkpoints",
-		"./logs",
+		dataDir,
+		filepath.Join(dataDir, "backups"),
+		filepath.Join(dataDir, "checkpoints"),
+		*flagLogDir,
 	}
 	for _, dir := range dirs {
 		os.MkdirAll(dir, 0755)
@@ -1021,6 +1085,17 @@ func startPeriodicStateSave() {
 
 		for range ticker.C {
 			saveTasksState()
+			saveVerifyTasksState() // 同时保存校验任务状态
+		}
+	}()
+	
+	// 【不丢数据保障】额外启动错误 Key 定期落盘（每 10 秒）
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			saveAllErrorKeys()
 		}
 	}()
 }
@@ -1100,6 +1175,12 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/api/v1/templates/"):
 		templateHandler(rw, r, log)
 	
+	// 独立校验任务 API
+	case path == "/api/v1/verify-tasks":
+		verifyTasksHandler(rw, r, log)
+	case strings.HasPrefix(path, "/api/v1/verify-tasks/"):
+		verifyTaskHandler(rw, r, log)
+	
 	// 智能重试相关 API
 	case path == "/api/v1/smart-retry/status":
 		smartRetryStatusHandler(rw, r, log)
@@ -1154,10 +1235,78 @@ func jsonResponse(w http.ResponseWriter, data interface{}) {
 func initDemoData() {
 	// 预置模板任务
 	now := time.Now().Format("2006-01-02 15:04:05")
-	templates["template-default"] = &TaskTemplate{
-		ID:            "template-default",
-		Name:          "Template",
-		Description:   "预置迁移模板：源端到目标端的全量+增量迁移",
+	
+	// 测试环境 A - 主从模式集群
+	templates["template-env-a"] = &TaskTemplate{
+		ID:            "template-env-a",
+		Name:          "测试环境A",
+		Description:   "测试环境A：主从模式 3主3从 集群迁移",
+		SourceCluster: "10.31.36.8:8902,10.31.36.10:8903,10.31.36.12:8901",
+		TargetCluster: "10.31.36.3:8902,10.31.36.15:8901,10.31.36.13:8903",
+		MigrationMode: "full_and_incremental",
+		Options: &TaskOptions{
+			WorkerCount:       8,
+			ScanBatchSize:     1000,
+			ConflictPolicy:    "skip",
+			LargeKeyThreshold: 10485760, // 10MB
+			KeyFilter: &KeyFilter{
+				Mode:     "prefix",
+				Prefixes: []string{"testkey"},
+			},
+			RateLimit: &RateLimit{
+				SourceQPS:         0,
+				TargetQPS:         0,
+				SourceConnections: 50,
+				TargetConnections: 50,
+			},
+			RetryConfig: &RetryConfig{
+				MaxRetries:          3,
+				FullRetryIntervalMs: 100,
+				IncrRetryIntervalMs: 1000,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	
+	// 测试环境 B - 单机多端口集群
+	templates["template-env-b"] = &TaskTemplate{
+		ID:            "template-env-b",
+		Name:          "测试环境B",
+		Description:   "测试环境B：单机多端口集群迁移",
+		SourceCluster: "10.31.36.5:8901,10.31.36.5:8902,10.31.36.5:8903",
+		TargetCluster: "10.31.36.16:8901,10.31.36.16:8902,10.31.36.16:8903",
+		MigrationMode: "full_and_incremental",
+		Options: &TaskOptions{
+			WorkerCount:       8,
+			ScanBatchSize:     1000,
+			ConflictPolicy:    "skip",
+			LargeKeyThreshold: 10485760, // 10MB
+			KeyFilter: &KeyFilter{
+				Mode:     "prefix",
+				Prefixes: []string{"testkey"},
+			},
+			RateLimit: &RateLimit{
+				SourceQPS:         0,
+				TargetQPS:         0,
+				SourceConnections: 50,
+				TargetConnections: 50,
+			},
+			RetryConfig: &RetryConfig{
+				MaxRetries:          3,
+				FullRetryIntervalMs: 100,
+				IncrRetryIntervalMs: 1000,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	
+	// 测试环境 C - 原有默认环境
+	templates["template-env-c"] = &TaskTemplate{
+		ID:            "template-env-c",
+		Name:          "测试环境C",
+		Description:   "测试环境C：原有测试环境集群迁移",
 		SourceCluster: "10.248.37.11:8901,10.248.37.11:8902,10.248.37.11:8903",
 		TargetCluster: "10.31.165.39:8901,10.31.165.39:8902,10.31.165.39:8903",
 		MigrationMode: "full_and_incremental",
@@ -1189,9 +1338,16 @@ func initDemoData() {
 	// 启动定期状态保存
 	startPeriodicStateSave()
 
+	// 加载持久化的校验任务
+	loadVerifyTasksState()
+
+	// 初始化预置校验任务
+	initPresetVerifyTasks()
+
 	logger.Info("System initialized", map[string]interface{}{
-		"mode":      "production",
-		"templates": len(templates),
+		"mode":           "production",
+		"templates":      len(templates),
+		"verify_tasks":   len(verifyTasks),
 	})
 }
 
@@ -1254,6 +1410,12 @@ func logsExportHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 		format = "text"
 	}
 
+	// 新增参数：source=disk 表示从磁盘文件导出完整日志
+	source := q.Get("source")
+	if source == "" {
+		source = "memory" // 默认从内存导出（兼容旧行为）
+	}
+
 	taskID := q.Get("task_id")
 	filter := logger.LogFilter{
 		Level:     q.Get("level"),
@@ -1264,7 +1426,7 @@ func logsExportHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 		EndTime:   q.Get("end_time"),
 	}
 
-	// 如果指定了任务ID，获取任务名称用于文件名
+	// 如果指定了任务ID，获取任务名称用于文件名，并使用完整ID
 	taskName := ""
 	if taskID != "" {
 		tasksMu.RLock()
@@ -1278,7 +1440,23 @@ func logsExportHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 		tasksMu.RUnlock()
 	}
 
-	data, err := logger.Default().Export(filter, format)
+	var data []byte
+	var err error
+
+	// 根据 source 参数选择导出方式
+	if source == "disk" || source == "all" || source == "full" {
+		// 从磁盘文件导出完整日志
+		data, err = logger.Default().ExportFromDisk(filter, format)
+		log.Info("Exporting logs from disk", map[string]interface{}{
+			"task_id": filter.TaskID,
+			"level":   filter.Level,
+			"keyword": filter.Keyword,
+		})
+	} else {
+		// 从内存导出（默认，兼容旧行为）
+		data, err = logger.Default().Export(filter, format)
+	}
+
 	if err != nil {
 		log.Error("Failed to export logs", map[string]interface{}{"error": err.Error()})
 		jsonResponse(w, map[string]interface{}{"code": 500, "message": err.Error()})
@@ -1292,6 +1470,13 @@ func logsExportHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 	if format == "json" {
 		ext = "json"
 	}
+	
+	// 如果是从磁盘导出，文件名加上 full 标记
+	sourceTag := ""
+	if source == "disk" || source == "all" || source == "full" {
+		sourceTag = "-full"
+	}
+	
 	if taskID != "" {
 		shortID := taskID
 		if len(shortID) > 8 {
@@ -1305,12 +1490,12 @@ func logsExportHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 				}
 				return r
 			}, taskName)
-			filename = fmt.Sprintf("task-%s-%s-%s.%s", shortID, safeName, timestamp, ext)
+			filename = fmt.Sprintf("task-%s-%s%s-%s.%s", shortID, safeName, sourceTag, timestamp, ext)
 		} else {
-			filename = fmt.Sprintf("task-%s-logs-%s.%s", shortID, timestamp, ext)
+			filename = fmt.Sprintf("task-%s-logs%s-%s.%s", shortID, sourceTag, timestamp, ext)
 		}
 	} else {
-		filename = fmt.Sprintf("tendis-migrate-logs-%s.%s", timestamp, ext)
+		filename = fmt.Sprintf("tendis-migrate-logs%s-%s.%s", sourceTag, timestamp, ext)
 	}
 	
 	if format == "json" {
@@ -1827,7 +2012,22 @@ func createTaskHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 		if options.KeyFilter == nil {
 			options.KeyFilter = &KeyFilter{Mode: "all"}
 		} else if options.KeyFilter.Mode == "" {
-			options.KeyFilter.Mode = "all"
+			// 【BUG-1 修复】如果设置了 prefixes 或 exclude_prefixes，自动设置 mode 为 "prefix"
+			// 这样用户只需要设置 prefixes，不需要同时设置 mode
+			if len(options.KeyFilter.Prefixes) > 0 || len(options.KeyFilter.ExcludePrefixes) > 0 {
+				options.KeyFilter.Mode = "prefix"
+				log.Info("【BUG-1 FIX】Auto-set key_filter.mode to 'prefix' based on prefixes config", map[string]interface{}{
+					"prefixes":         options.KeyFilter.Prefixes,
+					"exclude_prefixes": options.KeyFilter.ExcludePrefixes,
+				})
+			} else if len(options.KeyFilter.Patterns) > 0 {
+				options.KeyFilter.Mode = "pattern"
+				log.Info("【BUG-1 FIX】Auto-set key_filter.mode to 'pattern' based on patterns config", map[string]interface{}{
+					"patterns": options.KeyFilter.Patterns,
+				})
+			} else {
+				options.KeyFilter.Mode = "all"
+			}
 		}
 		// 确保其他选项有默认值
 		if options.WorkerCount == 0 {
@@ -2096,6 +2296,28 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 	// P2 改进：获取详细进度指标
 	detailedProgress := getDetailedProgressMetrics(id, task)
 
+	// 构建 options 数据（同时支持 config 和 options 字段）
+	var optionsData map[string]interface{}
+	if task.Options != nil {
+		optionsData = map[string]interface{}{
+			"worker_count":        task.Options.WorkerCount,
+			"scan_batch_size":     task.Options.ScanBatchSize,
+			"conflict_policy":     task.Options.ConflictPolicy,
+			"large_key_threshold": task.Options.LargeKeyThreshold,
+			"skip_full_sync":      task.Options.SkipFullSync,
+			"skip_incremental":    task.Options.SkipIncremental,
+			"shadow_mode":         task.Options.ShadowMode,
+		}
+		if task.Options.KeyFilter != nil {
+			optionsData["key_filter"] = map[string]interface{}{
+				"mode":             task.Options.KeyFilter.Mode,
+				"prefixes":         task.Options.KeyFilter.Prefixes,
+				"exclude_prefixes": task.Options.KeyFilter.ExcludePrefixes,
+				"patterns":         task.Options.KeyFilter.Patterns,
+			}
+		}
+	}
+
 	jsonResponse(w, map[string]interface{}{
 		"code":    0,
 		"message": "success",
@@ -2113,6 +2335,7 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 			"incr_start_at":  task.IncrStartAt,
 			"keys_filtered":  task.KeysFiltered,
 			"config":         configData,
+			"options":        optionsData, // 同时返回 options（向后兼容）
 			"progress": map[string]interface{}{
 				"percentage":      task.Progress,
 				"total_keys":      task.KeysTotal,
@@ -2454,6 +2677,20 @@ func pauseTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *lo
 		return
 	}
 	
+	// 【BUG-4 修复】检查任务状态，只有 running 状态的任务才能暂停
+	if task.Status != "running" {
+		tasksMu.Unlock()
+		log.Warn("Task cannot be paused", map[string]interface{}{
+			"task_id":        id,
+			"current_status": task.Status,
+		})
+		jsonResponse(w, map[string]interface{}{
+			"code":    400,
+			"message": fmt.Sprintf("Task cannot be paused: current status is '%s', only 'running' tasks can be paused", task.Status),
+		})
+		return
+	}
+	
 	task.Status = "paused"
 	task.Speed = 0
 	now := time.Now()
@@ -2462,9 +2699,10 @@ func pauseTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *lo
 	tasksMu.Unlock()
 	
 	log.Info("Task paused", map[string]interface{}{"task_id": id})
-	taskLog.Info("Task paused", map[string]interface{}{
+	taskLog.Info("【BUG-4 FIX】Task paused successfully", map[string]interface{}{
 		"progress":  task.Progress,
 		"paused_at": task.PausedAt,
+		"phase":     task.Phase,
 	})
 	
 	jsonResponse(w, map[string]interface{}{"code": 0, "message": "success"})
@@ -2599,6 +2837,570 @@ var (
 	verifyResults   = make(map[string]*VerifyResult) // batchID -> result
 	verifyResultsMu sync.RWMutex
 )
+
+// ==================== 独立校验任务模块 ====================
+
+// VerifyTask 独立校验任务
+type VerifyTask struct {
+	ID             string                 `json:"id"`
+	Name           string                 `json:"name"`
+	Status         string                 `json:"status"`          // pending, running, completed, failed, cancelled
+	SourceCluster  string                 `json:"source_cluster"`
+	TargetCluster  string                 `json:"target_cluster"`
+	SourcePassword string                 `json:"-"`               // 不输出到 JSON
+	TargetPassword string                 `json:"-"`
+	VerifyMode     string                 `json:"verify_mode"`     // count_only, sample, full
+	SampleRate     float64                `json:"sample_rate"`     // 采样率 (0.001-1.0)
+	MaxKeys        int64                  `json:"max_keys"`        // 最大校验 Key 数
+	KeyFilter      *KeyFilterConfig       `json:"key_filter,omitempty"` // Key 过滤配置
+	CompareValue   bool                   `json:"compare_value"`   // 是否比较值内容（已弃用，使用 CompareMode）
+	CompareTTL     bool                   `json:"compare_ttl"`     // 是否比较 TTL
+	TTLTolerance   int64                  `json:"ttl_tolerance"`   // TTL 容差（秒）
+	MigrationTaskID string               `json:"migration_task_id,omitempty"` // 关联的迁移任务 ID（可选）
+	CreatedAt      string                 `json:"created_at"`
+	StartedAt      string                 `json:"started_at,omitempty"`
+	CompletedAt    string                 `json:"completed_at,omitempty"`
+	
+	// ===== 新增：并发和 QPS 控制 =====
+	Concurrency    int                    `json:"concurrency"`     // 并发数（默认 10）
+	QPS            int                    `json:"qps"`             // QPS 限制（0 表示不限制）
+	
+	// ===== 新增：细化比较模式 =====
+	CompareMode    string                 `json:"compare_mode"`    // full_value, length_only, exists_only
+	SkipLargeKey   bool                   `json:"skip_large_key"`  // 是否跳过大 Key
+	LargeKeyThreshold int64              `json:"large_key_threshold"` // 大 Key 阈值（字节），默认 10MB
+	
+	// ===== 新增：DB 过滤 =====
+	DBList         string                 `json:"db_list"`         // 要校验的 DB 列表，分号分隔，如 "0;5;15"
+	
+	// ===== 新增：多轮迭代收敛（借鉴 redis-full-check）=====
+	CompareRounds  int                    `json:"compare_rounds"`  // 比较轮数（默认3，最少1，最多5）
+	RoundInterval  int                    `json:"round_interval"`  // 轮次间隔秒数（默认5）
+	
+	// ===== P2: 双向校验支持 =====
+	Direction      string                 `json:"direction"`       // source_to_target(默认), target_to_source, bidirectional
+	
+	// ===== P2: 智能比较模式（自动根据 Key 大小选择策略）=====
+	SmartCompare   bool                   `json:"smart_compare"`   // 是否启用智能比较
+	BigKeyThreshold int64                 `json:"big_key_threshold"` // 智能模式下判定大 Key 的元素数阈值（Hash/Set/ZSet）
+	
+	// ===== P1: SQLite 结果持久化 =====
+	EnableSQLite   bool                   `json:"enable_sqlite"`   // 是否启用 SQLite 存储结果（断点续传）
+	SQLiteDBPath   string                 `json:"sqlite_db_path,omitempty"` // SQLite 数据库路径
+	
+	// ===== P1: Field 级别比对 =====
+	FieldLevelCompare bool                `json:"field_level_compare"` // 是否启用 Field 级别比对（Hash/Set/ZSet）
+	FieldScanThreshold int64              `json:"field_scan_threshold"` // 使用 SCAN 命令获取 Field 的阈值（默认 5000）
+	
+	// 结果统计
+	Result         *VerifyTaskResult      `json:"result,omitempty"`
+	
+	// 内部字段（不序列化）
+	sqliteDB       *VerifyResultDB        `json:"-"` // SQLite 数据库连接
+}
+
+// KeyFilterConfig Key 过滤配置
+type KeyFilterConfig struct {
+	Prefixes        []string `json:"prefixes,omitempty"`         // 只校验这些前缀
+	ExcludePrefixes []string `json:"exclude_prefixes,omitempty"` // 排除这些前缀
+	Pattern         string   `json:"pattern,omitempty"`          // 正则匹配
+}
+
+// VerifyTaskResult 校验任务结果
+type VerifyTaskResult struct {
+	SourceKeyCount   int64                  `json:"source_key_count"`   // 源端 Key 数量
+	TargetKeyCount   int64                  `json:"target_key_count"`   // 目标端 Key 数量
+	ScannedKeys      int64                  `json:"scanned_keys"`       // 已扫描 Key 数
+	SampledKeys      int64                  `json:"sampled_keys"`       // 已采样 Key 数
+	MatchedKeys      int64                  `json:"matched_keys"`       // 匹配的 Key 数
+	MissingKeys      int64                  `json:"missing_keys"`       // 源端有目标端无
+	ExtraKeys        int64                  `json:"extra_keys"`         // 目标端有源端无
+	ValueMismatch    int64                  `json:"value_mismatch"`     // 值不匹配
+	LengthMismatch   int64                  `json:"length_mismatch"`    // 长度不匹配（新增）
+	TTLMismatch      int64                  `json:"ttl_mismatch"`       // TTL 不匹配
+	LargeKeySkipped  int64                  `json:"large_key_skipped"`  // 跳过的大 Key 数量（新增）
+	ConsistencyRate  float64                `json:"consistency_rate"`   // 一致性百分比
+	Details          []VerifyMismatchDetail `json:"details,omitempty"`  // 不匹配详情
+	Progress         float64                `json:"progress"`           // 进度百分比
+	CurrentSpeed     int64                  `json:"current_speed"`      // 当前速度 keys/s
+	EstimatedTime    string                 `json:"estimated_time"`     // 预估剩余时间
+	DBsVerified      []int                  `json:"dbs_verified,omitempty"` // 已校验的 DB 列表（新增）
+	
+	// ===== 新增：多轮迭代收敛结果（借鉴 redis-full-check）=====
+	CurrentRound     int                    `json:"current_round"`      // 当前轮次
+	TotalRounds      int                    `json:"total_rounds"`       // 总轮数
+	Rounds           []VerifyRoundResult    `json:"rounds,omitempty"`   // 每轮详细结果
+	FinalMismatchKeys []string              `json:"final_mismatch_keys,omitempty"` // 最终确认不一致的 Key（多轮收敛后）
+	
+	// ===== P2: 双向校验结果 =====
+	TargetExtraKeys  int64                  `json:"target_extra_keys"`  // 目标端多余的 Key 数量
+	ExtraKeyDetails  []VerifyMismatchDetail `json:"extra_key_details,omitempty"` // 目标端多余 Key 详情
+	
+	// ===== P1: Field 级别不一致统计 =====
+	FieldMismatchKeys int64                 `json:"field_mismatch_keys"` // Field 级别不一致的 Key 数
+	FieldMismatches   []FieldMismatchDetail `json:"field_mismatches,omitempty"` // Field 级别不匹配详情
+	
+	// ===== P3: 指标监控 =====
+	Metrics          *VerifyMetrics         `json:"metrics,omitempty"` // 详细指标
+}
+
+// VerifyRoundResult 单轮校验结果（用于多轮迭代收敛）
+type VerifyRoundResult struct {
+	RoundNo        int                    `json:"round_no"`         // 轮次编号（从1开始）
+	StartTime      string                 `json:"start_time"`       // 本轮开始时间
+	EndTime        string                 `json:"end_time"`         // 本轮结束时间
+	KeysToCheck    int64                  `json:"keys_to_check"`    // 本轮待检查 Key 数
+	MismatchCount  int64                  `json:"mismatch_count"`   // 本轮发现的不一致数
+	MismatchKeys   []string               `json:"mismatch_keys,omitempty"` // 本轮不一致的 Key 列表（用于下轮复查）
+	ConvergeRate   float64                `json:"converge_rate"`    // 相比上轮的收敛率（减少的百分比）
+	Details        []VerifyMismatchDetail `json:"details,omitempty"` // 本轮不匹配详情
+}
+
+// ==================== P1: Field 级别比对结构体 ====================
+
+// FieldMismatchDetail Field 级别不匹配详情
+type FieldMismatchDetail struct {
+	Key         string   `json:"key"`                    // Key 名称
+	KeyType     string   `json:"key_type"`               // Key 类型（hash/set/zset/list）
+	TotalFields int64    `json:"total_fields"`           // 总 Field 数
+	MismatchFields []FieldDiff `json:"mismatch_fields,omitempty"` // 不一致的 Field 列表
+}
+
+// FieldDiff 单个 Field 不一致详情
+type FieldDiff struct {
+	Field       string `json:"field"`                  // Field 名称（Hash/Set）或索引（List）或成员（ZSet）
+	Type        string `json:"type"`                   // lack_source, lack_target, value_mismatch, score_mismatch
+	SourceValue string `json:"source_value,omitempty"` // 源端值（截断显示）
+	TargetValue string `json:"target_value,omitempty"` // 目标端值（截断显示）
+	SourceScore float64 `json:"source_score,omitempty"` // ZSet 源端分数
+	TargetScore float64 `json:"target_score,omitempty"` // ZSet 目标端分数
+}
+
+// ==================== P3: 指标监控结构体 ====================
+
+// VerifyMetrics 校验详细指标
+type VerifyMetrics struct {
+	StartTime        string  `json:"start_time"`         // 开始时间
+	EndTime          string  `json:"end_time,omitempty"` // 结束时间
+	Duration         string  `json:"duration,omitempty"` // 总耗时
+	
+	// 吞吐量指标
+	KeysPerSecond    float64 `json:"keys_per_second"`    // 每秒处理 Key 数
+	BytesPerSecond   int64   `json:"bytes_per_second"`   // 每秒处理字节数
+	
+	// 网络指标
+	RedisCommands    int64   `json:"redis_commands"`     // Redis 命令总数
+	PipelineBatches  int64   `json:"pipeline_batches"`   // Pipeline 批次数
+	NetworkRoundTrips int64  `json:"network_round_trips"` // 网络往返次数
+	
+	// 按类型统计
+	TypeDistribution map[string]int64 `json:"type_distribution,omitempty"` // Key 类型分布
+	
+	// 内存使用
+	PeakMemoryMB     float64 `json:"peak_memory_mb"`     // 峰值内存使用（MB）
+	
+	// 按轮次指标
+	RoundMetrics     []RoundMetric `json:"round_metrics,omitempty"` // 每轮指标
+}
+
+// RoundMetric 单轮指标
+type RoundMetric struct {
+	RoundNo       int     `json:"round_no"`
+	Duration      string  `json:"duration"`
+	KeysPerSecond float64 `json:"keys_per_second"`
+	MismatchRate  float64 `json:"mismatch_rate"` // 不一致率
+}
+
+// ==================== P1: SQLite 结果存储 ====================
+
+// VerifyResultDB SQLite 结果数据库
+type VerifyResultDB struct {
+	db     *sql.DB
+	taskID string
+	dbPath string
+}
+
+// NewVerifyResultDB 创建或打开 SQLite 数据库
+func NewVerifyResultDB(taskID string) (*VerifyResultDB, error) {
+	dbPath := fmt.Sprintf("./data/verify_%s.db", taskID)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite3 failed: %w", err)
+	}
+	
+	// 设置连接池参数
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	
+	// 创建表
+	_, err = db.Exec(`
+		-- Key 级别不一致记录
+		CREATE TABLE IF NOT EXISTS key_diff (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			round INTEGER NOT NULL,
+			key_name TEXT NOT NULL,
+			key_type TEXT,
+			diff_type TEXT NOT NULL,
+			source_value TEXT,
+			target_value TEXT,
+			source_ttl INTEGER,
+			target_ttl INTEGER,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_key_diff_round ON key_diff(round);
+		CREATE INDEX IF NOT EXISTS idx_key_diff_key ON key_diff(key_name);
+		CREATE INDEX IF NOT EXISTS idx_key_diff_type ON key_diff(diff_type);
+		
+		-- Field 级别不一致记录（Hash/Set/ZSet）
+		CREATE TABLE IF NOT EXISTS field_diff (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			round INTEGER NOT NULL,
+			key_name TEXT NOT NULL,
+			key_type TEXT NOT NULL,
+			field_name TEXT NOT NULL,
+			diff_type TEXT NOT NULL,
+			source_value TEXT,
+			target_value TEXT,
+			source_score REAL,
+			target_score REAL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_field_diff_round ON field_diff(round);
+		CREATE INDEX IF NOT EXISTS idx_field_diff_key ON field_diff(key_name);
+		
+		-- 校验进度记录（用于断点续传）
+		CREATE TABLE IF NOT EXISTS checkpoint (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			round INTEGER NOT NULL,
+			scan_cursor TEXT,
+			keys_scanned INTEGER,
+			keys_sampled INTEGER,
+			last_key TEXT,
+			saved_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		
+		-- 统计摘要
+		CREATE TABLE IF NOT EXISTS summary (
+			round INTEGER PRIMARY KEY,
+			keys_checked INTEGER,
+			mismatch_count INTEGER,
+			converge_rate REAL,
+			start_time TEXT,
+			end_time TEXT
+		);
+	`)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create tables failed: %w", err)
+	}
+	
+	return &VerifyResultDB{
+		db:     db,
+		taskID: taskID,
+		dbPath: dbPath,
+	}, nil
+}
+
+// Close 关闭数据库连接
+func (r *VerifyResultDB) Close() error {
+	if r.db != nil {
+		return r.db.Close()
+	}
+	return nil
+}
+
+// SaveKeyDiff 保存 Key 级别不一致记录
+func (r *VerifyResultDB) SaveKeyDiff(round int, key, keyType, diffType, sourceVal, targetVal string, sourceTTL, targetTTL int64) error {
+	_, err := r.db.Exec(
+		`INSERT INTO key_diff (round, key_name, key_type, diff_type, source_value, target_value, source_ttl, target_ttl) 
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		round, key, keyType, diffType, sourceVal, targetVal, sourceTTL, targetTTL,
+	)
+	return err
+}
+
+// SaveFieldDiff 保存 Field 级别不一致记录
+func (r *VerifyResultDB) SaveFieldDiff(round int, key, keyType, field, diffType, sourceVal, targetVal string, sourceScore, targetScore float64) error {
+	_, err := r.db.Exec(
+		`INSERT INTO field_diff (round, key_name, key_type, field_name, diff_type, source_value, target_value, source_score, target_score)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		round, key, keyType, field, diffType, sourceVal, targetVal, sourceScore, targetScore,
+	)
+	return err
+}
+
+// SaveCheckpoint 保存断点信息
+func (r *VerifyResultDB) SaveCheckpoint(round int, cursor string, keysScanned, keysSampled int64, lastKey string) error {
+	_, err := r.db.Exec(
+		`INSERT INTO checkpoint (round, scan_cursor, keys_scanned, keys_sampled, last_key) VALUES (?, ?, ?, ?, ?)`,
+		round, cursor, keysScanned, keysSampled, lastKey,
+	)
+	return err
+}
+
+// GetLastCheckpoint 获取最后一个断点
+func (r *VerifyResultDB) GetLastCheckpoint() (round int, cursor string, keysScanned, keysSampled int64, lastKey string, err error) {
+	err = r.db.QueryRow(
+		`SELECT round, scan_cursor, keys_scanned, keys_sampled, last_key FROM checkpoint ORDER BY id DESC LIMIT 1`,
+	).Scan(&round, &cursor, &keysScanned, &keysSampled, &lastKey)
+	return
+}
+
+// GetMismatchKeysFromRound 获取指定轮次的不一致 Key 列表
+func (r *VerifyResultDB) GetMismatchKeysFromRound(round int) ([]string, error) {
+	rows, err := r.db.Query(`SELECT DISTINCT key_name FROM key_diff WHERE round = ?`, round)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
+// SaveRoundSummary 保存轮次摘要
+func (r *VerifyResultDB) SaveRoundSummary(round int, keysChecked, mismatchCount int64, convergeRate float64, startTime, endTime string) error {
+	_, err := r.db.Exec(
+		`INSERT OR REPLACE INTO summary (round, keys_checked, mismatch_count, converge_rate, start_time, end_time)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		round, keysChecked, mismatchCount, convergeRate, startTime, endTime,
+	)
+	return err
+}
+
+// GetDiffStats 获取不一致统计
+func (r *VerifyResultDB) GetDiffStats(round int) (map[string]int64, error) {
+	rows, err := r.db.Query(
+		`SELECT diff_type, COUNT(*) as cnt FROM key_diff WHERE round = ? GROUP BY diff_type`,
+		round,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	
+	stats := make(map[string]int64)
+	for rows.Next() {
+		var diffType string
+		var count int64
+		if err := rows.Scan(&diffType, &count); err != nil {
+			continue
+		}
+		stats[diffType] = count
+	}
+	return stats, nil
+}
+
+// GetPrefixStats 获取按前缀分组的统计
+func (r *VerifyResultDB) GetPrefixStats(round int, limit int) ([]map[string]interface{}, error) {
+	rows, err := r.db.Query(`
+		SELECT 
+			CASE WHEN INSTR(key_name, ':') > 0 
+				THEN SUBSTR(key_name, 1, INSTR(key_name, ':') - 1) 
+				ELSE 'no_prefix' 
+			END AS prefix,
+			COUNT(*) AS cnt
+		FROM key_diff 
+		WHERE round = ?
+		GROUP BY prefix
+		ORDER BY cnt DESC
+		LIMIT ?
+	`, round, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	
+	var results []map[string]interface{}
+	for rows.Next() {
+		var prefix string
+		var count int64
+		if err := rows.Scan(&prefix, &count); err != nil {
+			continue
+		}
+		results = append(results, map[string]interface{}{
+			"prefix": prefix,
+			"count":  count,
+		})
+	}
+	return results, nil
+}
+
+// ClearRound 清除指定轮次的数据（用于重试）
+func (r *VerifyResultDB) ClearRound(round int) error {
+	_, err := r.db.Exec(`DELETE FROM key_diff WHERE round = ?`, round)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.Exec(`DELETE FROM field_diff WHERE round = ?`, round)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.Exec(`DELETE FROM summary WHERE round = ?`, round)
+	return err
+}
+
+// 独立校验任务存储
+var (
+	verifyTasks   = make(map[string]*VerifyTask) // taskID -> VerifyTask
+	verifyTasksMu sync.RWMutex
+)
+
+// ==================== 校验任务持久化 ====================
+
+const verifyTasksFile = "./data/verify-tasks.json"
+
+// saveVerifyTasksState 保存校验任务状态到文件
+func saveVerifyTasksState() {
+	verifyTasksMu.RLock()
+	tasksToSave := make(map[string]*VerifyTask)
+	for id, task := range verifyTasks {
+		tasksToSave[id] = task
+	}
+	verifyTasksMu.RUnlock()
+
+	if len(tasksToSave) == 0 {
+		return
+	}
+
+	data, err := json.MarshalIndent(tasksToSave, "", "  ")
+	if err != nil {
+		logger.Warn("Failed to marshal verify tasks state", map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	if err := os.WriteFile(verifyTasksFile, data, 0644); err != nil {
+		logger.Warn("Failed to save verify tasks state", map[string]interface{}{"error": err.Error()})
+	} else {
+		logger.Debug("Verify tasks state saved", map[string]interface{}{"count": len(tasksToSave)})
+	}
+}
+
+// loadVerifyTasksState 从文件加载校验任务状态
+func loadVerifyTasksState() {
+	data, err := os.ReadFile(verifyTasksFile)
+	if err != nil {
+		logger.Debug("No saved verify tasks state found", map[string]interface{}{"file": verifyTasksFile})
+		return
+	}
+
+	var savedTasks map[string]*VerifyTask
+	if err := json.Unmarshal(data, &savedTasks); err != nil {
+		logger.Warn("Failed to parse saved verify tasks", map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	verifyTasksMu.Lock()
+	for id, task := range savedTasks {
+		// 如果任务是 running 状态，恢复为 pending（需要用户重新启动）
+		if task.Status == "running" {
+			task.Status = "pending"
+		}
+		verifyTasks[id] = task
+	}
+	verifyTasksMu.Unlock()
+
+	logger.Info("Verify tasks state recovered", map[string]interface{}{"count": len(savedTasks)})
+}
+
+// initPresetVerifyTasks 初始化预置校验任务
+func initPresetVerifyTasks() {
+	verifyTasksMu.Lock()
+	defer verifyTasksMu.Unlock()
+
+	now := time.Now().Format(time.RFC3339)
+
+	// 测试环境 A - 主从模式集群
+	if _, exists := verifyTasks["preset-verify-env-a"]; !exists {
+		verifyTasks["preset-verify-env-a"] = &VerifyTask{
+			ID:                "preset-verify-env-a",
+			Name:              "测试环境A校验",
+			Status:            "pending",
+			SourceCluster:     "10.31.36.8:8902,10.31.36.10:8903,10.31.36.12:8901",
+			TargetCluster:     "10.31.36.3:8902,10.31.36.15:8901,10.31.36.13:8903",
+			VerifyMode:        "sample",
+			SampleRate:        0.01, // 1% 采样率
+			MaxKeys:           100000,
+			CompareMode:       "full_value",
+			CompareTTL:        false,
+			TTLTolerance:      10,
+			Concurrency:       10,
+			QPS:               0, // 不限速
+			SkipLargeKey:      true,
+			LargeKeyThreshold: 10 * 1024 * 1024, // 10MB
+			KeyFilter: &KeyFilterConfig{
+				Prefixes: []string{"testkey"},
+			},
+			CreatedAt: now,
+			Result:    &VerifyTaskResult{},
+		}
+	}
+
+	// 测试环境 B - 单机多端口集群
+	if _, exists := verifyTasks["preset-verify-env-b"]; !exists {
+		verifyTasks["preset-verify-env-b"] = &VerifyTask{
+			ID:                "preset-verify-env-b",
+			Name:              "测试环境B校验",
+			Status:            "pending",
+			SourceCluster:     "10.31.36.5:8901,10.31.36.5:8902,10.31.36.5:8903",
+			TargetCluster:     "10.31.36.16:8901,10.31.36.16:8902,10.31.36.16:8903",
+			VerifyMode:        "sample",
+			SampleRate:        0.01, // 1% 采样率
+			MaxKeys:           100000,
+			CompareMode:       "full_value",
+			CompareTTL:        false,
+			TTLTolerance:      10,
+			Concurrency:       10,
+			QPS:               0,
+			SkipLargeKey:      true,
+			LargeKeyThreshold: 10 * 1024 * 1024,
+			KeyFilter: &KeyFilterConfig{
+				Prefixes: []string{"testkey"},
+			},
+			CreatedAt: now,
+			Result:    &VerifyTaskResult{},
+		}
+	}
+
+	// 测试环境 C - 原有默认环境
+	if _, exists := verifyTasks["preset-verify-env-c"]; !exists {
+		verifyTasks["preset-verify-env-c"] = &VerifyTask{
+			ID:                "preset-verify-env-c",
+			Name:              "测试环境C校验",
+			Status:            "pending",
+			SourceCluster:     "10.248.37.11:8901,10.248.37.11:8902,10.248.37.11:8903",
+			TargetCluster:     "10.31.165.39:8901,10.31.165.39:8902,10.31.165.39:8903",
+			VerifyMode:        "sample",
+			SampleRate:        0.01, // 1% 采样率
+			MaxKeys:           100000,
+			CompareMode:       "full_value",
+			CompareTTL:        false,
+			TTLTolerance:      10,
+			Concurrency:       10,
+			QPS:               0,
+			SkipLargeKey:      true,
+			LargeKeyThreshold: 10 * 1024 * 1024,
+			KeyFilter: &KeyFilterConfig{
+				Prefixes: []string{"testkey"},
+			},
+			CreatedAt: now,
+			Result:    &VerifyTaskResult{},
+		}
+	}
+
+	logger.Info("Preset verify tasks initialized", map[string]interface{}{
+		"env_a": "preset-verify-env-a",
+		"env_b": "preset-verify-env-b",
+		"env_c": "preset-verify-env-c",
+	})
+}
 
 // ==================== 问题4修复: 大 Key 监控功能 ====================
 
@@ -3034,11 +3836,46 @@ func verifyResultsHandler(w http.ResponseWriter, r *http.Request, id string, log
 	})
 }
 
+// 全量迁移互斥锁（P0-BUG2 修复：防止并发启动多个全量）
+var (
+	fullMigrationMu       sync.Mutex
+	fullMigrationRunning  = make(map[string]bool) // taskID -> 是否正在运行全量
+)
+
 func simulateProgress(task *Task) {
 	taskLog := logger.WithTask(task.ID)
 	taskLog.Info("Migration started - connecting to clusters")
 
 	ctx := context.Background()
+
+	// ==================== P0-BUG1 修复：检查是否需要跳过全量阶段 ====================
+	// 如果任务恢复时已经处于增量阶段，则直接跳过全量迁移
+	tasksMu.RLock()
+	currentPhase := task.Phase
+	currentProgress := task.Progress
+	tasksMu.RUnlock()
+
+	// 加载已有的断点，检查是否全量已完成
+	existingCheckpoint := loadFullSyncCheckpoint(task.ID)
+	fullSyncAlreadyCompleted := existingCheckpoint != nil && existingCheckpoint.IsComplete
+
+	// 判断是否应该跳过全量
+	shouldSkipFullSync := false
+	if currentPhase == "incremental" || currentPhase == "completed" {
+		shouldSkipFullSync = true
+		taskLog.Info("🔄 【P0-BUG1 FIX】Resuming from incremental phase, skipping full migration", map[string]interface{}{
+			"current_phase":    currentPhase,
+			"progress":         currentProgress,
+			"checkpoint_found": existingCheckpoint != nil,
+		})
+	} else if fullSyncAlreadyCompleted {
+		shouldSkipFullSync = true
+		taskLog.Info("🔄 【P0-BUG1 FIX】Full sync checkpoint shows completed, skipping full migration", map[string]interface{}{
+			"checkpoint_phase":     existingCheckpoint.Phase,
+			"checkpoint_complete":  existingCheckpoint.IsComplete,
+			"checkpoint_updated":   existingCheckpoint.UpdatedAt,
+		})
+	}
 
 	// 解析源端和目标端地址
 	sourceAddrs := strings.Split(task.SourceCluster, ",")
@@ -3118,17 +3955,32 @@ func simulateProgress(task *Task) {
 		totalKeys = 10000 // 默认估算值
 	}
 
+	// ==================== P2-BUG4 修复: 只在首次设置 FullStartAt ====================
 	tasksMu.Lock()
 	task.KeysTotal = totalKeys
 	task.BytesTotal = totalKeys * 256 // 估算平均每个key 256 bytes
-	task.FullStartAt = time.Now().Format("2006-01-02 15:04:05")
+	// 【P2-BUG4 修复】只在 FullStartAt 为空时设置，避免恢复时覆盖原始时间
+	if task.FullStartAt == "" && !shouldSkipFullSync {
+		task.FullStartAt = time.Now().Format("2006-01-02 15:04:05")
+		taskLog.Info("📅 【P2-BUG4 FIX】Setting FullStartAt for first time", map[string]interface{}{
+			"full_start_at": task.FullStartAt,
+		})
+	} else if task.FullStartAt != "" {
+		taskLog.Info("📅 【P2-BUG4 FIX】Preserving existing FullStartAt", map[string]interface{}{
+			"full_start_at": task.FullStartAt,
+		})
+	}
 	// 【问题1修复】开始新的全量迁移时，清空旧的增量开始时间
-	// 避免断点恢复时显示不合理的时间（增量开始早于全量开始）
-	task.IncrStartAt = ""
+	// 只在非恢复场景才清空（即 shouldSkipFullSync=false 且 phase 不是 incremental）
+	if !shouldSkipFullSync && currentPhase != "incremental" {
+		task.IncrStartAt = ""
+	}
 	tasksMu.Unlock()
 
 	// ==================== 问题2修复: 检查 SkipFullSync 配置 ====================
-	skipFullSync := task.Options != nil && task.Options.SkipFullSync
+	skipFullSyncConfig := task.Options != nil && task.Options.SkipFullSync
+	// 【P0-BUG1 修复】合并配置和自动检测的跳过逻辑
+	actualSkipFullSync := skipFullSyncConfig || shouldSkipFullSync
 	skipIncremental := task.Options != nil && task.Options.SkipIncremental
 	needIncremental := !skipIncremental && task.MigrationMode == "full_and_incremental"
 
@@ -3143,29 +3995,43 @@ func simulateProgress(task *Task) {
 	var binlogCtx context.Context
 	var binlogCancel context.CancelFunc
 
-	if needIncremental && !skipFullSync {
+	// 如果跳过全量（恢复到增量阶段），也需要启动 FakeSlave
+	if needIncremental {
 		// 检查是否支持 INCRSYNC 协议
 		if checkTendisIncrSyncSupport(ctx, sourceClient, taskLog) {
-			taskLog.Info("【关键】Starting FakeSlave BEFORE full migration to capture all changes")
-			
-			// 创建 Binlog 缓存管理器
-			cacheConfig := replication.BinlogCacheConfig{
-				CacheDir:    "./data/binlog_cache",
-				TaskID:      task.ID,
-				MaxFileSize: 1 << 30, // 1GB 单文件上限
+			if !actualSkipFullSync {
+				taskLog.Info("【关键】Starting FakeSlave BEFORE full migration to capture all changes")
+			} else {
+				taskLog.Info("【恢复】Starting FakeSlave for incremental sync phase (full sync skipped)")
 			}
-			cacheManager = replication.NewBinlogCacheManager(cacheConfig)
-			cacheManager.StartCaching() // 开启缓存模式
+			
+			// 创建 Binlog 缓存管理器（仅在需要全量时使用缓存模式）
+			if !actualSkipFullSync {
+				cacheConfig := replication.BinlogCacheConfig{
+					CacheDir:    "./data/binlog_cache",
+					TaskID:      task.ID,
+					MaxFileSize: 1 << 30, // 1GB 单文件上限
+				}
+				cacheManager = replication.NewBinlogCacheManager(cacheConfig)
+				cacheManager.StartCaching() // 开启缓存模式
+			}
 			
 			// 保存到 task
 			tasksMu.Lock()
-			task.cacheManager = cacheManager
+			if cacheManager != nil {
+				task.cacheManager = cacheManager
+			}
 			task.IncrSyncMode = "binlog"
 			tasksMu.Unlock()
 			
-			// 启动 FakeSlave（缓存模式）
+			// 启动 FakeSlave
 			binlogCtx, binlogCancel = context.WithCancel(ctx)
-			fakeSlaves, err = startFakeSlavesWithCache(binlogCtx, task, sourceClient, targetClient, sourceIsCluster, cacheManager, taskLog)
+			if cacheManager != nil {
+				fakeSlaves, err = startFakeSlavesWithCache(binlogCtx, task, sourceClient, targetClient, sourceIsCluster, cacheManager, taskLog)
+			} else {
+				// 恢复场景：直接启动实时同步模式的 FakeSlave
+				fakeSlaves, err = startFakeSlaves(binlogCtx, task, sourceClient, targetClient, sourceIsCluster, taskLog)
+			}
 			if err != nil {
 				taskLog.Error("Failed to start FakeSlaves, will use time-window mode", map[string]interface{}{
 					"error": err.Error(),
@@ -3174,8 +4040,10 @@ func simulateProgress(task *Task) {
 				cacheManager = nil
 				fakeSlaves = nil
 			} else {
-				taskLog.Info("FakeSlaves started in cache mode, binlog will be captured during full migration", map[string]interface{}{
-					"node_count": len(fakeSlaves),
+				taskLog.Info("FakeSlaves started", map[string]interface{}{
+					"node_count":  len(fakeSlaves),
+					"cache_mode":  cacheManager != nil,
+					"skip_full":   actualSkipFullSync,
 				})
 			}
 		} else {
@@ -3186,24 +4054,50 @@ func simulateProgress(task *Task) {
 		}
 	}
 
-	// ==================== 执行全量迁移 ====================
-	if skipFullSync {
-		taskLog.Info("Full migration SKIPPED (skip_full_sync=true)", map[string]interface{}{
-			"total_keys": totalKeys,
-		})
-		// 直接标记全量阶段完成
+	// ==================== 执行全量迁移（P0-BUG1/BUG2 修复）====================
+	if actualSkipFullSync {
+		if skipFullSyncConfig {
+			taskLog.Info("Full migration SKIPPED (skip_full_sync=true)", map[string]interface{}{
+				"total_keys": totalKeys,
+			})
+		} else {
+			taskLog.Info("🔄 【P0-BUG1 FIX】Full migration SKIPPED (resuming from incremental phase)", map[string]interface{}{
+				"current_phase": currentPhase,
+				"checkpoint_complete": fullSyncAlreadyCompleted,
+			})
+		}
+		// 直接标记全量阶段完成（保留原有状态如果已经是 incremental）
 		tasksMu.Lock()
-		task.Phase = "full_skipped"
+		if task.Phase != "incremental" {
+			task.Phase = "full_skipped"
+		}
 		task.Progress = 100
 		tasksMu.Unlock()
 	} else {
-		taskLog.Info("Starting full migration", map[string]interface{}{
-			"total_keys": totalKeys,
-			"binlog_caching": cacheManager != nil,
-		})
+		// ==================== P0-BUG2 修复：使用互斥锁防止并发启动多个全量 ====================
+		fullMigrationMu.Lock()
+		if fullMigrationRunning[task.ID] {
+			fullMigrationMu.Unlock()
+			taskLog.Warn("🔒 【P0-BUG2 FIX】Full migration already running, skip duplicate start", map[string]interface{}{
+				"task_id": task.ID,
+			})
+		} else {
+			fullMigrationRunning[task.ID] = true
+			fullMigrationMu.Unlock()
+			
+			taskLog.Info("Starting full migration", map[string]interface{}{
+				"total_keys": totalKeys,
+				"binlog_caching": cacheManager != nil,
+			})
 
-		// 执行全量迁移
-		doFullMigration(ctx, task, sourceClient, targetClient, sourceIsCluster, targetIsCluster, taskLog)
+			// 执行全量迁移
+			doFullMigration(ctx, task, sourceClient, targetClient, sourceIsCluster, targetIsCluster, taskLog)
+			
+			// 清除运行标记
+			fullMigrationMu.Lock()
+			delete(fullMigrationRunning, task.ID)
+			fullMigrationMu.Unlock()
+		}
 	}
 
 	// 检查是否需要增量迁移
@@ -3243,7 +4137,17 @@ func simulateProgress(task *Task) {
 		taskLog.Info("Starting incremental sync phase")
 		tasksMu.Lock()
 		task.Phase = "incremental"
-		task.IncrStartAt = time.Now().Format("2006-01-02 15:04:05")
+		// 【P2-BUG4 修复】只在 IncrStartAt 为空时设置，避免恢复时覆盖原始时间
+		if task.IncrStartAt == "" {
+			task.IncrStartAt = time.Now().Format("2006-01-02 15:04:05")
+			taskLog.Info("📅 【P2-BUG4 FIX】Setting IncrStartAt for first time", map[string]interface{}{
+				"incr_start_at": task.IncrStartAt,
+			})
+		} else {
+			taskLog.Info("📅 【P2-BUG4 FIX】Preserving existing IncrStartAt", map[string]interface{}{
+				"incr_start_at": task.IncrStartAt,
+			})
+		}
 		tasksMu.Unlock()
 		
 		// 根据是否有 FakeSlave 选择同步模式
@@ -3406,6 +4310,9 @@ func connectRedisWithPoolSize(ctx context.Context, addrs []string, password stri
 		PoolSize:     poolSize,           // 每个节点的连接池大小
 		MinIdleConns: poolSize / 4,       // 最小空闲连接数
 		PoolTimeout:  30 * time.Second,   // 等待连接的超时时间
+		DialTimeout:  10 * time.Second,   // 连接超时
+		ReadTimeout:  60 * time.Second,   // 读取超时（大 Key RESTORE 可能需要较长时间）
+		WriteTimeout: 60 * time.Second,   // 写入超时
 	})
 	if err := clusterClient.Ping(ctx).Err(); err == nil {
 		return clusterClient, true, nil
@@ -3419,6 +4326,9 @@ func connectRedisWithPoolSize(ctx context.Context, addrs []string, password stri
 		PoolSize:     poolSize,           // 连接池大小
 		MinIdleConns: poolSize / 4,       // 最小空闲连接数
 		PoolTimeout:  30 * time.Second,   // 等待连接的超时时间
+		DialTimeout:  10 * time.Second,   // 连接超时
+		ReadTimeout:  60 * time.Second,   // 读取超时（大 Key RESTORE 可能需要较长时间）
+		WriteTimeout: 60 * time.Second,   // 写入超时
 	})
 	if err := standaloneClient.Ping(ctx).Err(); err != nil {
 		standaloneClient.Close()
@@ -4106,7 +5016,14 @@ func (p *DynamicWorkerPool) processKey(workerID int, key string) {
 		atomic.AddInt64(p.filteredCount, 1)
 	} else {
 		atomic.AddInt64(p.failedCount, 1)
-		addErrorKey(p.task.ID, key, "string", "failed", reason+" (after "+fmt.Sprintf("%d", maxRetries)+" retries)")
+		// 【P2-BUG5 修复】使用增强版错误记录，包含完整上下文
+		sourceAddr := getClientAddr(p.sourceClient)
+		targetAddr := getClientAddr(p.targetClient)
+		addErrorKeyWithDetails(
+			p.task.ID, key, "string", "failed",
+			reason+" (after "+fmt.Sprintf("%d", maxRetries)+" retries)",
+			sourceAddr, targetAddr, "migrate", "full", maxRetries,
+		)
 		
 		// 定期保存错误 key（每 100 个失败保存一次）
 		failedCount := atomic.LoadInt64(p.failedCount)
@@ -4482,10 +5399,23 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 	// 加载已有的全量断点
 	existingCheckpoint := loadFullSyncCheckpoint(task.ID)
 	if existingCheckpoint != nil && !existingCheckpoint.IsComplete {
-		taskLog.Info("Resuming from existing checkpoint", map[string]interface{}{
-			"processed_keys": existingCheckpoint.ProcessedKeys,
-			"node_cursors":   len(existingCheckpoint.NodeCursors),
+		// 【恢复日志增强】详细记录从哪个断点继续
+		taskLog.Info("📍 【RESUME】Resuming from existing checkpoint", map[string]interface{}{
+			"processed_keys":    existingCheckpoint.ProcessedKeys,
+			"total_scanned":     existingCheckpoint.TotalScannedKeys,
+			"node_cursors":      len(existingCheckpoint.NodeCursors),
+			"checkpoint_phase":  existingCheckpoint.Phase,
+			"checkpoint_start":  existingCheckpoint.StartTime,
+			"checkpoint_update": existingCheckpoint.UpdatedAt,
 		})
+		// 打印每个节点的 cursor 详情
+		for nodeKey, cursor := range existingCheckpoint.NodeCursors {
+			taskLog.Info("📍 【RESUME】Node cursor detail", map[string]interface{}{
+				"node_key": nodeKey,
+				"cursor":   cursor,
+				"status":   map[bool]string{true: "completed", false: "resuming"}[cursor == 0],
+			})
+		}
 	}
 
 	// 初始化全量断点
@@ -4497,11 +5427,15 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 	}
 	if existingCheckpoint != nil && !existingCheckpoint.IsComplete {
 		fullCheckpoint = existingCheckpoint
+		// 【P2-BUG4 修复】保留原始 StartTime
+		if existingCheckpoint.StartTime != "" {
+			fullCheckpoint.StartTime = existingCheckpoint.StartTime
+		}
 	}
 
 	// 断点保存计数器
 	var scannedKeysCount int64
-	checkpointSaveInterval := int64(10000) // 每扫描 10000 个 key 保存一次断点
+	checkpointSaveInterval := int64(1000) // 每扫描 1000 个 key 保存一次断点（SSD 优化：减少崩溃后重复迁移）
 	lastCheckpointSave := time.Now()
 	
 	// 【优化】获取 SCAN MATCH 模式 - 利用服务端过滤
@@ -4534,24 +5468,52 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 				// 获取节点地址
 				nodeAddr := nodeClient.Options().Addr
 				
-				// 从断点恢复 cursor（支持前缀维度）
+				// 【P1-BUG3 修复】从断点恢复 cursor（支持前缀维度）
 				var cursor uint64
+				var cursorFound bool
 				nodeCursorsMu.Lock()
 				checkpointKey := getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)
+				
+				// 尝试多种 key 格式查找 cursor
 				if savedCursor, ok := fullCheckpoint.NodeCursors[checkpointKey]; ok {
 					cursor = savedCursor
-					taskLog.Info("Resuming node scan from cursor", map[string]interface{}{
-						"node":         nodeAddr,
-						"cursor":       cursor,
-						"match_pattern": scanMatchPattern,
+					cursorFound = true
+					taskLog.Info("📍 【P1-BUG3 FIX】Resuming node scan from cursor (prefix key)", map[string]interface{}{
+						"node":           nodeAddr,
+						"cursor":         cursor,
+						"checkpoint_key": checkpointKey,
+						"match_pattern":  scanMatchPattern,
 					})
 				} else if savedCursor, ok := fullCheckpoint.NodeCursors[nodeAddr]; ok {
-					// 兼容旧断点格式
+					// 兼容旧断点格式（只使用节点地址作为 key）
 					cursor = savedCursor
-					taskLog.Info("Resuming node scan from cursor (legacy)", map[string]interface{}{
+					cursorFound = true
+					taskLog.Info("📍 【P1-BUG3 FIX】Resuming node scan from cursor (legacy key)", map[string]interface{}{
 						"node":   nodeAddr,
 						"cursor": cursor,
 					})
+				} else {
+					// 没有找到断点，从头开始
+					taskLog.Info("📍 【P1-BUG3 FIX】No checkpoint found for node, starting from beginning", map[string]interface{}{
+						"node":              nodeAddr,
+						"checkpoint_key":    checkpointKey,
+						"available_cursors": len(fullCheckpoint.NodeCursors),
+					})
+					// 打印所有可用的 cursor keys 便于调试
+					if len(fullCheckpoint.NodeCursors) > 0 {
+						taskLog.Debug("Available checkpoint keys", map[string]interface{}{
+							"keys": getMapKeys(fullCheckpoint.NodeCursors),
+						})
+					}
+				}
+				
+				// 如果 cursor == 0 但已找到记录，说明该节点已扫描完成
+				if cursorFound && cursor == 0 {
+					taskLog.Info("📍 Node already completed in previous run, skipping", map[string]interface{}{
+						"node": nodeAddr,
+					})
+					nodeCursorsMu.Unlock()
+					return
 				}
 				nodeCursorsMu.Unlock()
 				
@@ -4981,6 +5943,123 @@ func migrateKeyWithPolicy(ctx context.Context, sourceClient, targetClient redis.
 	return true, bytes, ""
 }
 
+// syncKeyByType 【BUG-2 修复】根据 Key 类型使用原生命令同步
+// 解决 Tendis 间 DUMP/RESTORE 格式不兼容问题
+func syncKeyByType(ctx context.Context, sourceClient, targetClient redis.UniversalClient, key, keyType string, ttl time.Duration, conflictPolicy string) error {
+	// 冲突策略检查
+	if conflictPolicy == "skip" {
+		exists, _ := targetClient.Exists(ctx, key).Result()
+		if exists > 0 {
+			return nil // 跳过已存在的 Key
+		}
+	} else if conflictPolicy == "replace" || conflictPolicy == "skip_full_only" {
+		// 增量阶段使用 replace 策略，先删除目标端的 Key
+		targetClient.Del(ctx, key)
+	}
+
+	var err error
+	switch keyType {
+	case "string":
+		// STRING 类型
+		val, getErr := sourceClient.Get(ctx, key).Result()
+		if getErr != nil {
+			return getErr
+		}
+		if ttl > 0 {
+			err = targetClient.Set(ctx, key, val, ttl).Err()
+		} else {
+			err = targetClient.Set(ctx, key, val, 0).Err()
+		}
+
+	case "hash":
+		// HASH 类型
+		fields, getErr := sourceClient.HGetAll(ctx, key).Result()
+		if getErr != nil {
+			return getErr
+		}
+		if len(fields) > 0 {
+			// 转换为 []interface{} 格式
+			args := make([]interface{}, 0, len(fields)*2)
+			for k, v := range fields {
+				args = append(args, k, v)
+			}
+			err = targetClient.HMSet(ctx, key, args...).Err()
+			if err == nil && ttl > 0 {
+				targetClient.Expire(ctx, key, ttl)
+			}
+		}
+
+	case "list":
+		// LIST 类型
+		vals, getErr := sourceClient.LRange(ctx, key, 0, -1).Result()
+		if getErr != nil {
+			return getErr
+		}
+		if len(vals) > 0 {
+			// 转换为 []interface{} 格式
+			args := make([]interface{}, len(vals))
+			for i, v := range vals {
+				args[i] = v
+			}
+			err = targetClient.RPush(ctx, key, args...).Err()
+			if err == nil && ttl > 0 {
+				targetClient.Expire(ctx, key, ttl)
+			}
+		}
+
+	case "set":
+		// SET 类型
+		members, getErr := sourceClient.SMembers(ctx, key).Result()
+		if getErr != nil {
+			return getErr
+		}
+		if len(members) > 0 {
+			// 转换为 []interface{} 格式
+			args := make([]interface{}, len(members))
+			for i, v := range members {
+				args[i] = v
+			}
+			err = targetClient.SAdd(ctx, key, args...).Err()
+			if err == nil && ttl > 0 {
+				targetClient.Expire(ctx, key, ttl)
+			}
+		}
+
+	case "zset":
+		// ZSET 类型
+		members, getErr := sourceClient.ZRangeWithScores(ctx, key, 0, -1).Result()
+		if getErr != nil {
+			return getErr
+		}
+		if len(members) > 0 {
+			zMembers := make([]*redis.Z, len(members))
+			for i, m := range members {
+				zMembers[i] = &redis.Z{Score: m.Score, Member: m.Member}
+			}
+			err = targetClient.ZAdd(ctx, key, zMembers...).Err()
+			if err == nil && ttl > 0 {
+				targetClient.Expire(ctx, key, ttl)
+			}
+		}
+
+	default:
+		// 其他类型尝试使用 DUMP/RESTORE（如果支持）
+		dump, dumpErr := sourceClient.Dump(ctx, key).Result()
+		if dumpErr != nil {
+			return fmt.Errorf("unsupported type %s, dump failed: %v", keyType, dumpErr)
+		}
+		if ttl < 0 {
+			ttl = 0
+		}
+		err = targetClient.Restore(ctx, key, ttl, dump).Err()
+		if err != nil {
+			return fmt.Errorf("restore failed for type %s: %v", keyType, err)
+		}
+	}
+
+	return err
+}
+
 // ==================== P2 改进: Pipeline 批量 DUMP/RESTORE ====================
 
 // PipelineMigrateResult 批量迁移结果
@@ -5100,7 +6179,16 @@ func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient re
 		for i := range keys {
 			if restoreCmds[i] != nil {
 				if err := restoreCmds[i].Err(); err != nil {
-					results[i].Reason = "restore failed: " + err.Error()
+					errStr := err.Error()
+					// BUSYKEY 错误表示 Key 已存在，应该归类为 skipped 而不是 failed
+					// 这种情况通常发生在：
+					// 1. 增量同步比全量迁移更快地写入了这个 Key
+					// 2. EXISTS 检查和 RESTORE 执行之间的竞态条件
+					if strings.Contains(errStr, "BUSYKEY") {
+						results[i].Reason = "skipped"
+					} else {
+						results[i].Reason = "restore failed: " + errStr
+					}
 				} else {
 					results[i].Migrated = true
 				}
@@ -5156,9 +6244,14 @@ func MigrateBatchWithPipelineAndFilter(ctx context.Context, sourceClient, target
 			skipped++
 		} else if r.Reason != "" {
 			failed++
-			// 【问题2修复】记录详细的失败原因
+			// 【P2-BUG5 修复】记录详细的失败原因，包含源目标节点
 			if taskID != "" {
-				addErrorKey(taskID, r.Key, "unknown", "failed", r.Reason+" (batch pipeline)")
+				sourceAddr := getClientAddr(sourceClient)
+				targetAddr := getClientAddr(targetClient)
+				addErrorKeyWithDetails(
+					taskID, r.Key, "unknown", "failed", r.Reason+" (batch pipeline)",
+					sourceAddr, targetAddr, "pipeline", "full", 0,
+				)
 			}
 			// 记录迁移失败的大 Key
 			if r.Bytes >= largeKeyThreshold && taskID != "" {
@@ -5328,7 +6421,7 @@ func doIncrementalSyncWithFakeSlave(
 
 	// 创建 Binlog 处理回调
 	binlogHandler := func(entries []replication.BinlogEntry) error {
-		return processBinlogEntries(ctx, task, entries, targetClient, conflictPolicy, taskLog)
+		return processBinlogEntries(ctx, task, entries, sourceClient, targetClient, conflictPolicy, taskLog)
 	}
 
 	// 收集所有源端节点地址
@@ -5525,7 +6618,7 @@ func startFakeSlavesWithCache(
 
 	// 创建 Binlog 处理回调（非缓存模式下使用）
 	binlogHandler := func(entries []replication.BinlogEntry) error {
-		return processBinlogEntries(ctx, task, entries, targetClient, conflictPolicy, taskLog)
+		return processBinlogEntries(ctx, task, entries, sourceClient, targetClient, conflictPolicy, taskLog)
 	}
 
 	// 收集所有源端节点地址
@@ -5670,6 +6763,143 @@ func startFakeSlavesWithCache(
 	taskLog.Info("FakeSlaves connected and ready", map[string]interface{}{
 		"connected": connectedCount,
 		"total":     len(fakeSlaves),
+	})
+
+	return fakeSlaves, nil
+}
+
+// startFakeSlaves 启动 FakeSlave（实时同步模式，不带缓存）
+// 用于从增量阶段恢复时直接启动实时同步
+func startFakeSlaves(
+	ctx context.Context,
+	task *Task,
+	sourceClient, targetClient redis.UniversalClient,
+	sourceIsCluster bool,
+	taskLog *logger.TaskLogger,
+) ([]*replication.FakeSlave, error) {
+	taskLog.Info("Starting FakeSlaves in real-time sync mode (no cache)")
+
+	// 创建 Key 过滤函数
+	keyFilter := func(key string) bool {
+		return matchKeyFilter(key, task.Options)
+	}
+
+	// 获取冲突策略
+	conflictPolicy := "skip"
+	if task.Options != nil && task.Options.ConflictPolicy != "" {
+		conflictPolicy = task.Options.ConflictPolicy
+	}
+
+	// 创建 Binlog 处理回调（直接应用到目标端）
+	binlogHandler := func(entries []replication.BinlogEntry) error {
+		return processBinlogEntries(ctx, task, entries, sourceClient, targetClient, conflictPolicy, taskLog)
+	}
+
+	// 收集所有源端节点地址
+	var sourceNodes []string
+	if sourceIsCluster {
+		clusterClient := sourceClient.(*redis.ClusterClient)
+		err := clusterClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+			sourceNodes = append(sourceNodes, node.Options().Addr)
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get cluster nodes: %w", err)
+		}
+	} else {
+		sourceNodes = []string{sourceClient.(*redis.Client).Options().Addr}
+	}
+
+	// 获取 kvstorecount
+	kvstorecount := 10
+	if len(sourceNodes) > 0 {
+		nodeClient := redis.NewClient(&redis.Options{
+			Addr:     sourceNodes[0],
+			Password: task.SourcePassword,
+		})
+		result, err := nodeClient.Do(ctx, "CONFIG", "GET", "kvstorecount").Result()
+		nodeClient.Close()
+		if err == nil {
+			if arr, ok := result.([]interface{}); ok && len(arr) >= 2 {
+				if countStr, ok := arr[1].(string); ok {
+					if count, err := strconv.Atoi(countStr); err == nil && count > 0 {
+						kvstorecount = count
+					}
+				}
+			}
+		}
+	}
+
+	taskLog.Info("FakeSlave will connect to nodes (real-time mode)", map[string]interface{}{
+		"nodes":        sourceNodes,
+		"node_count":   len(sourceNodes),
+		"kvstorecount": kvstorecount,
+		"total_slaves": len(sourceNodes) * kvstorecount,
+	})
+
+	// 为每个节点的每个 store 创建 FakeSlave
+	fakeSlaves := make([]*replication.FakeSlave, 0, len(sourceNodes)*kvstorecount)
+
+	for nodeIdx, nodeAddr := range sourceNodes {
+		nodeClient := redis.NewClient(&redis.Options{
+			Addr:     nodeAddr,
+			Password: task.SourcePassword,
+		})
+
+		for storeID := 0; storeID < kvstorecount; storeID++ {
+			// 获取当前 store 的 binlog 位置
+			var startBinlogPos uint64
+			binlogPosResult, err := nodeClient.Do(ctx, "binlogpos", fmt.Sprintf("%d", storeID)).Result()
+
+			if err == nil {
+				switch v := binlogPosResult.(type) {
+				case int64:
+					startBinlogPos = uint64(v)
+				case string:
+					fmt.Sscanf(v, "%d", &startBinlogPos)
+				}
+			}
+
+			// 创建 FakeSlave 配置
+			config := replication.FakeSlaveConfig{
+				SourceAddr:     nodeAddr,
+				SourcePassword: task.SourcePassword,
+				StoreID:        uint32(storeID),
+				StartBinlogPos: startBinlogPos,
+				KeyFilter:      keyFilter,
+				CacheManager:   nil, // 不使用缓存
+			}
+
+			// 创建并启动 FakeSlave（需要传入 targetClient）
+			fs := replication.NewFakeSlave(config, targetClient)
+			fs.SetBinlogHandler(binlogHandler) // 设置 binlog 处理回调
+			if err := fs.Start(ctx); err != nil {
+				taskLog.Error("Failed to start FakeSlave", map[string]interface{}{
+					"node":     nodeAddr,
+					"store_id": storeID,
+					"error":    err.Error(),
+				})
+				continue
+			}
+
+			fakeSlaves = append(fakeSlaves, fs)
+			taskLog.Debug("FakeSlave started (real-time mode)", map[string]interface{}{
+				"node":             nodeAddr,
+				"node_idx":         nodeIdx,
+				"store_id":         storeID,
+				"start_binlog_pos": startBinlogPos,
+			})
+		}
+		nodeClient.Close()
+	}
+
+	if len(fakeSlaves) == 0 {
+		return nil, fmt.Errorf("failed to start any FakeSlave")
+	}
+
+	taskLog.Info("FakeSlaves started in real-time mode", map[string]interface{}{
+		"connected": len(fakeSlaves),
+		"total":     len(sourceNodes) * kvstorecount,
 	})
 
 	return fakeSlaves, nil
@@ -5933,11 +7163,12 @@ func parseRESPCommand(cmdStr string) []string {
 }
 
 // processBinlogEntries 处理 Binlog 条目并应用到目标端
+// 【BUG-2 修复】添加 sourceClient 参数用于按类型同步
 func processBinlogEntries(
 	ctx context.Context,
 	task *Task,
 	entries []replication.BinlogEntry,
-	targetClient redis.UniversalClient,
+	sourceClient, targetClient redis.UniversalClient,
 	conflictPolicy string,
 	taskLog *logger.TaskLogger,
 ) error {
@@ -5972,6 +7203,10 @@ func processBinlogEntries(
 						"error":   err.Error(),
 					})
 					failed++
+					// 【BUG-3 修复】记录增量同步失败的 Key
+					addErrorKeyWithDetails(task.ID, entry.Key, "unknown", "failed",
+						"Binlog CMD failed: "+err.Error(),
+						"binlog", "target", "CMD", "incremental", 0)
 					continue
 				}
 				synced++
@@ -5983,36 +7218,37 @@ func processBinlogEntries(
 			}
 
 		case "SET":
-			// SET 类型：entry.Value 是 RocksDB 格式的 DUMP 数据
-			// 使用 RESTORE 命令同步
-			if len(entry.Value) > 0 {
+			// 【BUG-2 修复】SET 类型：不再使用 RESTORE 命令（Tendis 间 DUMP 格式可能不兼容）
+			// 改为从源端重新读取数据并使用原生命令写入
+			if len(entry.Key) > 0 {
 				ttl := time.Duration(entry.TTL) * time.Millisecond
-				// 根据冲突策略决定是否替换
-				if conflictPolicy == "replace" || conflictPolicy == "skip_full_only" {
-					err := targetClient.RestoreReplace(ctx, entry.Key, ttl, string(entry.Value)).Err()
-					if err != nil {
-						taskLog.Debug("Binlog RESTORE failed", map[string]interface{}{
-							"key":   entry.Key,
-							"error": err.Error(),
-						})
-						failed++
-						continue
-					}
-					synced++
-				} else {
-					// skip 策略：先检查目标端是否存在
-					exists, _ := targetClient.Exists(ctx, entry.Key).Result()
-					if exists > 0 {
-						skipped++
-						continue
-					}
-					err := targetClient.Restore(ctx, entry.Key, ttl, string(entry.Value)).Err()
-					if err != nil {
-						failed++
-						continue
-					}
-					synced++
+				
+				// 从源端重新获取 Key 的类型和值
+				keyType, err := sourceClient.Type(ctx, entry.Key).Result()
+				if err != nil || keyType == "none" {
+					// Key 可能已被删除，跳过
+					taskLog.Debug("Binlog SET key not found in source", map[string]interface{}{
+						"key": entry.Key,
+					})
+					continue
 				}
+				
+				// 根据 Key 类型使用对应的命令同步
+				syncErr := syncKeyByType(ctx, sourceClient, targetClient, entry.Key, keyType, ttl, conflictPolicy)
+				if syncErr != nil {
+					taskLog.Debug("Binlog SET sync failed", map[string]interface{}{
+						"key":      entry.Key,
+						"key_type": keyType,
+						"error":    syncErr.Error(),
+					})
+					failed++
+					// 【BUG-3 修复】记录增量同步失败的 Key
+					addErrorKeyWithDetails(task.ID, entry.Key, keyType, "failed",
+						"Binlog SET sync failed: "+syncErr.Error(),
+						"binlog", "target", "SET", "incremental", 0)
+					continue
+				}
+				synced++
 			}
 
 		case "DEL", "UNLINK", "EXPIRED", "EVICTED":
@@ -6499,10 +7735,20 @@ func scanNodeModifiedKeysV2(
 						synced++
 					} else if reason == "skipped" {
 						skipped++
-						addErrorKey(task.ID, key, "string", "skipped", "Key exists in target (incremental V2)")
+						// 【P2-BUG5 修复】增量跳过也记录完整上下文
+						nodeAddr := node.Options().Addr
+						targetAddr := getClientAddr(targetClient)
+						addErrorKeyWithDetails(task.ID, key, "string", "skipped", 
+							"Key exists in target (incremental V2)",
+							nodeAddr, targetAddr, "migrate", "incremental", 0)
 					} else if reason != "" {
 						failed++
-						addErrorKey(task.ID, key, "string", "failed", reason+" (incremental V2)")
+						// 【P2-BUG5 修复】增量失败记录完整上下文
+						nodeAddr := node.Options().Addr
+						targetAddr := getClientAddr(targetClient)
+						addErrorKeyWithDetails(task.ID, key, "string", "failed", 
+							reason+" (incremental V2)",
+							nodeAddr, targetAddr, "migrate", "incremental", maxRetries)
 					}
 				}
 			}
@@ -6960,7 +8206,11 @@ func processSingleNodeBinlog(
 							})
 						} else if reason != "" && reason != "skipped" {
 							failed++
-							addErrorKey(task.ID, dstKey, "string", "failed", reason+" (rename)")
+							// 【P2-BUG5 修复】rename 失败记录完整上下文
+							nodeAddr := node.Options().Addr
+							targetAddr := getClientAddr(targetClient)
+							addErrorKeyWithDetails(task.ID, dstKey, "string", "failed", 
+								reason+" (rename)", nodeAddr, targetAddr, "RENAME", "incremental", 0)
 						}
 					} else {
 						taskLog.Warn("Failed to rename key", map[string]interface{}{
@@ -6996,7 +8246,12 @@ func processSingleNodeBinlog(
 				skipped++
 			} else if reason != "" {
 				failed++
-				addErrorKey(task.ID, entry.Key, "string", "failed", reason+" (binlog)")
+				// 【P2-BUG5 修复】binlog 失败记录完整上下文
+				nodeAddr := node.Options().Addr
+				targetAddr := getClientAddr(targetClient)
+				addErrorKeyWithDetails(task.ID, entry.Key, "string", "failed", 
+					reason+" (binlog "+entry.Operation+")", 
+					nodeAddr, targetAddr, entry.Operation, "incremental", 0)
 			}
 
 		case "DEL", "UNLINK":
@@ -7084,9 +8339,11 @@ func loadBinlogCheckpoint(taskID string) *BinlogCheckpoint {
 // ==================== P0 改进: ErrorKeys 上限提升 + 落盘机制 ====================
 
 const (
-	// P0 改进：提高内存上限到 10 万，总上限 100 万
-	MaxErrorKeysInMemory = 100000   // 内存中最多存 10 万条
-	MaxErrorKeysTotal    = 1000000  // 总共最多记录 100 万条（含落盘）
+	// 核心底线：不丢数据！支持 1 亿+ 失败 Key 记录
+	// 内存上限降低到 1 万（约 2MB），减少崩溃时的数据丢失风险
+	// 总上限提升到 5 亿，确保任何规模的失败 Key 都能记录
+	MaxErrorKeysInMemory = 10000       // 内存中最多存 1 万条（约 2MB），超出自动落盘
+	MaxErrorKeysTotal    = 500000000   // 总上限 5 亿条（支持超大规模迁移）
 )
 
 // ErrorKeysFileTracker 追踪每个任务的落盘文件
@@ -7104,7 +8361,14 @@ var (
 )
 
 // addErrorKey 添加错误Key记录（P0 改进版：支持落盘）
+// 【P2-BUG5 修复】保持向后兼容的简化版本
 func addErrorKey(taskID, key, keyType, reason, detail string) {
+	addErrorKeyWithDetails(taskID, key, keyType, reason, detail, "", "", "", "", 0)
+}
+
+// addErrorKeyWithDetails 添加错误Key记录（完整版本 - P2-BUG5 修复）
+// 支持记录完整的错误上下文：源节点、目标节点、操作类型、阶段、重试次数
+func addErrorKeyWithDetails(taskID, key, keyType, reason, detail, sourceNode, targetNode, operation, phase string, retryCount int) {
 	errorKeyMu.Lock()
 	defer errorKeyMu.Unlock()
 
@@ -7128,6 +8392,11 @@ func addErrorKey(taskID, key, keyType, reason, detail string) {
 			"task_id":        taskID,
 			"key":            key,
 			"reason":         reason,
+			"detail":         detail,
+			"source_node":    sourceNode,
+			"target_node":    targetNode,
+			"operation":      operation,
+			"phase":          phase,
 			"total_in_files": tracker.TotalInFiles,
 			"in_memory":      len(errorKeys[taskID]),
 			"max_total":      MaxErrorKeysTotal,
@@ -7135,13 +8404,18 @@ func addErrorKey(taskID, key, keyType, reason, detail string) {
 		return
 	}
 
-	// 添加到内存
+	// 添加到内存（包含完整错误上下文）
 	errorKeys[taskID] = append(errorKeys[taskID], ErrorKey{
-		Key:       key,
-		Type:      keyType,
-		Reason:    reason,
-		Detail:    detail,
-		Timestamp: time.Now().Format(time.RFC3339),
+		Key:        key,
+		Type:       keyType,
+		Reason:     reason,
+		Detail:     detail,
+		SourceNode: sourceNode,
+		TargetNode: targetNode,
+		Operation:  operation,
+		Phase:      phase,
+		RetryCount: retryCount,
+		Timestamp:  time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -7483,22 +8757,38 @@ func getIncrementalCheckpoint(taskID string) *IncrementalSyncCheckpoint {
 
 // ==================== 全量同步断点（SCAN cursor 持久化）====================
 
-// saveFullSyncCheckpoint 保存全量同步断点
+// saveFullSyncCheckpoint 保存全量同步断点（异步写入磁盘，不阻塞主流程）
 func saveFullSyncCheckpoint(taskID string, checkpoint *FullSyncCheckpoint) {
+	// 先更新内存（同步操作，确保一致性）
 	fullSyncCheckpointsMu.Lock()
-	fullSyncCheckpoints[taskID] = checkpoint
+	// 深拷贝 checkpoint，避免并发修改问题
+	cpCopy := &FullSyncCheckpoint{
+		TaskID:           checkpoint.TaskID,
+		NodeCursors:      make(map[string]uint64),
+		ProcessedKeys:    checkpoint.ProcessedKeys,
+		TotalScannedKeys: checkpoint.TotalScannedKeys,
+		Phase:            checkpoint.Phase,
+		IsComplete:       checkpoint.IsComplete,
+		UpdatedAt:        checkpoint.UpdatedAt,
+	}
+	for k, v := range checkpoint.NodeCursors {
+		cpCopy.NodeCursors[k] = v
+	}
+	fullSyncCheckpoints[taskID] = cpCopy
 	fullSyncCheckpointsMu.Unlock()
 
-	// 保存到文件
-	checkpointDir := "./data/checkpoints"
-	os.MkdirAll(checkpointDir, 0755)
+	// 异步保存到文件（SSD 优化：不阻塞迁移主流程）
+	go func(taskID string, cp *FullSyncCheckpoint) {
+		checkpointDir := "./data/checkpoints"
+		os.MkdirAll(checkpointDir, 0755)
 
-	data, err := json.MarshalIndent(checkpoint, "", "  ")
-	if err != nil {
-		logger.Warn("Failed to marshal full sync checkpoint", map[string]interface{}{"error": err.Error()})
-		return
-	}
-	os.WriteFile(fmt.Sprintf("%s/full-%s.json", checkpointDir, taskID), data, 0644)
+		data, err := json.MarshalIndent(cp, "", "  ")
+		if err != nil {
+			logger.Warn("Failed to marshal full sync checkpoint", map[string]interface{}{"error": err.Error()})
+			return
+		}
+		os.WriteFile(fmt.Sprintf("%s/full-%s.json", checkpointDir, taskID), data, 0644)
+	}(taskID, cpCopy)
 }
 
 // loadFullSyncCheckpoint 加载全量同步断点
@@ -10851,4 +12141,2147 @@ func conflictKeysSubHandler(w http.ResponseWriter, r *http.Request, id, action s
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// ==================== 独立校验任务 API ====================
+
+// verifyTasksHandler 处理校验任务列表
+// GET /api/v1/verify-tasks - 获取校验任务列表
+// POST /api/v1/verify-tasks - 创建校验任务
+func verifyTasksHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
+	switch r.Method {
+	case "GET":
+		listVerifyTasksHandler(w, r, log)
+	case "POST":
+		createVerifyTaskHandler(w, r, log)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// listVerifyTasksHandler 获取校验任务列表
+func listVerifyTasksHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
+	verifyTasksMu.RLock()
+	defer verifyTasksMu.RUnlock()
+
+	taskList := make([]*VerifyTask, 0, len(verifyTasks))
+	for _, task := range verifyTasks {
+		taskList = append(taskList, task)
+	}
+
+	// 按创建时间倒序排序
+	sort.Slice(taskList, func(i, j int) bool {
+		return taskList[i].CreatedAt > taskList[j].CreatedAt
+	})
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+		"data":    taskList,
+	})
+}
+
+// createVerifyTaskHandler 创建校验任务
+func createVerifyTaskHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
+	var req struct {
+		Name           string `json:"name"`
+		SourceCluster  struct {
+			Addrs    []string `json:"addrs"`
+			Password string   `json:"password"`
+		} `json:"source_cluster"`
+		TargetCluster struct {
+			Addrs    []string `json:"addrs"`
+			Password string   `json:"password"`
+		} `json:"target_cluster"`
+		VerifyMode      string           `json:"verify_mode"`       // count_only, sample, full
+		SampleRate      float64          `json:"sample_rate"`       // 采样率
+		MaxKeys         int64            `json:"max_keys"`          // 最大校验 Key 数
+		KeyFilter       *KeyFilterConfig `json:"key_filter"`        // Key 过滤
+		CompareValue    bool             `json:"compare_value"`     // 是否比较值（兼容旧版）
+		CompareTTL      bool             `json:"compare_ttl"`       // 是否比较 TTL
+		TTLTolerance    int64            `json:"ttl_tolerance"`     // TTL 容差（秒）
+		MigrationTaskID string           `json:"migration_task_id"` // 关联的迁移任务
+		AutoStart       bool             `json:"auto_start"`        // 是否自动启动
+		// 新增参数
+		Concurrency       int    `json:"concurrency"`         // 并发数
+		QPS               int    `json:"qps"`                 // QPS 限制
+		CompareMode       string `json:"compare_mode"`        // full_value, length_only, exists_only
+		SkipLargeKey      bool   `json:"skip_large_key"`      // 是否跳过大 Key
+		LargeKeyThreshold int64  `json:"large_key_threshold"` // 大 Key 阈值（字节）
+		DBList            string `json:"db_list"`             // DB 列表，分号分隔
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Error("Failed to decode request", map[string]interface{}{"error": err.Error()})
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "Invalid request body"})
+		return
+	}
+
+	// 验证必填字段
+	if len(req.SourceCluster.Addrs) == 0 || len(req.TargetCluster.Addrs) == 0 {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "Source and target cluster addresses are required"})
+		return
+	}
+
+	// 设置默认值
+	if req.Name == "" {
+		req.Name = fmt.Sprintf("校验任务-%s", time.Now().Format("20060102-150405"))
+	}
+	if req.VerifyMode == "" {
+		req.VerifyMode = "sample"
+	}
+	if req.SampleRate <= 0 || req.SampleRate > 1 {
+		req.SampleRate = 0.01 // 默认 1% 采样率
+	}
+	if req.MaxKeys <= 0 {
+		req.MaxKeys = 100000 // 默认最大 10 万 Key
+	}
+	if req.TTLTolerance <= 0 {
+		req.TTLTolerance = 5 // 默认 5 秒容差
+	}
+	// 新增默认值
+	if req.Concurrency <= 0 {
+		req.Concurrency = 10 // 默认 10 并发
+	}
+	if req.Concurrency > 100 {
+		req.Concurrency = 100 // 最大 100 并发
+	}
+	if req.CompareMode == "" {
+		// 兼容旧版：如果 CompareValue 为 true，使用 full_value；否则使用 exists_only
+		if req.CompareValue {
+			req.CompareMode = "full_value"
+		} else {
+			req.CompareMode = "exists_only"
+		}
+	}
+	if req.LargeKeyThreshold <= 0 {
+		req.LargeKeyThreshold = 10 * 1024 * 1024 // 默认 10MB
+	}
+
+	task := &VerifyTask{
+		ID:                uuid.New().String(),
+		Name:              req.Name,
+		Status:            "pending",
+		SourceCluster:     strings.Join(req.SourceCluster.Addrs, ","),
+		TargetCluster:     strings.Join(req.TargetCluster.Addrs, ","),
+		SourcePassword:    req.SourceCluster.Password,
+		TargetPassword:    req.TargetCluster.Password,
+		VerifyMode:        req.VerifyMode,
+		SampleRate:        req.SampleRate,
+		MaxKeys:           req.MaxKeys,
+		KeyFilter:         req.KeyFilter,
+		CompareValue:      req.CompareValue,
+		CompareTTL:        req.CompareTTL,
+		TTLTolerance:      req.TTLTolerance,
+		MigrationTaskID:   req.MigrationTaskID,
+		Concurrency:       req.Concurrency,
+		QPS:               req.QPS,
+		CompareMode:       req.CompareMode,
+		SkipLargeKey:      req.SkipLargeKey,
+		LargeKeyThreshold: req.LargeKeyThreshold,
+		DBList:            req.DBList,
+		CreatedAt:         time.Now().Format(time.RFC3339),
+		Result: &VerifyTaskResult{
+			Progress: 0,
+		},
+	}
+
+	verifyTasksMu.Lock()
+	verifyTasks[task.ID] = task
+	verifyTasksMu.Unlock()
+
+	// 保存校验任务状态
+	saveVerifyTasksState()
+
+	log.Info("Verify task created", map[string]interface{}{
+		"task_id":     task.ID,
+		"name":        task.Name,
+		"verify_mode": task.VerifyMode,
+	})
+
+	// 如果设置了自动启动，则立即启动
+	if req.AutoStart {
+		go runVerifyTask(task)
+	}
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+		"data":    task,
+	})
+}
+
+// verifyTaskHandler 处理单个校验任务
+func verifyTaskHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/verify-tasks/")
+	parts := strings.Split(path, "/")
+
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	id := parts[0]
+	action := ""
+	if len(parts) > 1 {
+		action = parts[1]
+	}
+
+	switch {
+	case action == "" && r.Method == "GET":
+		getVerifyTaskHandler(w, r, id, log)
+	case action == "" && r.Method == "DELETE":
+		deleteVerifyTaskHandler(w, r, id, log)
+	case action == "start" && r.Method == "POST":
+		startVerifyTaskHandler(w, r, id, log)
+	case action == "stop" && r.Method == "POST":
+		stopVerifyTaskHandler(w, r, id, log)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// getVerifyTaskHandler 获取校验任务详情
+func getVerifyTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
+	verifyTasksMu.RLock()
+	task, ok := verifyTasks[id]
+	verifyTasksMu.RUnlock()
+
+	if !ok {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Verify task not found"})
+		return
+	}
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+		"data":    task,
+	})
+}
+
+// deleteVerifyTaskHandler 删除校验任务
+func deleteVerifyTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
+	verifyTasksMu.Lock()
+	task, ok := verifyTasks[id]
+	if ok {
+		if task.Status == "running" {
+			verifyTasksMu.Unlock()
+			jsonResponse(w, map[string]interface{}{"code": 400, "message": "Cannot delete running task"})
+			return
+		}
+		delete(verifyTasks, id)
+	}
+	verifyTasksMu.Unlock()
+
+	if !ok {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Verify task not found"})
+		return
+	}
+
+	// 保存校验任务状态
+	saveVerifyTasksState()
+
+	log.Info("Verify task deleted", map[string]interface{}{"task_id": id})
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+	})
+}
+
+// startVerifyTaskHandler 启动校验任务
+func startVerifyTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
+	verifyTasksMu.Lock()
+	task, ok := verifyTasks[id]
+	if ok {
+		if task.Status == "running" {
+			verifyTasksMu.Unlock()
+			jsonResponse(w, map[string]interface{}{"code": 400, "message": "Task is already running"})
+			return
+		}
+		task.Status = "running"
+		task.StartedAt = time.Now().Format(time.RFC3339)
+	}
+	verifyTasksMu.Unlock()
+
+	if !ok {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Verify task not found"})
+		return
+	}
+
+	log.Info("Verify task started", map[string]interface{}{"task_id": id})
+
+	// 在后台运行校验任务
+	go runVerifyTask(task)
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+	})
+}
+
+// stopVerifyTaskHandler 停止校验任务
+func stopVerifyTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
+	verifyTasksMu.Lock()
+	task, ok := verifyTasks[id]
+	if ok && task.Status == "running" {
+		task.Status = "cancelled"
+		task.CompletedAt = time.Now().Format(time.RFC3339)
+	}
+	verifyTasksMu.Unlock()
+
+	if !ok {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Verify task not found"})
+		return
+	}
+
+	log.Info("Verify task stopped", map[string]interface{}{"task_id": id})
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+	})
+}
+
+// runVerifyTask 执行校验任务
+// 支持：并发控制、QPS限制、多DB、多种比较模式、大Key跳过
+// 【重要】新增：多轮迭代收敛机制（借鉴 redis-full-check）
+//   - 第1轮：全量扫描并比对，记录不一致 Key
+//   - 后续轮次：只复查上轮不一致的 Key，逐步收敛
+//   - 最终确认经过多轮复查仍然不一致的 Key
+func runVerifyTask(task *VerifyTask) {
+	ctx := context.Background()
+	taskLog := logger.Default()
+	
+	// P3: 初始化指标监控
+	metrics := NewVerifyMetrics()
+	
+	// P1: 初始化 SQLite 存储（如果启用）
+	var sqliteDB *VerifyResultDB
+	if task.EnableSQLite {
+		var err error
+		sqliteDB, err = NewVerifyResultDB(task.ID)
+		if err != nil {
+			taskLog.Warn("Failed to init SQLite, continuing without it", map[string]interface{}{"error": err.Error()})
+		} else {
+			task.sqliteDB = sqliteDB
+			taskLog.Info("SQLite storage initialized", map[string]interface{}{"path": sqliteDB.dbPath})
+		}
+	}
+
+	defer func() {
+		// 关闭 SQLite 连接
+		if sqliteDB != nil {
+			sqliteDB.Close()
+		}
+		
+		// P3: 完成指标计算
+		if task.Result != nil {
+			metrics.Finalize(task.Result.SampledKeys)
+			task.Result.Metrics = metrics
+		}
+		
+		verifyTasksMu.Lock()
+		if task.Status == "running" {
+			task.Status = "completed"
+		}
+		task.CompletedAt = time.Now().Format(time.RFC3339)
+		// 计算一致性
+		if task.Result != nil && task.Result.SampledKeys > 0 {
+			task.Result.ConsistencyRate = float64(task.Result.MatchedKeys) / float64(task.Result.SampledKeys) * 100
+		}
+		verifyTasksMu.Unlock()
+		
+		// 保存校验任务状态到文件
+		saveVerifyTasksState()
+		
+		taskLog.Info("Verify task finished", map[string]interface{}{
+			"task_id":            task.ID,
+			"status":             task.Status,
+			"total_rounds":       task.Result.TotalRounds,
+			"sampled_keys":       task.Result.SampledKeys,
+			"matched_keys":       task.Result.MatchedKeys,
+			"final_mismatch":     len(task.Result.FinalMismatchKeys),
+			"consistency_rate":   task.Result.ConsistencyRate,
+			"large_key_skipped":  task.Result.LargeKeySkipped,
+			"target_extra_keys":  task.Result.TargetExtraKeys,
+		})
+	}()
+
+	verifyTasksMu.Lock()
+	task.Status = "running"
+	task.StartedAt = time.Now().Format(time.RFC3339)
+	if task.Result == nil {
+		task.Result = &VerifyTaskResult{}
+	}
+	verifyTasksMu.Unlock()
+
+	// 解析要校验的 DB 列表
+	dbList := parseDBList(task.DBList)
+	if len(dbList) > 0 {
+		task.Result.DBsVerified = dbList
+	}
+
+	// 设置默认值
+	concurrency := task.Concurrency
+	if concurrency <= 0 {
+		concurrency = 10
+	}
+	compareMode := task.CompareMode
+	if compareMode == "" {
+		if task.CompareValue {
+			compareMode = "full_value"
+		} else {
+			compareMode = "exists_only"
+		}
+	}
+	largeKeyThreshold := task.LargeKeyThreshold
+	if largeKeyThreshold <= 0 {
+		largeKeyThreshold = 10 * 1024 * 1024 // 10MB
+	}
+	
+	// 多轮迭代参数
+	compareRounds := task.CompareRounds
+	if compareRounds <= 0 {
+		compareRounds = 3 // 默认 3 轮
+	}
+	if compareRounds > 5 {
+		compareRounds = 5 // 最多 5 轮
+	}
+	roundInterval := task.RoundInterval
+	if roundInterval <= 0 {
+		roundInterval = 5 // 默认间隔 5 秒
+	}
+	task.Result.TotalRounds = compareRounds
+
+	// 连接源端和目标端
+	sourceAddrs := strings.Split(task.SourceCluster, ",")
+	targetAddrs := strings.Split(task.TargetCluster, ",")
+
+	sourceClient, sourceIsCluster, err := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, concurrency)
+	if err != nil {
+		taskLog.Error("Failed to connect source cluster", map[string]interface{}{"error": err.Error()})
+		task.Status = "failed"
+		return
+	}
+	defer sourceClient.Close()
+
+	targetClient, targetIsCluster, err := connectRedisWithPoolSize(ctx, targetAddrs, task.TargetPassword, concurrency)
+	if err != nil {
+		taskLog.Error("Failed to connect target cluster", map[string]interface{}{"error": err.Error()})
+		task.Status = "failed"
+		return
+	}
+	defer targetClient.Close()
+
+	taskLog.Info("Verify task started", map[string]interface{}{
+		"task_id":             task.ID,
+		"verify_mode":         task.VerifyMode,
+		"compare_mode":        compareMode,
+		"compare_rounds":      compareRounds,
+		"round_interval":      roundInterval,
+		"sample_rate":         task.SampleRate,
+		"max_keys":            task.MaxKeys,
+		"concurrency":         concurrency,
+		"qps":                 task.QPS,
+		"skip_large_key":      task.SkipLargeKey,
+		"large_key_threshold": largeKeyThreshold,
+		"db_list":             dbList,
+		"source_is_cluster":   sourceIsCluster,
+		"target_is_cluster":   targetIsCluster,
+		// P1/P2/P3 新增配置
+		"direction":           task.Direction,
+		"smart_compare":       task.SmartCompare,
+		"field_level_compare": task.FieldLevelCompare,
+		"enable_sqlite":       task.EnableSQLite,
+	})
+
+	// 阶段1：统计 Key 数量
+	if task.VerifyMode == "count_only" || task.VerifyMode == "sample" || task.VerifyMode == "full" {
+		sourceCount, targetCount := countClusterKeysWithDB(ctx, sourceClient, sourceIsCluster, targetClient, targetIsCluster, dbList)
+		task.Result.SourceKeyCount = sourceCount
+		task.Result.TargetKeyCount = targetCount
+		
+		taskLog.Info("Key count completed", map[string]interface{}{
+			"source_count": sourceCount,
+			"target_count": targetCount,
+		})
+		
+		if task.VerifyMode == "count_only" {
+			task.Result.Progress = 100
+			return
+		}
+	}
+
+	// 检查是否已取消
+	verifyTasksMu.RLock()
+	if task.Status == "cancelled" {
+		verifyTasksMu.RUnlock()
+		return
+	}
+	verifyTasksMu.RUnlock()
+
+	// 阶段2：采样获取 Key 列表（只在第1轮执行）
+	var keysToVerify []string
+	var scannedKeys int64
+	var mu sync.Mutex
+	startTime := time.Now()
+
+	// 构建 SCAN 匹配模式
+	scanPattern := "*"
+	if task.KeyFilter != nil && len(task.KeyFilter.Prefixes) > 0 {
+		scanPattern = task.KeyFilter.Prefixes[0] + "*"
+	}
+
+	// QPS 限流器
+	var rateLimiter <-chan time.Time
+	if task.QPS > 0 {
+		rateLimiter = time.Tick(time.Second / time.Duration(task.QPS))
+	}
+
+	// 根据部署模式选择扫描策略
+	if sourceIsCluster {
+		// 集群模式：遍历所有 Master 节点
+		clusterClient := sourceClient.(*redis.ClusterClient)
+		clusterClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+			scanKeysFromNode(ctx, node, task, scanPattern, &keysToVerify, &scannedKeys, &mu, startTime, rateLimiter)
+			return nil
+		})
+	} else {
+		// 非集群模式：支持多 DB
+		if len(dbList) > 0 {
+			// 扫描指定的 DB
+			for _, dbNum := range dbList {
+				// 检查是否已取消
+				verifyTasksMu.RLock()
+				if task.Status == "cancelled" {
+					verifyTasksMu.RUnlock()
+					break
+				}
+				verifyTasksMu.RUnlock()
+
+				// 切换 DB（只有非集群模式才需要）
+				if client, ok := sourceClient.(*redis.Client); ok {
+					if err := client.Do(ctx, "SELECT", dbNum).Err(); err != nil {
+						taskLog.Warn("Failed to select DB", map[string]interface{}{"db": dbNum, "error": err.Error()})
+						continue
+					}
+				}
+				
+				taskLog.Info("Scanning DB", map[string]interface{}{"db": dbNum})
+				scanKeysFromClient(ctx, sourceClient, task, scanPattern, &keysToVerify, &scannedKeys, &mu, startTime, rateLimiter)
+			}
+		} else {
+			// 默认扫描 DB 0
+			scanKeysFromClient(ctx, sourceClient, task, scanPattern, &keysToVerify, &scannedKeys, &mu, startTime, rateLimiter)
+		}
+	}
+
+	task.Result.ScannedKeys = scannedKeys
+	task.Result.SampledKeys = int64(len(keysToVerify))
+
+	taskLog.Info("Sampling completed", map[string]interface{}{
+		"scanned": scannedKeys,
+		"sampled": len(keysToVerify),
+	})
+
+	// ========== 阶段3：多轮迭代比对（核心逻辑）==========
+	// 借鉴 redis-full-check 的多轮收敛策略：
+	// - 第1轮全量比对，发现不一致 Key
+	// - 后续轮次只复查上轮的不一致 Key
+	// - 逐步收敛，最终确认真正不一致的数据
+	
+	var currentMismatchKeys []string = keysToVerify // 第1轮待检查的是全部采样 Key
+	var previousMismatchCount int64 = 0
+	
+	for round := 1; round <= compareRounds; round++ {
+		// 检查是否已取消
+		verifyTasksMu.RLock()
+		if task.Status == "cancelled" {
+			verifyTasksMu.RUnlock()
+			break
+		}
+		verifyTasksMu.RUnlock()
+		
+		roundStartTime := time.Now()
+		task.Result.CurrentRound = round
+		
+		taskLog.Info("Starting verification round", map[string]interface{}{
+			"round":          round,
+			"total_rounds":   compareRounds,
+			"keys_to_check":  len(currentMismatchKeys),
+		})
+		
+		// 非第1轮需要等待间隔，让增量同步有时间追上
+		if round > 1 && roundInterval > 0 {
+			taskLog.Info("Waiting for round interval", map[string]interface{}{
+				"interval_seconds": roundInterval,
+			})
+			time.Sleep(time.Duration(roundInterval) * time.Second)
+		}
+		
+		// 执行本轮比对
+		roundMismatches := verifyKeysForRound(ctx, task, sourceClient, targetClient, 
+			currentMismatchKeys, concurrency, compareMode, largeKeyThreshold, taskLog)
+		
+		roundEndTime := time.Now()
+		
+		// 计算收敛率
+		var convergeRate float64 = 0
+		if round > 1 && previousMismatchCount > 0 {
+			convergeRate = (1 - float64(len(roundMismatches))/float64(previousMismatchCount)) * 100
+		}
+		
+		// 记录本轮结果
+		roundResult := VerifyRoundResult{
+			RoundNo:       round,
+			StartTime:     roundStartTime.Format(time.RFC3339),
+			EndTime:       roundEndTime.Format(time.RFC3339),
+			KeysToCheck:   int64(len(currentMismatchKeys)),
+			MismatchCount: int64(len(roundMismatches)),
+			ConvergeRate:  convergeRate,
+		}
+		
+		// 保存不一致的 Key 列表（用于下轮复查）
+		if len(roundMismatches) > 0 {
+			roundResult.MismatchKeys = make([]string, 0, len(roundMismatches))
+			for key := range roundMismatches {
+				roundResult.MismatchKeys = append(roundResult.MismatchKeys, key)
+			}
+			// 限制详情数量（避免过大）
+			if len(roundResult.MismatchKeys) <= 100 {
+				roundResult.Details = make([]VerifyMismatchDetail, 0, len(roundMismatches))
+				for key, detail := range roundMismatches {
+					detail.Key = key
+					roundResult.Details = append(roundResult.Details, detail)
+				}
+			}
+			
+			// P1: 保存到 SQLite（如果启用）
+			if sqliteDB != nil {
+				for key, detail := range roundMismatches {
+					sqliteDB.SaveKeyDiff(round, key, "", detail.Type, 
+						detail.SourceValue, detail.TargetValue, detail.SourceTTL, detail.TargetTTL)
+				}
+				sqliteDB.SaveRoundSummary(round, int64(len(currentMismatchKeys)), 
+					int64(len(roundMismatches)), convergeRate, 
+					roundStartTime.Format(time.RFC3339), roundEndTime.Format(time.RFC3339))
+			}
+		}
+		
+		// P3: 记录轮次指标
+		metrics.AddRoundMetric(round, roundEndTime.Sub(roundStartTime), 
+			int64(len(currentMismatchKeys)), int64(len(roundMismatches)))
+		
+		task.Result.Rounds = append(task.Result.Rounds, roundResult)
+		
+		taskLog.Info("Verification round completed", map[string]interface{}{
+			"round":           round,
+			"keys_checked":    len(currentMismatchKeys),
+			"mismatch_found":  len(roundMismatches),
+			"converge_rate":   fmt.Sprintf("%.2f%%", convergeRate),
+			"duration":        roundEndTime.Sub(roundStartTime).String(),
+		})
+		
+		// 更新进度（多轮分配进度）
+		task.Result.Progress = 50 + float64(round)/float64(compareRounds)*40
+		
+		// 检查是否已完全收敛（没有不一致了）
+		if len(roundMismatches) == 0 {
+			taskLog.Info("All keys converged, no mismatch found", map[string]interface{}{
+				"round": round,
+			})
+			break
+		}
+		
+		// 准备下一轮待检查的 Key（只检查本轮不一致的）
+		previousMismatchCount = int64(len(roundMismatches))
+		currentMismatchKeys = roundResult.MismatchKeys
+	}
+	
+	// 设置最终不一致的 Key 列表
+	if len(task.Result.Rounds) > 0 {
+		lastRound := task.Result.Rounds[len(task.Result.Rounds)-1]
+		task.Result.FinalMismatchKeys = lastRound.MismatchKeys
+		task.Result.MissingKeys = lastRound.MismatchCount
+		task.Result.Details = lastRound.Details
+		
+		// 统计匹配的 Key 数
+		task.Result.MatchedKeys = task.Result.SampledKeys - lastRound.MismatchCount
+	}
+	
+	// ========== P1: Field 级别比对（对不一致的复合类型进行细粒度比对）==========
+	if task.FieldLevelCompare && len(task.Result.FinalMismatchKeys) > 0 {
+		taskLog.Info("Starting field-level comparison", map[string]interface{}{
+			"keys_to_check": len(task.Result.FinalMismatchKeys),
+		})
+		
+		fieldScanThreshold := task.FieldScanThreshold
+		if fieldScanThreshold <= 0 {
+			fieldScanThreshold = 5000
+		}
+		
+		var fieldMismatches []FieldMismatchDetail
+		for _, key := range task.Result.FinalMismatchKeys {
+			if len(fieldMismatches) >= 100 {
+				break
+			}
+			
+			// 获取 Key 类型
+			keyType, err := sourceClient.Type(ctx, key).Result()
+			if err != nil || keyType == "none" {
+				continue
+			}
+			
+			var detail *FieldMismatchDetail
+			var matched bool
+			
+			switch keyType {
+			case "hash":
+				matched, detail = compareHashFields(ctx, sourceClient, targetClient, key, fieldScanThreshold)
+			case "set":
+				matched, detail = compareSetMembers(ctx, sourceClient, targetClient, key, fieldScanThreshold)
+			case "zset":
+				matched, detail = compareZSetMembers(ctx, sourceClient, targetClient, key, fieldScanThreshold)
+			default:
+				continue
+			}
+			
+			if !matched && detail != nil {
+				fieldMismatches = append(fieldMismatches, *detail)
+				
+				// P1: 保存 Field 级别详情到 SQLite
+				if sqliteDB != nil {
+					for _, fd := range detail.MismatchFields {
+						sqliteDB.SaveFieldDiff(compareRounds, key, keyType, fd.Field, fd.Type,
+							fd.SourceValue, fd.TargetValue, fd.SourceScore, fd.TargetScore)
+					}
+				}
+			}
+		}
+		
+		task.Result.FieldMismatchKeys = int64(len(fieldMismatches))
+		task.Result.FieldMismatches = fieldMismatches
+		
+		taskLog.Info("Field-level comparison completed", map[string]interface{}{
+			"field_mismatch_keys": len(fieldMismatches),
+		})
+	}
+	
+	// ========== P2: 双向校验（检测目标端多余的 Key）==========
+	if task.Direction == "bidirectional" || task.Direction == "target_to_source" {
+		// 检查是否已取消
+		verifyTasksMu.RLock()
+		if task.Status == "cancelled" {
+			verifyTasksMu.RUnlock()
+		} else {
+			verifyTasksMu.RUnlock()
+			
+			task.Result.Progress = 95
+			extraKeys, extraCount := checkExtraKeysInTarget(ctx, task, sourceClient, targetClient, targetIsCluster, taskLog)
+			task.Result.TargetExtraKeys = extraCount
+			
+			if len(extraKeys) > 0 {
+				var extraDetails []VerifyMismatchDetail
+				for _, key := range extraKeys {
+					if len(extraDetails) >= 100 {
+						break
+					}
+					extraDetails = append(extraDetails, VerifyMismatchDetail{
+						Key:  key,
+						Type: "extra",
+					})
+				}
+				task.Result.ExtraKeyDetails = extraDetails
+			}
+		}
+	}
+	
+	task.Result.Progress = 100
+}
+
+// parseDBList 解析 DB 列表字符串（分号分隔）
+func parseDBList(dbListStr string) []int {
+	if dbListStr == "" {
+		return nil
+	}
+	
+	parts := strings.Split(dbListStr, ";")
+	var result []int
+	seen := make(map[int]bool)
+	
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		dbNum, err := strconv.Atoi(part)
+		if err != nil || dbNum < 0 || dbNum > 15 {
+			continue
+		}
+		if !seen[dbNum] {
+			seen[dbNum] = true
+			result = append(result, dbNum)
+		}
+	}
+	
+	sort.Ints(result)
+	return result
+}
+
+// scanKeysFromNode 从集群节点扫描 Key
+func scanKeysFromNode(ctx context.Context, node *redis.Client, task *VerifyTask, scanPattern string, 
+	keysToVerify *[]string, scannedKeys *int64, mu *sync.Mutex, startTime time.Time, rateLimiter <-chan time.Time) {
+	
+	var cursor uint64
+	for {
+		// 检查是否已取消
+		verifyTasksMu.RLock()
+		if task.Status == "cancelled" {
+			verifyTasksMu.RUnlock()
+			return
+		}
+		verifyTasksMu.RUnlock()
+
+		// QPS 限流
+		if rateLimiter != nil {
+			<-rateLimiter
+		}
+
+		keys, newCursor, err := node.Scan(ctx, cursor, scanPattern, 1000).Result()
+		if err != nil {
+			return
+		}
+
+		mu.Lock()
+		for _, key := range keys {
+			*scannedKeys++
+			// 根据采样率或全量模式决定是否采样
+			shouldSample := task.VerifyMode == "full" || rand.Float64() < task.SampleRate
+			if shouldSample && int64(len(*keysToVerify)) < task.MaxKeys {
+				// 检查 Key 过滤
+				if matchVerifyKeyFilter(key, task.KeyFilter) {
+					*keysToVerify = append(*keysToVerify, key)
+				}
+			}
+			
+			// 更新进度
+			if *scannedKeys%10000 == 0 {
+				task.Result.ScannedKeys = *scannedKeys
+				task.Result.SampledKeys = int64(len(*keysToVerify))
+				elapsed := time.Since(startTime).Seconds()
+				if elapsed > 0 {
+					task.Result.CurrentSpeed = int64(float64(*scannedKeys) / elapsed)
+				}
+				if task.Result.SourceKeyCount > 0 {
+					task.Result.Progress = float64(*scannedKeys) / float64(task.Result.SourceKeyCount) * 50
+				}
+			}
+		}
+		mu.Unlock()
+
+		cursor = newCursor
+		if cursor == 0 || int64(len(*keysToVerify)) >= task.MaxKeys {
+			break
+		}
+	}
+}
+
+// scanKeysFromClient 从客户端扫描 Key（非集群模式）
+func scanKeysFromClient(ctx context.Context, client redis.Cmdable, task *VerifyTask, scanPattern string,
+	keysToVerify *[]string, scannedKeys *int64, mu *sync.Mutex, startTime time.Time, rateLimiter <-chan time.Time) {
+	
+	var cursor uint64
+	for {
+		// 检查是否已取消
+		verifyTasksMu.RLock()
+		if task.Status == "cancelled" {
+			verifyTasksMu.RUnlock()
+			break
+		}
+		verifyTasksMu.RUnlock()
+
+		// QPS 限流
+		if rateLimiter != nil {
+			<-rateLimiter
+		}
+
+		keys, newCursor, err := client.Scan(ctx, cursor, scanPattern, 1000).Result()
+		if err != nil {
+			break
+		}
+
+		mu.Lock()
+		for _, key := range keys {
+			*scannedKeys++
+			shouldSample := task.VerifyMode == "full" || rand.Float64() < task.SampleRate
+			if shouldSample && int64(len(*keysToVerify)) < task.MaxKeys {
+				if matchVerifyKeyFilter(key, task.KeyFilter) {
+					*keysToVerify = append(*keysToVerify, key)
+				}
+			}
+			
+			// 更新进度
+			if *scannedKeys%10000 == 0 {
+				task.Result.ScannedKeys = *scannedKeys
+				task.Result.SampledKeys = int64(len(*keysToVerify))
+				elapsed := time.Since(startTime).Seconds()
+				if elapsed > 0 {
+					task.Result.CurrentSpeed = int64(float64(*scannedKeys) / elapsed)
+				}
+				if task.Result.SourceKeyCount > 0 {
+					task.Result.Progress = float64(*scannedKeys) / float64(task.Result.SourceKeyCount) * 50
+				}
+			}
+		}
+		mu.Unlock()
+
+		cursor = newCursor
+		if cursor == 0 || int64(len(*keysToVerify)) >= task.MaxKeys {
+			break
+		}
+	}
+}
+
+// verifyKeysForRound 单轮校验（用于多轮迭代收敛）
+// 返回不一致的 Key 及其详情
+func verifyKeysForRound(ctx context.Context, task *VerifyTask, 
+	sourceClient, targetClient redis.Cmdable,
+	keysToVerify []string, concurrency int, compareMode string, 
+	largeKeyThreshold int64, taskLog *logger.Logger) map[string]VerifyMismatchDetail {
+	
+	const batchSize = 100
+	mismatches := make(map[string]VerifyMismatchDetail)
+	var mismatchMu sync.Mutex
+	var wg sync.WaitGroup
+	
+	// 创建工作通道
+	workChan := make(chan []string, concurrency)
+	
+	// 启动工作协程
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batchKeys := range workChan {
+				// 检查是否已取消
+				verifyTasksMu.RLock()
+				if task.Status == "cancelled" {
+					verifyTasksMu.RUnlock()
+					continue
+				}
+				verifyTasksMu.RUnlock()
+
+				batchMismatches := verifyBatchForRound(ctx, task, sourceClient, targetClient, 
+					batchKeys, compareMode, largeKeyThreshold)
+				
+				if len(batchMismatches) > 0 {
+					mismatchMu.Lock()
+					for key, detail := range batchMismatches {
+						mismatches[key] = detail
+					}
+					mismatchMu.Unlock()
+				}
+			}
+		}()
+	}
+	
+	// 分批发送任务
+	for i := 0; i < len(keysToVerify); i += batchSize {
+		// 检查是否已取消
+		verifyTasksMu.RLock()
+		if task.Status == "cancelled" {
+			verifyTasksMu.RUnlock()
+			break
+		}
+		verifyTasksMu.RUnlock()
+
+		end := i + batchSize
+		if end > len(keysToVerify) {
+			end = len(keysToVerify)
+		}
+		
+		batchKeys := make([]string, end-i)
+		copy(batchKeys, keysToVerify[i:end])
+		workChan <- batchKeys
+	}
+	
+	close(workChan)
+	wg.Wait()
+	
+	return mismatches
+}
+
+// verifyBatchForRound 单批次校验（返回不一致的 Key 详情）
+func verifyBatchForRound(ctx context.Context, task *VerifyTask, 
+	sourceClient, targetClient redis.Cmdable,
+	batchKeys []string, compareMode string, largeKeyThreshold int64) map[string]VerifyMismatchDetail {
+	
+	mismatches := make(map[string]VerifyMismatchDetail)
+	
+	// Pipeline 获取源端数据
+	sourcePipe := sourceClient.Pipeline()
+	sourceTypeCmds := make([]*redis.StatusCmd, len(batchKeys))
+	sourceTTLCmds := make([]*redis.DurationCmd, len(batchKeys))
+	var sourceDumpCmds []*redis.StringCmd
+	var sourceStrLenCmds []*redis.IntCmd
+	
+	needDump := compareMode == "full_value"
+	needLen := compareMode == "length_only" || (compareMode == "full_value" && task.SkipLargeKey)
+	
+	if needDump {
+		sourceDumpCmds = make([]*redis.StringCmd, len(batchKeys))
+	}
+	if needLen {
+		sourceStrLenCmds = make([]*redis.IntCmd, len(batchKeys))
+	}
+
+	for j, key := range batchKeys {
+		sourceTypeCmds[j] = sourcePipe.Type(ctx, key)
+		sourceTTLCmds[j] = sourcePipe.TTL(ctx, key)
+		if needDump {
+			sourceDumpCmds[j] = sourcePipe.Dump(ctx, key)
+		}
+		if needLen {
+			sourceStrLenCmds[j] = sourcePipe.StrLen(ctx, key)
+		}
+	}
+	sourcePipe.Exec(ctx)
+
+	// Pipeline 获取目标端数据
+	targetPipe := targetClient.Pipeline()
+	targetExistsCmds := make([]*redis.IntCmd, len(batchKeys))
+	targetTTLCmds := make([]*redis.DurationCmd, len(batchKeys))
+	var targetDumpCmds []*redis.StringCmd
+	var targetStrLenCmds []*redis.IntCmd
+	
+	if needDump {
+		targetDumpCmds = make([]*redis.StringCmd, len(batchKeys))
+	}
+	if needLen {
+		targetStrLenCmds = make([]*redis.IntCmd, len(batchKeys))
+	}
+
+	for j, key := range batchKeys {
+		targetExistsCmds[j] = targetPipe.Exists(ctx, key)
+		targetTTLCmds[j] = targetPipe.TTL(ctx, key)
+		if needDump {
+			targetDumpCmds[j] = targetPipe.Dump(ctx, key)
+		}
+		if needLen {
+			targetStrLenCmds[j] = targetPipe.StrLen(ctx, key)
+		}
+	}
+	targetPipe.Exec(ctx)
+
+	// 比对结果
+	for j, key := range batchKeys {
+		sourceType, _ := sourceTypeCmds[j].Result()
+		sourceTTL, _ := sourceTTLCmds[j].Result()
+
+		targetExists, _ := targetExistsCmds[j].Result()
+		targetTTL, _ := targetTTLCmds[j].Result()
+
+		// 源端 Key 不存在（可能已被删除）- 视为已收敛/一致
+		if sourceType == "none" {
+			continue
+		}
+
+		// 目标端 Key 不存在 - 不一致
+		if targetExists == 0 {
+			mismatches[key] = VerifyMismatchDetail{
+				Type: "missing",
+			}
+			continue
+		}
+
+		// Key 存在，根据比较模式进行比较
+		switch compareMode {
+		case "exists_only":
+			// 只检查 Key 是否存在，已确认存在，视为一致
+			continue
+			
+		case "length_only":
+			// 只比较长度
+			if sourceStrLenCmds != nil && targetStrLenCmds != nil {
+				sourceLen, _ := sourceStrLenCmds[j].Result()
+				targetLen, _ := targetStrLenCmds[j].Result()
+				if sourceLen != targetLen {
+					mismatches[key] = VerifyMismatchDetail{
+						Type:        "length_mismatch",
+						SourceValue: fmt.Sprintf("%d bytes", sourceLen),
+						TargetValue: fmt.Sprintf("%d bytes", targetLen),
+					}
+				}
+			}
+			
+		case "full_value":
+			// 全量值比较
+			if sourceDumpCmds != nil && targetDumpCmds != nil {
+				sourceDump, sourceErr := sourceDumpCmds[j].Result()
+				targetDump, targetErr := targetDumpCmds[j].Result()
+				
+				// 检查是否跳过大 Key
+				if task.SkipLargeKey && len(sourceDump) > int(largeKeyThreshold) {
+					atomic.AddInt64(&task.Result.LargeKeySkipped, 1)
+					continue
+				}
+
+				if sourceErr == nil && targetErr == nil && sourceDump != targetDump {
+					mismatches[key] = VerifyMismatchDetail{
+						Type:        "value_mismatch",
+						SourceValue: fmt.Sprintf("[%s] %d bytes", sourceType, len(sourceDump)),
+						TargetValue: fmt.Sprintf("%d bytes", len(targetDump)),
+					}
+				}
+			}
+		}
+
+		// 如果已经发现不一致，不再检查 TTL
+		if _, exists := mismatches[key]; exists {
+			continue
+		}
+
+		// 比较 TTL
+		if task.CompareTTL {
+			ttlDiff := sourceTTL - targetTTL
+			if ttlDiff < 0 {
+				ttlDiff = -ttlDiff
+			}
+			if ttlDiff > time.Duration(task.TTLTolerance)*time.Second {
+				mismatches[key] = VerifyMismatchDetail{
+					Type:      "ttl_mismatch",
+					SourceTTL: int64(sourceTTL.Seconds()),
+					TargetTTL: int64(targetTTL.Seconds()),
+				}
+			}
+		}
+	}
+	
+	return mismatches
+}
+
+// ==================== P1: Field 级别比对实现 ====================
+
+// compareHashFields Hash 类型 Field 级别比对
+func compareHashFields(ctx context.Context, sourceClient, targetClient redis.Cmdable, 
+	key string, threshold int64) (matched bool, detail *FieldMismatchDetail) {
+	
+	// 获取源端和目标端 Hash 大小
+	sourceLen, err1 := sourceClient.HLen(ctx, key).Result()
+	targetLen, err2 := targetClient.HLen(ctx, key).Result()
+	
+	if err1 != nil || err2 != nil {
+		return false, nil
+	}
+	
+	detail = &FieldMismatchDetail{
+		Key:         key,
+		KeyType:     "hash",
+		TotalFields: sourceLen,
+	}
+	
+	// 长度不同，直接判定不一致
+	if sourceLen != targetLen {
+		detail.MismatchFields = append(detail.MismatchFields, FieldDiff{
+			Field: "_length_",
+			Type:  "length_mismatch",
+			SourceValue: fmt.Sprintf("%d", sourceLen),
+			TargetValue: fmt.Sprintf("%d", targetLen),
+		})
+		return false, detail
+	}
+	
+	// 根据大小选择获取方式
+	if sourceLen > threshold {
+		// 大 Hash 使用 HSCAN
+		return compareLargeHash(ctx, sourceClient, targetClient, key, detail)
+	}
+	
+	// 小 Hash 使用 HGETALL
+	sourceMap, err1 := sourceClient.HGetAll(ctx, key).Result()
+	targetMap, err2 := targetClient.HGetAll(ctx, key).Result()
+	
+	if err1 != nil || err2 != nil {
+		return false, nil
+	}
+	
+	var mismatches []FieldDiff
+	
+	// 检查源端 Field
+	for field, sourceValue := range sourceMap {
+		targetValue, exists := targetMap[field]
+		if !exists {
+			mismatches = append(mismatches, FieldDiff{
+				Field:       field,
+				Type:        "lack_target",
+				SourceValue: truncateValue(sourceValue, 100),
+			})
+		} else if sourceValue != targetValue {
+			mismatches = append(mismatches, FieldDiff{
+				Field:       field,
+				Type:        "value_mismatch",
+				SourceValue: truncateValue(sourceValue, 100),
+				TargetValue: truncateValue(targetValue, 100),
+			})
+		}
+	}
+	
+	// 检查目标端多余的 Field
+	for field, targetValue := range targetMap {
+		if _, exists := sourceMap[field]; !exists {
+			mismatches = append(mismatches, FieldDiff{
+				Field:       field,
+				Type:        "lack_source",
+				TargetValue: truncateValue(targetValue, 100),
+			})
+		}
+	}
+	
+	if len(mismatches) > 0 {
+		// 限制返回的 Field 数量
+		if len(mismatches) > 50 {
+			detail.MismatchFields = mismatches[:50]
+		} else {
+			detail.MismatchFields = mismatches
+		}
+		return false, detail
+	}
+	
+	return true, nil
+}
+
+// compareLargeHash 大 Hash 使用 HSCAN 比对
+func compareLargeHash(ctx context.Context, sourceClient, targetClient redis.Cmdable, 
+	key string, detail *FieldMismatchDetail) (matched bool, _ *FieldMismatchDetail) {
+	
+	var mismatches []FieldDiff
+	var cursor uint64
+	
+	for {
+		// 扫描源端
+		vals, newCursor, err := sourceClient.HScan(ctx, key, cursor, "*", 500).Result()
+		if err != nil {
+			break
+		}
+		
+		// vals 是 [field1, value1, field2, value2, ...]
+		for i := 0; i < len(vals); i += 2 {
+			if i+1 >= len(vals) {
+				break
+			}
+			field := vals[i]
+			sourceValue := vals[i+1]
+			
+			// 获取目标端对应 Field
+			targetValue, err := targetClient.HGet(ctx, key, field).Result()
+			if err == redis.Nil {
+				mismatches = append(mismatches, FieldDiff{
+					Field:       field,
+					Type:        "lack_target",
+					SourceValue: truncateValue(sourceValue, 100),
+				})
+			} else if err == nil && sourceValue != targetValue {
+				mismatches = append(mismatches, FieldDiff{
+					Field:       field,
+					Type:        "value_mismatch",
+					SourceValue: truncateValue(sourceValue, 100),
+					TargetValue: truncateValue(targetValue, 100),
+				})
+			}
+			
+			// 限制不一致数量
+			if len(mismatches) >= 100 {
+				break
+			}
+		}
+		
+		cursor = newCursor
+		if cursor == 0 || len(mismatches) >= 100 {
+			break
+		}
+	}
+	
+	if len(mismatches) > 0 {
+		detail.MismatchFields = mismatches
+		return false, detail
+	}
+	
+	return true, nil
+}
+
+// compareSetMembers Set 类型成员比对
+func compareSetMembers(ctx context.Context, sourceClient, targetClient redis.Cmdable,
+	key string, threshold int64) (matched bool, detail *FieldMismatchDetail) {
+	
+	sourceLen, err1 := sourceClient.SCard(ctx, key).Result()
+	targetLen, err2 := targetClient.SCard(ctx, key).Result()
+	
+	if err1 != nil || err2 != nil {
+		return false, nil
+	}
+	
+	detail = &FieldMismatchDetail{
+		Key:         key,
+		KeyType:     "set",
+		TotalFields: sourceLen,
+	}
+	
+	if sourceLen != targetLen {
+		detail.MismatchFields = append(detail.MismatchFields, FieldDiff{
+			Field: "_cardinality_",
+			Type:  "length_mismatch",
+			SourceValue: fmt.Sprintf("%d", sourceLen),
+			TargetValue: fmt.Sprintf("%d", targetLen),
+		})
+		return false, detail
+	}
+	
+	// 根据大小选择获取方式
+	if sourceLen > threshold {
+		return compareLargeSet(ctx, sourceClient, targetClient, key, detail)
+	}
+	
+	// 小 Set 使用 SMEMBERS
+	sourceMembers, _ := sourceClient.SMembers(ctx, key).Result()
+	
+	var mismatches []FieldDiff
+	for _, member := range sourceMembers {
+		exists, _ := targetClient.SIsMember(ctx, key, member).Result()
+		if !exists {
+			mismatches = append(mismatches, FieldDiff{
+				Field:       truncateValue(member, 50),
+				Type:        "lack_target",
+				SourceValue: member,
+			})
+		}
+		if len(mismatches) >= 50 {
+			break
+		}
+	}
+	
+	if len(mismatches) > 0 {
+		detail.MismatchFields = mismatches
+		return false, detail
+	}
+	
+	return true, nil
+}
+
+// compareLargeSet 大 Set 使用 SSCAN 比对
+func compareLargeSet(ctx context.Context, sourceClient, targetClient redis.Cmdable,
+	key string, detail *FieldMismatchDetail) (matched bool, _ *FieldMismatchDetail) {
+	
+	var mismatches []FieldDiff
+	var cursor uint64
+	
+	for {
+		members, newCursor, err := sourceClient.SScan(ctx, key, cursor, "*", 500).Result()
+		if err != nil {
+			break
+		}
+		
+		// 批量检查成员是否存在
+		pipe := targetClient.Pipeline()
+		cmds := make([]*redis.BoolCmd, len(members))
+		for i, member := range members {
+			cmds[i] = pipe.SIsMember(ctx, key, member)
+		}
+		pipe.Exec(ctx)
+		
+		for i, member := range members {
+			exists, _ := cmds[i].Result()
+			if !exists {
+				mismatches = append(mismatches, FieldDiff{
+					Field:       truncateValue(member, 50),
+					Type:        "lack_target",
+					SourceValue: member,
+				})
+			}
+			if len(mismatches) >= 100 {
+				break
+			}
+		}
+		
+		cursor = newCursor
+		if cursor == 0 || len(mismatches) >= 100 {
+			break
+		}
+	}
+	
+	if len(mismatches) > 0 {
+		detail.MismatchFields = mismatches
+		return false, detail
+	}
+	
+	return true, nil
+}
+
+// compareZSetMembers ZSet 类型成员及分数比对
+func compareZSetMembers(ctx context.Context, sourceClient, targetClient redis.Cmdable,
+	key string, threshold int64) (matched bool, detail *FieldMismatchDetail) {
+	
+	sourceLen, err1 := sourceClient.ZCard(ctx, key).Result()
+	targetLen, err2 := targetClient.ZCard(ctx, key).Result()
+	
+	if err1 != nil || err2 != nil {
+		return false, nil
+	}
+	
+	detail = &FieldMismatchDetail{
+		Key:         key,
+		KeyType:     "zset",
+		TotalFields: sourceLen,
+	}
+	
+	if sourceLen != targetLen {
+		detail.MismatchFields = append(detail.MismatchFields, FieldDiff{
+			Field: "_cardinality_",
+			Type:  "length_mismatch",
+			SourceValue: fmt.Sprintf("%d", sourceLen),
+			TargetValue: fmt.Sprintf("%d", targetLen),
+		})
+		return false, detail
+	}
+	
+	// 根据大小选择获取方式
+	if sourceLen > threshold {
+		return compareLargeZSet(ctx, sourceClient, targetClient, key, detail)
+	}
+	
+	// 小 ZSet 使用 ZRANGE WITHSCORES
+	sourceMembers, _ := sourceClient.ZRangeWithScores(ctx, key, 0, -1).Result()
+	
+	var mismatches []FieldDiff
+	for _, z := range sourceMembers {
+		member := fmt.Sprintf("%v", z.Member)
+		targetScore, err := targetClient.ZScore(ctx, key, member).Result()
+		
+		if err == redis.Nil {
+			mismatches = append(mismatches, FieldDiff{
+				Field:       truncateValue(member, 50),
+				Type:        "lack_target",
+				SourceScore: z.Score,
+			})
+		} else if err == nil && z.Score != targetScore {
+			mismatches = append(mismatches, FieldDiff{
+				Field:       truncateValue(member, 50),
+				Type:        "score_mismatch",
+				SourceScore: z.Score,
+				TargetScore: targetScore,
+			})
+		}
+		
+		if len(mismatches) >= 50 {
+			break
+		}
+	}
+	
+	if len(mismatches) > 0 {
+		detail.MismatchFields = mismatches
+		return false, detail
+	}
+	
+	return true, nil
+}
+
+// compareLargeZSet 大 ZSet 使用 ZSCAN 比对
+func compareLargeZSet(ctx context.Context, sourceClient, targetClient redis.Cmdable,
+	key string, detail *FieldMismatchDetail) (matched bool, _ *FieldMismatchDetail) {
+	
+	var mismatches []FieldDiff
+	var cursor uint64
+	
+	for {
+		vals, newCursor, err := sourceClient.ZScan(ctx, key, cursor, "*", 500).Result()
+		if err != nil {
+			break
+		}
+		
+		// vals 是 [member1, score1, member2, score2, ...]
+		for i := 0; i < len(vals); i += 2 {
+			if i+1 >= len(vals) {
+				break
+			}
+			member := vals[i]
+			sourceScore, _ := strconv.ParseFloat(vals[i+1], 64)
+			
+			targetScore, err := targetClient.ZScore(ctx, key, member).Result()
+			
+			if err == redis.Nil {
+				mismatches = append(mismatches, FieldDiff{
+					Field:       truncateValue(member, 50),
+					Type:        "lack_target",
+					SourceScore: sourceScore,
+				})
+			} else if err == nil && sourceScore != targetScore {
+				mismatches = append(mismatches, FieldDiff{
+					Field:       truncateValue(member, 50),
+					Type:        "score_mismatch",
+					SourceScore: sourceScore,
+					TargetScore: targetScore,
+				})
+			}
+			
+			if len(mismatches) >= 100 {
+				break
+			}
+		}
+		
+		cursor = newCursor
+		if cursor == 0 || len(mismatches) >= 100 {
+			break
+		}
+	}
+	
+	if len(mismatches) > 0 {
+		detail.MismatchFields = mismatches
+		return false, detail
+	}
+	
+	return true, nil
+}
+
+// truncateValue 截断值，避免存储过大
+func truncateValue(value string, maxLen int) string {
+	if len(value) <= maxLen {
+		return value
+	}
+	return value[:maxLen] + "...(truncated)"
+}
+
+// ==================== P2: 双向校验实现 ====================
+
+// checkExtraKeysInTarget 检测目标端多余的 Key
+func checkExtraKeysInTarget(ctx context.Context, task *VerifyTask, 
+	sourceClient, targetClient redis.Cmdable, targetIsCluster bool,
+	taskLog *logger.Logger) (extraKeys []string, extraCount int64) {
+	
+	taskLog.Info("Starting bidirectional check: scanning target for extra keys", nil)
+	
+	var mu sync.Mutex
+	scanPattern := "*"
+	if task.KeyFilter != nil && len(task.KeyFilter.Prefixes) > 0 {
+		scanPattern = task.KeyFilter.Prefixes[0] + "*"
+	}
+	
+	maxExtraKeys := int64(10000) // 最多记录 1 万个多余 Key
+	
+	scanTargetKeys := func(client redis.Cmdable) {
+		var cursor uint64
+		for {
+			keys, newCursor, err := client.Scan(ctx, cursor, scanPattern, 1000).Result()
+			if err != nil {
+				break
+			}
+			
+			// 批量检查这些 Key 在源端是否存在
+			if len(keys) > 0 {
+				pipe := sourceClient.Pipeline()
+				existsCmds := make([]*redis.IntCmd, len(keys))
+				for i, key := range keys {
+					existsCmds[i] = pipe.Exists(ctx, key)
+				}
+				pipe.Exec(ctx)
+				
+				mu.Lock()
+				for i, key := range keys {
+					exists, _ := existsCmds[i].Result()
+					if exists == 0 {
+						// 应用 Key 过滤
+						if matchVerifyKeyFilter(key, task.KeyFilter) {
+							extraCount++
+							if int64(len(extraKeys)) < maxExtraKeys {
+								extraKeys = append(extraKeys, key)
+							}
+						}
+					}
+				}
+				mu.Unlock()
+			}
+			
+			cursor = newCursor
+			if cursor == 0 {
+				break
+			}
+		}
+	}
+	
+	if targetIsCluster {
+		clusterClient := targetClient.(*redis.ClusterClient)
+		clusterClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+			scanTargetKeys(node)
+			return nil
+		})
+	} else {
+		scanTargetKeys(targetClient)
+	}
+	
+	taskLog.Info("Bidirectional check completed", map[string]interface{}{
+		"extra_keys_found": extraCount,
+		"extra_keys_sample": len(extraKeys),
+	})
+	
+	return extraKeys, extraCount
+}
+
+// ==================== P2: 智能比较模式实现 ====================
+
+// SmartCompareConfig 智能比较配置
+type SmartCompareConfig struct {
+	BigKeyThresholdBytes int64 // String 类型大 Key 阈值（字节）
+	BigKeyThresholdItems int64 // 复合类型大 Key 阈值（元素数）
+}
+
+// smartCompareKey 智能比较单个 Key（根据大小自动选择策略）
+func smartCompareKey(ctx context.Context, sourceClient, targetClient redis.Cmdable,
+	key string, config SmartCompareConfig) (matched bool, detail *VerifyMismatchDetail) {
+	
+	// 获取 Key 类型
+	keyType, err := sourceClient.Type(ctx, key).Result()
+	if err != nil || keyType == "none" {
+		return true, nil // 源端不存在，视为一致
+	}
+	
+	// 检查目标端是否存在
+	exists, _ := targetClient.Exists(ctx, key).Result()
+	if exists == 0 {
+		return false, &VerifyMismatchDetail{
+			Key:  key,
+			Type: "missing",
+		}
+	}
+	
+	// 获取 Key 大小
+	var keySize int64
+	switch keyType {
+	case "string":
+		keySize, _ = sourceClient.StrLen(ctx, key).Result()
+		if keySize > config.BigKeyThresholdBytes {
+			// 大 String：只比较长度
+			targetSize, _ := targetClient.StrLen(ctx, key).Result()
+			if keySize != targetSize {
+				return false, &VerifyMismatchDetail{
+					Key:         key,
+					Type:        "length_mismatch",
+					SourceValue: fmt.Sprintf("%d bytes", keySize),
+					TargetValue: fmt.Sprintf("%d bytes", targetSize),
+				}
+			}
+			return true, nil
+		}
+		
+	case "hash":
+		keySize, _ = sourceClient.HLen(ctx, key).Result()
+	case "list":
+		keySize, _ = sourceClient.LLen(ctx, key).Result()
+	case "set":
+		keySize, _ = sourceClient.SCard(ctx, key).Result()
+	case "zset":
+		keySize, _ = sourceClient.ZCard(ctx, key).Result()
+	}
+	
+	// 判断是否为大 Key（非 String 类型按元素数）
+	isLargeKey := false
+	if keyType != "string" && keySize > config.BigKeyThresholdItems {
+		isLargeKey = true
+	}
+	
+	if isLargeKey {
+		// 大 Key：只比较长度/元素数
+		var targetSize int64
+		switch keyType {
+		case "hash":
+			targetSize, _ = targetClient.HLen(ctx, key).Result()
+		case "list":
+			targetSize, _ = targetClient.LLen(ctx, key).Result()
+		case "set":
+			targetSize, _ = targetClient.SCard(ctx, key).Result()
+		case "zset":
+			targetSize, _ = targetClient.ZCard(ctx, key).Result()
+		}
+		
+		if keySize != targetSize {
+			return false, &VerifyMismatchDetail{
+				Key:         key,
+				Type:        "length_mismatch",
+				SourceValue: fmt.Sprintf("[%s] %d elements", keyType, keySize),
+				TargetValue: fmt.Sprintf("%d elements", targetSize),
+			}
+		}
+		return true, nil
+	}
+	
+	// 正常 Key：全量比较（使用 DUMP）
+	sourceDump, err1 := sourceClient.Dump(ctx, key).Result()
+	targetDump, err2 := targetClient.Dump(ctx, key).Result()
+	
+	if err1 == nil && err2 == nil && sourceDump != targetDump {
+		return false, &VerifyMismatchDetail{
+			Key:         key,
+			Type:        "value_mismatch",
+			SourceValue: fmt.Sprintf("[%s] %d bytes", keyType, len(sourceDump)),
+			TargetValue: fmt.Sprintf("%d bytes", len(targetDump)),
+		}
+	}
+	
+	return true, nil
+}
+
+// ==================== P3: 指标监控实现 ====================
+
+// NewVerifyMetrics 创建校验指标
+func NewVerifyMetrics() *VerifyMetrics {
+	return &VerifyMetrics{
+		StartTime:        time.Now().Format(time.RFC3339),
+		TypeDistribution: make(map[string]int64),
+	}
+}
+
+// RecordKeyType 记录 Key 类型
+func (m *VerifyMetrics) RecordKeyType(keyType string) {
+	if m.TypeDistribution == nil {
+		m.TypeDistribution = make(map[string]int64)
+	}
+	m.TypeDistribution[keyType]++
+}
+
+// RecordRedisCommand 记录 Redis 命令
+func (m *VerifyMetrics) RecordRedisCommand(count int64) {
+	atomic.AddInt64(&m.RedisCommands, count)
+}
+
+// RecordPipelineBatch 记录 Pipeline 批次
+func (m *VerifyMetrics) RecordPipelineBatch() {
+	atomic.AddInt64(&m.PipelineBatches, 1)
+	atomic.AddInt64(&m.NetworkRoundTrips, 1)
+}
+
+// Finalize 完成并计算最终指标
+func (m *VerifyMetrics) Finalize(totalKeys int64) {
+	m.EndTime = time.Now().Format(time.RFC3339)
+	
+	startTime, _ := time.Parse(time.RFC3339, m.StartTime)
+	endTime, _ := time.Parse(time.RFC3339, m.EndTime)
+	duration := endTime.Sub(startTime)
+	m.Duration = duration.String()
+	
+	if duration.Seconds() > 0 {
+		m.KeysPerSecond = float64(totalKeys) / duration.Seconds()
+	}
+	
+	// 获取内存使用
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	m.PeakMemoryMB = float64(memStats.Alloc) / 1024 / 1024
+}
+
+// AddRoundMetric 添加轮次指标
+func (m *VerifyMetrics) AddRoundMetric(roundNo int, duration time.Duration, keysChecked, mismatchCount int64) {
+	var mismatchRate float64
+	if keysChecked > 0 {
+		mismatchRate = float64(mismatchCount) / float64(keysChecked) * 100
+	}
+	
+	m.RoundMetrics = append(m.RoundMetrics, RoundMetric{
+		RoundNo:       roundNo,
+		Duration:      duration.String(),
+		KeysPerSecond: float64(keysChecked) / duration.Seconds(),
+		MismatchRate:  mismatchRate,
+	})
+}
+
+// LogProgress 输出进度日志
+func (m *VerifyMetrics) LogProgress(taskID string, processed, total int64) {
+	progress := float64(processed) / float64(total) * 100
+	logger.Info("Verify progress", map[string]interface{}{
+		"task_id":        taskID,
+		"processed":      processed,
+		"total":          total,
+		"progress":       fmt.Sprintf("%.2f%%", progress),
+		"keys_per_sec":   m.KeysPerSecond,
+		"redis_commands": m.RedisCommands,
+		"elapsed":        time.Since(time.Now()).String(),
+	})
+}
+
+// verifyKeysWithConcurrency 并发校验 Key
+func verifyKeysWithConcurrency(ctx context.Context, task *VerifyTask, sourceClient, targetClient redis.Cmdable,
+	sourceIsCluster, targetIsCluster bool, keysToVerify []string, concurrency int, compareMode string, 
+	largeKeyThreshold int64, dbList []int, taskLog *logger.Logger) {
+	
+	const batchSize = 100
+	var mismatches []VerifyMismatchDetail
+	var mismatchMu sync.Mutex
+	var wg sync.WaitGroup
+	
+	// 创建工作通道
+	workChan := make(chan []string, concurrency)
+	
+	// 启动工作协程
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batchKeys := range workChan {
+				// 检查是否已取消
+				verifyTasksMu.RLock()
+				if task.Status == "cancelled" {
+					verifyTasksMu.RUnlock()
+					continue
+				}
+				verifyTasksMu.RUnlock()
+
+				verifyBatch(ctx, task, sourceClient, targetClient, batchKeys, compareMode, 
+					largeKeyThreshold, &mismatches, &mismatchMu)
+			}
+		}()
+	}
+	
+	// 分批发送任务
+	totalBatches := (len(keysToVerify) + batchSize - 1) / batchSize
+	processedBatches := 0
+	
+	for i := 0; i < len(keysToVerify); i += batchSize {
+		// 检查是否已取消
+		verifyTasksMu.RLock()
+		if task.Status == "cancelled" {
+			verifyTasksMu.RUnlock()
+			break
+		}
+		verifyTasksMu.RUnlock()
+
+		end := i + batchSize
+		if end > len(keysToVerify) {
+			end = len(keysToVerify)
+		}
+		
+		batchKeys := make([]string, end-i)
+		copy(batchKeys, keysToVerify[i:end])
+		workChan <- batchKeys
+		
+		processedBatches++
+		// 更新进度
+		task.Result.Progress = 50 + float64(processedBatches)/float64(totalBatches)*50
+	}
+	
+	close(workChan)
+	wg.Wait()
+	
+	task.Result.Details = mismatches
+}
+
+// verifyBatch 批量校验
+func verifyBatch(ctx context.Context, task *VerifyTask, sourceClient, targetClient redis.Cmdable,
+	batchKeys []string, compareMode string, largeKeyThreshold int64, 
+	mismatches *[]VerifyMismatchDetail, mismatchMu *sync.Mutex) {
+	
+	// Pipeline 获取源端数据
+	sourcePipe := sourceClient.Pipeline()
+	sourceTypeCmds := make([]*redis.StatusCmd, len(batchKeys))
+	sourceTTLCmds := make([]*redis.DurationCmd, len(batchKeys))
+	var sourceDumpCmds []*redis.StringCmd
+	var sourceStrLenCmds []*redis.IntCmd
+	
+	needDump := compareMode == "full_value"
+	needLen := compareMode == "length_only" || (compareMode == "full_value" && task.SkipLargeKey)
+	
+	if needDump {
+		sourceDumpCmds = make([]*redis.StringCmd, len(batchKeys))
+	}
+	if needLen {
+		sourceStrLenCmds = make([]*redis.IntCmd, len(batchKeys))
+	}
+
+	for j, key := range batchKeys {
+		sourceTypeCmds[j] = sourcePipe.Type(ctx, key)
+		sourceTTLCmds[j] = sourcePipe.TTL(ctx, key)
+		if needDump {
+			sourceDumpCmds[j] = sourcePipe.Dump(ctx, key)
+		}
+		if needLen {
+			sourceStrLenCmds[j] = sourcePipe.StrLen(ctx, key)
+		}
+	}
+	sourcePipe.Exec(ctx)
+
+	// Pipeline 获取目标端数据
+	targetPipe := targetClient.Pipeline()
+	targetExistsCmds := make([]*redis.IntCmd, len(batchKeys))
+	targetTTLCmds := make([]*redis.DurationCmd, len(batchKeys))
+	var targetDumpCmds []*redis.StringCmd
+	var targetStrLenCmds []*redis.IntCmd
+	
+	if needDump {
+		targetDumpCmds = make([]*redis.StringCmd, len(batchKeys))
+	}
+	if needLen {
+		targetStrLenCmds = make([]*redis.IntCmd, len(batchKeys))
+	}
+
+	for j, key := range batchKeys {
+		targetExistsCmds[j] = targetPipe.Exists(ctx, key)
+		targetTTLCmds[j] = targetPipe.TTL(ctx, key)
+		if needDump {
+			targetDumpCmds[j] = targetPipe.Dump(ctx, key)
+		}
+		if needLen {
+			targetStrLenCmds[j] = targetPipe.StrLen(ctx, key)
+		}
+	}
+	targetPipe.Exec(ctx)
+
+	// 比对结果
+	for j, key := range batchKeys {
+		sourceType, _ := sourceTypeCmds[j].Result()
+		sourceTTL, _ := sourceTTLCmds[j].Result()
+
+		targetExists, _ := targetExistsCmds[j].Result()
+		targetTTL, _ := targetTTLCmds[j].Result()
+
+		// 源端 Key 不存在（可能已被删除）
+		if sourceType == "none" {
+			continue
+		}
+
+		// 目标端 Key 不存在
+		if targetExists == 0 {
+			atomic.AddInt64(&task.Result.MissingKeys, 1)
+			mismatchMu.Lock()
+			if len(*mismatches) < 100 {
+				*mismatches = append(*mismatches, VerifyMismatchDetail{
+					Key:  key,
+					Type: "missing",
+				})
+			}
+			mismatchMu.Unlock()
+			continue
+		}
+
+		// Key 存在，根据比较模式进行比较
+		matched := true
+
+		switch compareMode {
+		case "exists_only":
+			// 只检查 Key 是否存在，已确认存在
+			matched = true
+			
+		case "length_only":
+			// 只比较长度
+			if sourceStrLenCmds != nil && targetStrLenCmds != nil {
+				sourceLen, _ := sourceStrLenCmds[j].Result()
+				targetLen, _ := targetStrLenCmds[j].Result()
+				if sourceLen != targetLen {
+					atomic.AddInt64(&task.Result.LengthMismatch, 1)
+					matched = false
+					mismatchMu.Lock()
+					if len(*mismatches) < 100 {
+						*mismatches = append(*mismatches, VerifyMismatchDetail{
+							Key:         key,
+							Type:        "length_mismatch",
+							SourceValue: fmt.Sprintf("%d bytes", sourceLen),
+							TargetValue: fmt.Sprintf("%d bytes", targetLen),
+						})
+					}
+					mismatchMu.Unlock()
+				}
+			}
+			
+		case "full_value":
+			// 全量值比较
+			if sourceDumpCmds != nil && targetDumpCmds != nil {
+				sourceDump, sourceErr := sourceDumpCmds[j].Result()
+				targetDump, targetErr := targetDumpCmds[j].Result()
+				
+				// 检查是否跳过大 Key
+				if task.SkipLargeKey && len(sourceDump) > int(largeKeyThreshold) {
+					atomic.AddInt64(&task.Result.LargeKeySkipped, 1)
+					continue
+				}
+
+				if sourceErr == nil && targetErr == nil && sourceDump != targetDump {
+					atomic.AddInt64(&task.Result.ValueMismatch, 1)
+					matched = false
+					mismatchMu.Lock()
+					if len(*mismatches) < 100 {
+						*mismatches = append(*mismatches, VerifyMismatchDetail{
+							Key:         key,
+							Type:        "value_mismatch",
+							SourceValue: fmt.Sprintf("[%s] %d bytes", sourceType, len(sourceDump)),
+							TargetValue: fmt.Sprintf("%d bytes", len(targetDump)),
+						})
+					}
+					mismatchMu.Unlock()
+				}
+			}
+		}
+
+		// 比较 TTL
+		if task.CompareTTL && matched {
+			ttlDiff := sourceTTL - targetTTL
+			if ttlDiff < 0 {
+				ttlDiff = -ttlDiff
+			}
+			if ttlDiff > time.Duration(task.TTLTolerance)*time.Second {
+				atomic.AddInt64(&task.Result.TTLMismatch, 1)
+				matched = false
+				mismatchMu.Lock()
+				if len(*mismatches) < 100 {
+					*mismatches = append(*mismatches, VerifyMismatchDetail{
+						Key:       key,
+						Type:      "ttl_mismatch",
+						SourceTTL: int64(sourceTTL.Seconds()),
+						TargetTTL: int64(targetTTL.Seconds()),
+					})
+				}
+				mismatchMu.Unlock()
+			}
+		}
+
+		if matched {
+			atomic.AddInt64(&task.Result.MatchedKeys, 1)
+		}
+	}
+}
+
+// countClusterKeysWithDB 统计集群 Key 数量（支持多 DB）
+func countClusterKeysWithDB(ctx context.Context, sourceClient redis.Cmdable, sourceIsCluster bool, 
+	targetClient redis.Cmdable, targetIsCluster bool, dbList []int) (int64, int64) {
+	
+	var sourceCount, targetCount int64
+
+	// 统计源端
+	if sourceIsCluster {
+		clusterClient := sourceClient.(*redis.ClusterClient)
+		clusterClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+			count, err := node.DBSize(ctx).Result()
+			if err == nil {
+				sourceCount += count
+			}
+			return nil
+		})
+	} else {
+		if len(dbList) > 0 {
+			// 统计指定 DB（需要类型断言）
+			if client, ok := sourceClient.(*redis.Client); ok {
+				for _, dbNum := range dbList {
+					if err := client.Do(ctx, "SELECT", dbNum).Err(); err == nil {
+						count, err := client.DBSize(ctx).Result()
+						if err == nil {
+							sourceCount += count
+						}
+					}
+				}
+			}
+		} else {
+			count, err := sourceClient.DBSize(ctx).Result()
+			if err == nil {
+				sourceCount = count
+			}
+		}
+	}
+
+	// 统计目标端
+	if targetIsCluster {
+		clusterClient := targetClient.(*redis.ClusterClient)
+		clusterClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+			count, err := node.DBSize(ctx).Result()
+			if err == nil {
+				targetCount += count
+			}
+			return nil
+		})
+	} else {
+		if len(dbList) > 0 {
+			// 统计指定 DB（需要类型断言）
+			if client, ok := targetClient.(*redis.Client); ok {
+				for _, dbNum := range dbList {
+					if err := client.Do(ctx, "SELECT", dbNum).Err(); err == nil {
+						count, err := client.DBSize(ctx).Result()
+						if err == nil {
+							targetCount += count
+						}
+					}
+				}
+			}
+		} else {
+			count, err := targetClient.DBSize(ctx).Result()
+			if err == nil {
+				targetCount = count
+			}
+		}
+	}
+
+	return sourceCount, targetCount
+}
+
+// matchVerifyKeyFilter 检查 Key 是否匹配过滤器
+func matchVerifyKeyFilter(key string, filter *KeyFilterConfig) bool {
+	if filter == nil {
+		return true
+	}
+
+	// 检查排除前缀
+	for _, prefix := range filter.ExcludePrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return false
+		}
+	}
+
+	// 检查包含前缀（如果指定了）
+	if len(filter.Prefixes) > 0 {
+		matched := false
+		for _, prefix := range filter.Prefixes {
+			if strings.HasPrefix(key, prefix) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	// TODO: 支持正则匹配
+	return true
+}
+
+// countClusterKeys 统计集群 Key 数量
+func countClusterKeys(ctx context.Context, sourceClient redis.Cmdable, sourceIsCluster bool, targetClient redis.Cmdable) (int64, int64) {
+	var sourceCount, targetCount int64
+
+	// 统计源端
+	if sourceIsCluster {
+		clusterClient := sourceClient.(*redis.ClusterClient)
+		clusterClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+			count, err := node.DBSize(ctx).Result()
+			if err == nil {
+				sourceCount += count
+			}
+			return nil
+		})
+	} else {
+		count, err := sourceClient.DBSize(ctx).Result()
+		if err == nil {
+			sourceCount = count
+		}
+	}
+
+	// 统计目标端
+	if clusterClient, ok := targetClient.(*redis.ClusterClient); ok {
+		clusterClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+			count, err := node.DBSize(ctx).Result()
+			if err == nil {
+				targetCount += count
+			}
+			return nil
+		})
+	} else {
+		count, err := targetClient.DBSize(ctx).Result()
+		if err == nil {
+			targetCount = count
+		}
+	}
+
+	return sourceCount, targetCount
 }

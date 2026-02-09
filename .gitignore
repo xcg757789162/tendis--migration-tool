@@ -4,7 +4,18 @@
 
 # 编译产物
 tendis-migrate
+tendis-migrate-test
+tendis-migrate-darwin
+tendis-migrate-darwin-test
+tendis-migrate-linux
+tendis-migrate-master
+tendis-migrate-new
+tendis-migrate-worker
 tendis-migrate-package/
+simple
+simple-server
+simple-server-linux
+server
 
 # 日志和数据
 logs/
@@ -27,3 +38,6 @@ web/node_modules/
 *.dll
 *.so
 *.dylib
+
+# Test files
+snake-game/

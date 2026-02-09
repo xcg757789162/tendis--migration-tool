@@ -30,6 +30,12 @@ const routes = [
     meta: { title: '创建任务' }
   },
   {
+    path: '/verify',
+    name: 'VerifyTasks',
+    component: () => import('@/views/VerifyTasks.vue'),
+    meta: { title: '数据校验' }
+  },
+  {
     path: '/logs',
     name: 'Logs',
     component: () => import('@/views/Logs.vue'),

@@ -356,12 +356,132 @@ func (p *BinlogParser) decodeEntries(data []byte) ([]ReplLogValueEntryV2, error)
 		entries = append(entries, ReplLogValueEntryV2{
 			Op:        op,
 			Timestamp: timestamp,
-			Key:       string(keyBytes),
+			Key:       extractRedisKey(string(keyBytes)), // 从 RocksDB 格式中提取真正的 Redis Key
 			Value:     valueBytes,
 		})
 	}
 
 	return entries, nil
+}
+
+// extractRedisKey 从 RocksDB RecordKey 格式中提取真正的 Redis Key
+// 
+// Tendis RocksDB RecordKey 格式（参考 src/tendisplus/storage/record.h）：
+//   chunkId(4字节,BE) + type(1字节) + dbId(4字节,BE) + primaryKey(varint长度前缀) + [secondaryKey]
+//
+// 策略：
+//   1. 如果整个字符串都是可打印字符，认为是纯文本 Key，直接返回
+//   2. 尝试按 RocksDB RecordKey 格式解析（跳过 9 字节头部，读取 varint 长度前缀的 primaryKey）
+//   3. 如果解析失败，降级为查找最长可打印字符序列
+func extractRedisKey(recordKey string) string {
+	if len(recordKey) == 0 {
+		return ""
+	}
+	
+	// 策略1：如果整个字符串都是可打印字符，直接返回
+	if isValidRedisKey(recordKey) {
+		return recordKey
+	}
+	
+	data := []byte(recordKey)
+	
+	// 策略2：尝试按 RocksDB RecordKey 格式解析
+	// 头部固定 9 字节：chunkId(4) + type(1) + dbId(4)
+	const recordKeyHeaderSize = 9
+	if len(data) > recordKeyHeaderSize {
+		// 跳过头部，尝试读取 varint 长度前缀的 primaryKey
+		offset := recordKeyHeaderSize
+		
+		// 读取 primaryKey 长度（varint 编码）
+		pkLen, lenBytes, err := varintDecode(data[offset:])
+		if err == nil && lenBytes > 0 && pkLen > 0 && pkLen < 10000 {
+			offset += lenBytes
+			
+			// 检查是否有足够的数据
+			if offset+int(pkLen) <= len(data) {
+				primaryKey := string(data[offset : offset+int(pkLen)])
+				
+				// 验证提取的 primaryKey 是否是有效的 Redis Key
+				if isValidRedisKey(primaryKey) {
+					return primaryKey
+				}
+			}
+		}
+	}
+	
+	// 策略3：降级方案 - 查找最长的连续可打印字符序列
+	var bestStart, bestEnd int
+	var currentStart int
+	inPrintable := false
+	
+	for i := 0; i <= len(data); i++ {
+		var isPrintable bool
+		if i < len(data) {
+			// 允许 ASCII 32-126 的字符（可打印字符包括空格和标点符号）
+			isPrintable = data[i] >= 32 && data[i] <= 126
+		}
+		
+		if isPrintable && !inPrintable {
+			// 开始新的可打印序列
+			currentStart = i
+			inPrintable = true
+		} else if !isPrintable && inPrintable {
+			// 结束当前可打印序列
+			if i-currentStart > bestEnd-bestStart {
+				bestStart = currentStart
+				bestEnd = i
+			}
+			inPrintable = false
+		}
+	}
+	
+	// 如果找到了足够长的可打印序列（至少 2 个字符）
+	if bestEnd-bestStart >= 2 {
+		extracted := string(data[bestStart:bestEnd])
+		// 验证提取的字符串看起来像一个 Redis Key
+		if looksLikeRedisKey(extracted) {
+			return extracted
+		}
+	}
+	
+	// 策略4：最后降级方案 - 返回原始字符串（让上层过滤逻辑处理）
+	return recordKey
+}
+
+// isValidRedisKey 检查整个字符串是否是有效的 Redis Key
+// 有效的 Key 应该完全由可打印字符组成
+func isValidRedisKey(key string) bool {
+	if len(key) == 0 || len(key) > 1024 {
+		return false
+	}
+	
+	for _, c := range key {
+		if c < 32 || c > 126 {
+			return false
+		}
+	}
+	
+	return true
+}
+
+// looksLikeRedisKey 检查字符串是否看起来像一个 Redis Key
+// Redis Key 通常包含字母、数字、冒号、下划线等
+func looksLikeRedisKey(s string) bool {
+	if len(s) < 1 {
+		return false
+	}
+	
+	// 统计"合理"字符的数量
+	goodChars := 0
+	for _, c := range s {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || 
+		   (c >= '0' && c <= '9') || c == ':' || c == '_' || c == '-' || c == '.' || c == '/' {
+			goodChars++
+		}
+	}
+	
+	// 至少 40% 是"合理"字符（降低门槛以支持更多 Key 格式）
+	return float64(goodChars)/float64(len(s)) >= 0.4
 }
 
 // GetOpStr 获取操作类型的字符串表示

@@ -1003,7 +1003,8 @@ func (r *TaskRunner) shouldMigrateKey(key string) bool {
 			}
 		}
 		return false
-	case model.KeyFilterModeKeys:
+	case model.KeyFilterModeKeys, model.KeyFilterModeKeylist:
+		// 支持 keys 和 keylist 两种模式名称（前端使用 keylist）
 		for _, k := range filter.Keys {
 			if key == k {
 				return true
@@ -1456,32 +1457,56 @@ type SlotMigrator struct {
 	
 	conflictHandler *ConflictHandler
 	rateLimiter     *limiter.RateLimiter // 限流器引用
+	
+	// 断点保存相关
+	lastCheckpointTime time.Time
+	keysInBatch        int64
 }
 
 // NewSlotMigrator 创建Slot迁移器
 func NewSlotMigrator(runner *TaskRunner, worker *EmbeddedWorker) *SlotMigrator {
 	return &SlotMigrator{
-		runner:          runner,
-		worker:          worker,
-		conflictHandler: NewConflictHandler(runner.options.ConflictPolicy, runner.targetClient, runner.task.ID),
-		rateLimiter:     runner.GetRateLimiter(),
+		runner:             runner,
+		worker:             worker,
+		conflictHandler:    NewConflictHandler(runner.options.ConflictPolicy, runner.targetClient, runner.task.ID),
+		rateLimiter:        runner.GetRateLimiter(),
+		lastCheckpointTime: time.Now(),
+		keysInBatch:        0,
 	}
 }
 
-// MigrateSlot 迁移单个Slot
+// MigrateSlot 迁移单个Slot（支持断点恢复）
 func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 	source := m.runner.sourceClient
 	target := m.runner.targetClient
 
+	// 尝试从断点恢复
 	var cursor uint64
+	var keysMigrated int64
+	
+	checkpoint, err := m.runner.master.store.GetSlotCheckpoint(m.runner.task.ID, slot)
+	if err == nil && checkpoint != "" && checkpoint != "0" {
+		// 解析 cursor
+		fmt.Sscanf(checkpoint, "%d", &cursor)
+		log.Printf("Slot %d: Resuming from checkpoint cursor=%d", slot, cursor)
+	}
+	
 	batchSize := int64(m.runner.options.ScanBatchSize)
 	if batchSize <= 0 {
 		batchSize = 1000
 	}
 
+	// 断点保存配置
+	const checkpointKeyInterval = 10000       // 每 10000 个 key 保存一次
+	const checkpointTimeInterval = 30 * time.Second // 每 30 秒保存一次
+	m.lastCheckpointTime = time.Now()
+	m.keysInBatch = 0
+
 	for {
 		select {
 		case <-ctx.Done():
+			// 被中断时保存当前断点
+			m.saveSlotCheckpoint(slot, cursor, keysMigrated)
 			return ctx.Err()
 		default:
 		}
@@ -1496,16 +1521,47 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 		if len(keys) > 0 {
 			if err := m.migrateKeys(ctx, source, target, keys); err != nil {
 				log.Printf("Migrate keys failed: %v", err)
+			} else {
+				keysMigrated += int64(len(keys))
+				m.keysInBatch += int64(len(keys))
 			}
 		}
 
 		cursor = nextCursor
+		
+		// 定期保存断点（每 10000 个 key 或 30 秒）
+		if m.keysInBatch >= checkpointKeyInterval || time.Since(m.lastCheckpointTime) >= checkpointTimeInterval {
+			m.saveSlotCheckpoint(slot, cursor, keysMigrated)
+			m.keysInBatch = 0
+			m.lastCheckpointTime = time.Now()
+		}
+		
 		if cursor == 0 {
 			break
 		}
 	}
 
+	// Slot 完成，标记完成状态
+	log.Printf("Slot %d: Migration completed, keys=%d", slot, keysMigrated)
 	return nil
+}
+
+// saveSlotCheckpoint 保存 Slot 断点
+func (m *SlotMigrator) saveSlotCheckpoint(slot int, cursor uint64, keysMigrated int64) {
+	cursorStr := fmt.Sprintf("%d", cursor)
+	checkpoint := &model.Checkpoint{
+		TaskID:       m.runner.task.ID,
+		WorkerID:     m.worker.id,
+		SlotID:       slot,
+		Cursor:       cursorStr,
+		KeysMigrated: keysMigrated,
+		UpdatedAt:    time.Now().Unix(),
+	}
+	if err := m.runner.master.store.SaveCheckpoint(checkpoint); err != nil {
+		log.Printf("Slot %d: Save checkpoint failed: %v", slot, err)
+	} else {
+		log.Printf("Slot %d: Checkpoint saved, cursor=%d, keys=%d", slot, cursor, keysMigrated)
+	}
 }
 
 // scanSlot 扫描Slot中的Key
@@ -1644,7 +1700,8 @@ func (m *SlotMigrator) shouldMigrateKey(key string, filter *model.KeyFilterConfi
 			}
 		}
 		return false
-	case model.KeyFilterModeKeys:
+	case model.KeyFilterModeKeys, model.KeyFilterModeKeylist:
+		// 支持 keys 和 keylist 两种模式名称（前端使用 keylist）
 		for _, k := range filter.Keys {
 			if key == k {
 				return true

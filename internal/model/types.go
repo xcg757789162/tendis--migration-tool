@@ -54,7 +54,8 @@ const (
 	KeyFilterModeAll     KeyFilterMode = "all"
 	KeyFilterModePrefix  KeyFilterMode = "prefix"
 	KeyFilterModePattern KeyFilterMode = "pattern"
-	KeyFilterModeKeys    KeyFilterMode = "keys"
+	KeyFilterModeKeys    KeyFilterMode = "keys"    // 后端使用
+	KeyFilterModeKeylist KeyFilterMode = "keylist" // 前端使用（兼容）
 )
 
 // Task 迁移任务

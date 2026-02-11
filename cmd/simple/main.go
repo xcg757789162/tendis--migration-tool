@@ -351,10 +351,11 @@ type HardwareInfo struct {
 
 // KeyFilter Key过滤配置
 type KeyFilter struct {
-	Mode            string   `json:"mode"` // all, prefix, pattern
-	Prefixes        []string `json:"prefixes"`
-	ExcludePrefixes []string `json:"exclude_prefixes"`
-	Patterns        []string `json:"patterns"`
+	Mode            string   `json:"mode"` // all, prefix, pattern, keys, keylist
+	Prefixes        []string `json:"prefixes,omitempty"`
+	ExcludePrefixes []string `json:"exclude_prefixes,omitempty"`
+	Patterns        []string `json:"patterns,omitempty"`
+	Keys            []string `json:"keys,omitempty"` // keylist/keys 模式使用
 }
 
 // ==================== Key 清单导入功能 ====================
@@ -759,7 +760,9 @@ func main() {
 	startTime = time.Now()
 	
 	// 初始化日志系统
-	if err := logger.Init(*flagLogDir, logger.DEBUG); err != nil {
+	// 【优化】默认使用 INFO 级别，减少日志量
+	// Debug 日志只在需要详细排查时手动开启
+	if err := logger.Init(*flagLogDir, logger.INFO); err != nil {
 		fmt.Printf("Failed to init logger: %v\n", err)
 	}
 	
@@ -866,7 +869,7 @@ func pauseAllRunningTasks() {
 	pausedCount := 0
 	now := time.Now()
 	for _, task := range tasks {
-		if task.Status == "running" {
+		if task.Status == "running" || task.Status == "retrying" {
 			task.Status = "paused"
 			task.PausedAt = now.Format(time.RFC3339)  // 记录暂停时间
 			task.UpdatedAt = now.Format(time.RFC3339)
@@ -964,7 +967,7 @@ func recoverUnfinishedTasks() {
 	recoveredCount := 0
 	for id, savedTask := range savedTasks {
 		// 只恢复之前正在运行的任务
-		if savedTask.Status == "running" || savedTask.Status == "paused" {
+		if savedTask.Status == "running" || savedTask.Status == "paused" || savedTask.Status == "retrying" {
 			// 创建新任务对象
 			task := &Task{
 				ID:             savedTask.ID,
@@ -1048,8 +1051,8 @@ func saveTasksState() {
 	tasksToSave := make(map[string]*Task)
 	taskIDs := make([]string, 0)
 	for id, task := range tasks {
-		// 只保存运行中或暂停的任务
-		if task.Status == "running" || task.Status == "paused" {
+		// 只保存运行中、暂停或重试中的任务
+		if task.Status == "running" || task.Status == "paused" || task.Status == "retrying" {
 			tasksToSave[id] = task
 			taskIDs = append(taskIDs, id)
 		}
@@ -1086,6 +1089,9 @@ func startPeriodicStateSave() {
 		for range ticker.C {
 			saveTasksState()
 			saveVerifyTasksState() // 同时保存校验任务状态
+			// 【新增】同时保存断点，防止 SIGKILL 丢数据
+			saveAllFullSyncCheckpoints()
+			saveAllIncrementalCheckpoints()
 		}
 	}()
 	
@@ -1775,16 +1781,27 @@ func (c *WSClient) sendTaskMetrics(task *Task) {
 		Type:   "metrics",
 		TaskID: task.ID,
 		Payload: map[string]interface{}{
-			"status":         task.Status,
-			"progress":       task.Progress,
-			"processed_keys": task.KeysMigrated,
-			"total_keys":     task.KeysTotal,
-			"current_qps":    speed,
-			"bytes_written":  task.BytesMigrated,
-			"failed_keys":    task.KeysFailed,
-			"skipped_keys":   task.KeysSkipped,  // 冲突跳过的 Key 数（目标端已存在）
-			// 【修复】移除重复的 conflict_keys 字段，它和 skipped_keys 是同一个值
-			"phase":          task.Phase,
+			"status":          task.Status,
+			"progress":        task.Progress,
+			"processed_keys":  task.KeysMigrated,
+			"total_keys":      task.KeysTotal,
+			"keys_to_migrate": task.KeysToMigrate,  // 待迁移Key数
+			"current_qps":     speed,
+			"bytes_written":   task.BytesMigrated,
+			"total_bytes":     task.BytesTotal,     // 总字节数
+			"failed_keys":     task.KeysFailed,
+			"skipped_keys":    task.KeysSkipped,    // 冲突跳过的 Key 数
+			"filtered_keys":   task.KeysFiltered,   // 被过滤的 Key 数
+			"phase":           task.Phase,
+			"estimated_eta":   calculateETA(task),  // 预计剩余时间
+			"elapsed_time":    calculateElapsedTime(task), // 已耗时间
+			"migration_mode":  task.MigrationMode,  // 迁移模式
+			// 增量同步相关指标
+			"incr_keys_synced":   task.IncrKeysSynced,
+			"incr_keys_skipped":  task.IncrKeysSkipped,
+			"incr_keys_failed":   task.IncrKeysFailed,
+			"incr_keys_filtered": task.IncrKeysFiltered,
+			"incr_lag_ms":        task.IncrLagMs,
 		},
 	})
 }
@@ -1863,6 +1880,28 @@ func broadcastTaskStatus(taskID, status string) {
 	}
 }
 
+// broadcastTaskProgress 广播任务进度（用于重试进度等）
+func broadcastTaskProgress(taskID string, progressData map[string]interface{}) {
+	wsClientsMu.RLock()
+	defer wsClientsMu.RUnlock()
+	
+	msg := &WSMessage{
+		Type:   "progress",
+		TaskID: taskID,
+		Payload: progressData,
+	}
+	
+	for _, client := range wsClients {
+		client.mu.RLock()
+		subscribed := client.taskIDs[taskID]
+		client.mu.RUnlock()
+		
+		if subscribed {
+			client.sendMessage(msg)
+		}
+	}
+}
+
 // startWSBroadcaster 启动 WebSocket 广播服务
 func startWSBroadcaster() {
 	go func() {
@@ -1924,10 +1963,12 @@ func listTasksHandler(w http.ResponseWriter, r *http.Request, log *logger.Reques
 			"created_at": t.CreatedAt,
 			"updated_at": t.UpdatedAt,
 			"progress": map[string]interface{}{
-				"percentage":    t.Progress,
-				"keys_total":    t.KeysTotal,
-				"keys_migrated": t.KeysMigrated,
-				"speed":         t.Speed,
+				"percentage":      t.Progress,
+				"keys_total":      t.KeysTotal,
+				"keys_to_migrate": t.KeysToMigrate,  // 待迁移 Key 数
+				"keys_migrated":   t.KeysMigrated,
+				"keys_filtered":   t.KeysFiltered,   // 被过滤的 Key 数
+				"speed":           t.Speed,
 			},
 		})
 	}
@@ -2349,14 +2390,20 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 				"elapsed_time":    calculateElapsedTime(task),
 			},
 			"stats": map[string]interface{}{
-				"total_keys":      task.KeysTotal,
-				"keys_to_migrate": task.KeysToMigrate,  // 【新增】符合条件待迁移的Key数
-				"migrated_keys":   task.KeysMigrated,
-				"failed_keys":     task.KeysFailed,
-				"skipped_keys":    task.KeysSkipped,
-				"filtered_keys":   task.KeysFiltered,
-				"bytes_sent":      task.BytesMigrated,
+				"total_keys":         task.KeysTotal,
+				"keys_to_migrate":    task.KeysToMigrate,
+				"migrated_keys":      task.KeysMigrated,
+				"failed_keys":        task.KeysFailed,
+				"skipped_keys":       task.KeysSkipped,
+				"filtered_keys":      task.KeysFiltered,
+				"bytes_sent":         task.BytesMigrated,
+				"incr_keys_synced":   task.IncrKeysSynced,
+				"incr_keys_skipped":  task.IncrKeysSkipped,
+				"incr_keys_failed":   task.IncrKeysFailed,
+				"incr_keys_filtered": task.IncrKeysFiltered,
+				"api_version":        "v2.3.1-bugfix",
 			},
+			"phase": phase,
 			// 增量同步指标（Binlog 模式）
 			"incr_keys_synced":   task.IncrKeysSynced,
 			"incr_keys_skipped":  task.IncrKeysSkipped,
@@ -3299,8 +3346,8 @@ func loadVerifyTasksState() {
 
 	verifyTasksMu.Lock()
 	for id, task := range savedTasks {
-		// 如果任务是 running 状态，恢复为 pending（需要用户重新启动）
-		if task.Status == "running" {
+		// 如果任务是 running 或 retrying 状态，恢复为 pending（需要用户重新启动）
+		if task.Status == "running" || task.Status == "retrying" {
 			task.Status = "pending"
 		}
 		verifyTasks[id] = task
@@ -4151,49 +4198,54 @@ func simulateProgress(task *Task) {
 		tasksMu.Unlock()
 		
 		// 根据是否有 FakeSlave 选择同步模式
-		if cacheManager != nil && len(fakeSlaves) > 0 {
+		// 【BUG FIX】修改条件：当 skip_full_sync=true 时，cacheManager 为 nil，但仍应使用 FakeSlave 进行实时同步
+		if len(fakeSlaves) > 0 {
 			// ==================== 【关键】回放缓存的 Binlog ====================
-			taskLog.Info("Stopping cache mode, preparing to replay cached binlogs")
-			cacheManager.StopCaching() // 停止缓存，后续 Binlog 直接应用
-			
-			// 获取缓存统计
-			cacheStats := cacheManager.GetAllStats()
-			var totalCached int64
-			for storeID, stats := range cacheStats {
-				totalCached += stats["total_records"]
-				taskLog.Info("Cache stats for store", map[string]interface{}{
-					"store_id":      storeID,
-					"total_records": stats["total_records"],
-					"total_bytes":   stats["total_bytes"],
-					"files_created": stats["files_created"],
-				})
-			}
-			
-			if totalCached > 0 {
-				taskLog.Info("Replaying cached binlogs captured during full migration", map[string]interface{}{
-					"total_cached": totalCached,
-				})
+			if cacheManager != nil {
+				taskLog.Info("Stopping cache mode, preparing to replay cached binlogs")
+				cacheManager.StopCaching() // 停止缓存，后续 Binlog 直接应用
 				
-				// 回放缓存的 Binlog
-				for _, fs := range fakeSlaves {
-					cacheConfig := replication.BinlogCacheConfig{
-						CacheDir: "./data/binlog_cache",
-						TaskID:   task.ID,
-					}
-					if err := fs.ReplayCachedBinlogs(ctx, cacheConfig); err != nil {
-						taskLog.Error("Failed to replay cached binlogs", map[string]interface{}{
-							"error": err.Error(),
-						})
-					}
+				// 获取缓存统计
+				cacheStats := cacheManager.GetAllStats()
+				var totalCached int64
+				for storeID, stats := range cacheStats {
+					totalCached += stats["total_records"]
+					taskLog.Info("Cache stats for store", map[string]interface{}{
+						"store_id":      storeID,
+						"total_records": stats["total_records"],
+						"total_bytes":   stats["total_bytes"],
+						"files_created": stats["files_created"],
+					})
 				}
-				taskLog.Info("Cached binlog replay completed")
+				
+				if totalCached > 0 {
+					taskLog.Info("Replaying cached binlogs captured during full migration", map[string]interface{}{
+						"total_cached": totalCached,
+					})
+					
+					// 回放缓存的 Binlog
+					for _, fs := range fakeSlaves {
+						cacheConfig := replication.BinlogCacheConfig{
+							CacheDir: "./data/binlog_cache",
+							TaskID:   task.ID,
+						}
+						if err := fs.ReplayCachedBinlogs(ctx, cacheConfig); err != nil {
+							taskLog.Error("Failed to replay cached binlogs", map[string]interface{}{
+								"error": err.Error(),
+							})
+						}
+					}
+					taskLog.Info("Cached binlog replay completed")
+				} else {
+					taskLog.Info("No cached binlogs to replay")
+				}
+				
+				// 清理缓存文件（已回放完成）
+				if err := cacheManager.CleanupCache(); err != nil {
+					taskLog.Warn("Failed to cleanup cache", map[string]interface{}{"error": err.Error()})
+				}
 			} else {
-				taskLog.Info("No cached binlogs to replay")
-			}
-			
-			// 清理缓存文件（已回放完成）
-			if err := cacheManager.CleanupCache(); err != nil {
-				taskLog.Warn("Failed to cleanup cache", map[string]interface{}{"error": err.Error()})
+				taskLog.Info("No cache manager (skip_full_sync mode), proceeding with real-time binlog sync")
 			}
 			
 			// ==================== 切换到实时 Binlog 同步 ====================
@@ -5163,6 +5215,7 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 	var failedCount int64
 	var skippedCount int64
 	var filteredCount int64
+	var keysToMigrateCount int64  // 【修复】符合过滤条件的待迁移 Key 数（SCAN 后本地过滤统计）
 	startTime := time.Now()
 	lastLogTime := time.Now()
 	var lastLogMu sync.Mutex
@@ -5249,19 +5302,29 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 				task.KeysFiltered = ftc
 				task.ActiveWorkers = currentWorkers  // 更新当前活跃Worker数
 				
-				// 动态调整 KeysTotal：确保 KeysTotal >= 已处理Key数量
-				// 修复：初始 DBSIZE 可能不准确，且增量阶段会有新 Key
-				processedKeys := mc + sc + ftc
-				if processedKeys > task.KeysTotal {
-					task.KeysTotal = processedKeys
-					task.BytesTotal = processedKeys * 256 // 同步更新估算字节数
+				// 【修复】实时更新待迁移 Key 数
+				// 待迁移 Key 数 = SCAN 扫描到的、符合过滤条件的 Key 总数
+				// 由 keysToMigrateCount 在 SCAN 阶段统计（经过本地过滤）
+				toMigrate := atomic.LoadInt64(&keysToMigrateCount)
+				task.KeysToMigrate = toMigrate
+				
+				// 动态调整 KeysTotal：使用待迁移数作为总数（更准确）
+				// KeysTotal 代表"需要处理的 Key 总数"
+				if toMigrate > task.KeysTotal {
+					task.KeysTotal = toMigrate
+					task.BytesTotal = toMigrate * 256 // 同步更新估算字节数
 				}
 				
-				if task.KeysTotal > 0 {
-					task.Progress = float64(processedKeys) / float64(task.KeysTotal) * 100
+				// 进度 = 已处理数 / 待迁移数
+				processedKeys := mc + sc + ftc
+				if toMigrate > 0 {
+					task.Progress = float64(mc + sc) / float64(toMigrate) * 100
 					if task.Progress > 100 {
 						task.Progress = 100
 					}
+				} else if processedKeys > 0 {
+					// 还没扫描到符合条件的 Key，使用已处理数估算
+					task.Progress = 0
 				}
 				// 使用实时速度（滑动窗口），而不是平均速度
 				task.Speed = realTimeSpeed
@@ -5278,17 +5341,18 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 					}
 					
 					taskLog.Info("Migration progress", map[string]interface{}{
-						"progress":        fmt.Sprintf("%.1f%%", task.Progress),
-						"migrated_keys":   mc,
-						"failed_keys":     fc,
-						"skipped_keys":    sc,
-						"filtered_keys":   ftc,
-						"realtime_speed":  realTimeSpeed,
-						"average_speed":   avgSpeed,
-						"bytes_speed_mb":  fmt.Sprintf("%.2f MB/s", float64(bytesSpeed)/1024/1024),
-						"active_workers":  currentWorkers,
-						"target_workers":  targetWorkerCount,
-						"elapsed":         fmt.Sprintf("%.0fs", elapsed),
+						"progress":         fmt.Sprintf("%.1f%%", task.Progress),
+						"keys_to_migrate":  toMigrate,  // 待迁移 Key 数
+						"migrated_keys":    mc,
+						"failed_keys":      fc,
+						"skipped_keys":     sc,
+						"filtered_keys":    ftc,
+						"realtime_speed":   realTimeSpeed,
+						"average_speed":    avgSpeed,
+						"bytes_speed_mb":   fmt.Sprintf("%.2f MB/s", float64(bytesSpeed)/1024/1024),
+						"active_workers":   currentWorkers,
+						"target_workers":   targetWorkerCount,
+						"elapsed":          fmt.Sprintf("%.0fs", elapsed),
 						"speed_per_worker": realTimeSpeed / int64(max(currentWorkers, 1)),
 					})
 					lastLogTime = time.Now()
@@ -5435,14 +5499,67 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 
 	// 断点保存计数器
 	var scannedKeysCount int64
-	checkpointSaveInterval := int64(1000) // 每扫描 1000 个 key 保存一次断点（SSD 优化：减少崩溃后重复迁移）
+	checkpointSaveInterval := int64(1000) // 每扫描 1000 个 key 保存一次断点
 	lastCheckpointSave := time.Now()
+	
+	// 【零丢失断点机制】
+	// 问题：SCAN cursor 推进 ≠ worker 迁移完成。SIGKILL 时 keyChan 中未消费的 key 会丢失。
+	// 方案：断点保存的 cursor 需要回退，确保覆盖 keyChan 中所有待消费的 key。
+	//   - 维护一个 "cursor 历史栈"，记录每批 SCAN 对应的 {cursor, count}
+	//   - 保存断点时，根据 keyChan 中待消费的 key 数量（len(keyChan) + worker 批次缓冲）
+	//     回退到足够安全的 cursor
+	//   - 恢复时最多重复迁移一些 key，但绝不丢失（迁移是幂等的：replace 覆盖/skip 跳过）
+	type cursorBatch struct {
+		cursor   uint64 // 这批 SCAN 之前的 cursor 值
+		keyCount int64  // 这批 push 了多少 key 到 keyChan
+	}
+	var cursorHistory []cursorBatch    // cursor 历史栈
+	var cursorHistoryMu sync.Mutex
+	var totalPushedKeys int64          // 累计 push 到 keyChan 的 key 数量
+	
+	// getSafeCheckpointCursor 计算安全的断点 cursor
+	// 考虑 keyChan 中未消费的 key + worker 中正在处理的 key
+	getSafeCheckpointCursor := func(currentCursor uint64) uint64 {
+		cursorHistoryMu.Lock()
+		defer cursorHistoryMu.Unlock()
+		
+		if len(cursorHistory) == 0 {
+			return currentCursor
+		}
+		
+		// 估算 keyChan 中 + worker 中还未落盘的 key 数量
+		// keyChan 缓冲区中的 key + 每个 worker 可能持有的批次（最多 1000 个/worker）
+		pendingInChan := int64(len(keyChan))
+		pendingInWorkers := int64(workerCount) * 1000  // 最坏情况
+		totalPending := pendingInChan + pendingInWorkers
+		
+		// 从最新的批次开始向前回溯，找到覆盖所有 pending key 的安全 cursor
+		var accumulatedKeys int64
+		safeCursor := currentCursor
+		for i := len(cursorHistory) - 1; i >= 0; i-- {
+			safeCursor = cursorHistory[i].cursor
+			accumulatedKeys += cursorHistory[i].keyCount
+			if accumulatedKeys >= totalPending {
+				break
+			}
+		}
+		
+		// 清理已经安全的旧历史记录（保留最近的 + 需要回退的）
+		if accumulatedKeys >= totalPending && len(cursorHistory) > 100 {
+			// 保留最近的 50 条
+			cursorHistory = cursorHistory[len(cursorHistory)-50:]
+		}
+		
+		return safeCursor
+	}
 	
 	// 【优化】获取 SCAN MATCH 模式 - 利用服务端过滤
 	// 评审建议：SCAN MATCH 是服务端过滤，40亿 Key 场景下可大幅减少网络传输
 	var scanMatchPattern string
+	var keyFilter *KeyFilter  // 用于本地二次过滤（排除前缀等）
 	if task.Options != nil {
 		scanMatchPattern = getScanMatchPattern(task.Options.KeyFilter)
+		keyFilter = task.Options.KeyFilter
 	} else {
 		scanMatchPattern = "*"
 	}
@@ -5524,18 +5641,27 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 					status := task.Status
 					tasksMu.RUnlock()
 					if status != "running" {
-						// 保存当前 cursor 再退出（使用前缀维度的 key）
+						// 【零丢失】主动停止时，等待 keyChan 排空后保存安全 cursor
+						drainStart := time.Now()
+						for len(keyChan) > 0 && time.Since(drainStart) < 10*time.Second {
+							time.Sleep(50 * time.Millisecond)
+						}
+						safeCursor := getSafeCheckpointCursor(cursor)
 						nodeCursorsMu.Lock()
-						fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = cursor
+						fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = safeCursor
 						fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
 						nodeCursorsMu.Unlock()
 						saveFullSyncCheckpoint(task.ID, fullCheckpoint)
+						taskLog.Info("Checkpoint saved on pause (zero-loss)", map[string]interface{}{
+							"node": nodeAddr, "scan_cursor": cursor, "safe_cursor": safeCursor, "chan_pending": len(keyChan),
+						})
 						return
 					}
 
 					// 动态获取批次大小
 					currentBatchSize := getBatchSize()
 					// 【优化】使用 SCAN MATCH 服务端过滤
+					prevCursor := cursor
 					keys, newCursor, err := nodeClient.Scan(ctx, cursor, scanMatchPattern, currentBatchSize).Result()
 					if err != nil {
 						consecutiveScanFailures++
@@ -5549,9 +5675,9 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 						if consecutiveScanFailures >= MaxConsecutiveFailures {
 							shouldPause := recordSourceFailure(task.ID, taskLog)
 							if shouldPause {
-								// 保存断点后暂停
+								safeCursor := getSafeCheckpointCursor(cursor)
 								nodeCursorsMu.Lock()
-								fullCheckpoint.NodeCursors[nodeAddr] = cursor
+								fullCheckpoint.NodeCursors[nodeAddr] = safeCursor
 								fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
 								nodeCursorsMu.Unlock()
 								saveFullSyncCheckpoint(task.ID, fullCheckpoint)
@@ -5569,30 +5695,48 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 					consecutiveScanFailures = 0
 					recordSourceSuccess(task.ID)
 
+					// 【修复】统计符合过滤条件的待迁移 Key 数
+					var matchedInBatch int64
+					var pushedInBatch int64
 					for _, key := range keys {
 						tasksMu.RLock()
 						status := task.Status
 						tasksMu.RUnlock()
 						if status != "running" {
-							// 保存断点再退出（使用前缀维度 key）
+							// 【零丢失】主动停止时保存安全 cursor
+							safeCursor := getSafeCheckpointCursor(cursor)
 							nodeCursorsMu.Lock()
-							fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = cursor
+							fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = safeCursor
 							fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
 							nodeCursorsMu.Unlock()
 							saveFullSyncCheckpoint(task.ID, fullCheckpoint)
 							return
 						}
+						// 检查是否符合过滤条件（本地二次过滤，处理排除前缀等情况）
+						if matchKeyFilterV2(key, keyFilter) {
+							matchedInBatch++
+						}
 						keyChan <- key
+						pushedInBatch++
 					}
+					
+					// 累加待迁移 Key 数
+					atomic.AddInt64(&keysToMigrateCount, matchedInBatch)
 
 					cursor = newCursor
 					atomic.AddInt64(&scannedKeysCount, int64(len(keys)))
 					
-					// 定期保存断点（每 10000 个 key 或每 30 秒）- 使用前缀维度 key
+					// 【零丢失】记录 cursor 历史（用于断点回退）
+					cursorHistoryMu.Lock()
+					cursorHistory = append(cursorHistory, cursorBatch{cursor: prevCursor, keyCount: pushedInBatch})
+					cursorHistoryMu.Unlock()
+					
+					// 定期保存断点（使用安全 cursor）
 					currentScanned := atomic.LoadInt64(&scannedKeysCount)
 					if currentScanned%checkpointSaveInterval == 0 || time.Since(lastCheckpointSave) > 30*time.Second {
+						safeCursor := getSafeCheckpointCursor(cursor)
 						nodeCursorsMu.Lock()
-						fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = cursor
+						fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = safeCursor
 						fullCheckpoint.TotalScannedKeys = currentScanned
 						fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
 						nodeCursorsMu.Unlock()
@@ -5642,16 +5786,25 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 			status := task.Status
 			tasksMu.RUnlock()
 			if status != "running" {
-				// 保存断点再退出（使用前缀维度 key）
-				fullCheckpoint.NodeCursors[checkpointKey] = cursor
+				// 【零丢失】主动停止时，等待 keyChan 排空后保存安全 cursor
+				drainStart := time.Now()
+				for len(keyChan) > 0 && time.Since(drainStart) < 10*time.Second {
+					time.Sleep(50 * time.Millisecond)
+				}
+				safeCursor := getSafeCheckpointCursor(cursor)
+				fullCheckpoint.NodeCursors[checkpointKey] = safeCursor
 				fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
 				saveFullSyncCheckpoint(task.ID, fullCheckpoint)
+				taskLog.Info("Checkpoint saved on pause (zero-loss)", map[string]interface{}{
+					"scan_cursor": cursor, "safe_cursor": safeCursor, "chan_pending": len(keyChan),
+				})
 				break
 			}
 
 			// 动态获取批次大小
 			currentBatchSize := getBatchSize()
 			// 【优化】使用 SCAN MATCH 服务端过滤
+			prevCursor := cursor
 			keys, newCursor, err := sourceClient.Scan(ctx, cursor, scanMatchPattern, currentBatchSize).Result()
 			if err != nil {
 				consecutiveScanFailures++
@@ -5664,7 +5817,8 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 				if consecutiveScanFailures >= MaxConsecutiveFailures {
 					shouldPause := recordSourceFailure(task.ID, taskLog)
 					if shouldPause {
-						fullCheckpoint.NodeCursors[checkpointKey] = cursor
+						safeCursor := getSafeCheckpointCursor(cursor)
+						fullCheckpoint.NodeCursors[checkpointKey] = safeCursor
 						fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
 						saveFullSyncCheckpoint(task.ID, fullCheckpoint)
 						saveErrorKeysToFile(task.ID)
@@ -5681,27 +5835,46 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 			consecutiveScanFailures = 0
 			recordSourceSuccess(task.ID)
 
+			// 【修复】统计符合过滤条件的待迁移 Key 数
+			var matchedInBatch int64
+			var pushedInBatch int64
 			for _, key := range keys {
 				tasksMu.RLock()
 				status := task.Status
 				tasksMu.RUnlock()
 				if status != "running" {
-					// 保存断点再退出（使用前缀维度 key）
-					fullCheckpoint.NodeCursors[checkpointKey] = cursor
+					// 【零丢失】主动停止时保存安全 cursor
+					safeCursor := getSafeCheckpointCursor(cursor)
+					fullCheckpoint.NodeCursors[checkpointKey] = safeCursor
 					fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
 					saveFullSyncCheckpoint(task.ID, fullCheckpoint)
 					break
 				}
+				// 检查是否符合过滤条件
+				if matchKeyFilterV2(key, keyFilter) {
+					matchedInBatch++
+				}
 				keyChan <- key
+				pushedInBatch++
 			}
+			
+			// 累加待迁移 Key 数
+			atomic.AddInt64(&keysToMigrateCount, matchedInBatch)
 
 			cursor = newCursor
 			atomic.AddInt64(&scannedKeysCount, int64(len(keys)))
+			atomic.AddInt64(&totalPushedKeys, pushedInBatch)
 			
-			// 定期保存断点（使用前缀维度 key）
+			// 【零丢失】记录 cursor 历史（用于断点回退）
+			cursorHistoryMu.Lock()
+			cursorHistory = append(cursorHistory, cursorBatch{cursor: prevCursor, keyCount: pushedInBatch})
+			cursorHistoryMu.Unlock()
+			
+			// 定期保存断点（使用安全 cursor）
 			currentScanned := atomic.LoadInt64(&scannedKeysCount)
 			if currentScanned%checkpointSaveInterval == 0 || time.Since(lastCheckpointSave) > 30*time.Second {
-				fullCheckpoint.NodeCursors[checkpointKey] = cursor
+				safeCursor := getSafeCheckpointCursor(cursor)
+				fullCheckpoint.NodeCursors[checkpointKey] = safeCursor
 				fullCheckpoint.TotalScannedKeys = currentScanned
 				fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
 				saveFullSyncCheckpoint(task.ID, fullCheckpoint)
@@ -5762,22 +5935,31 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 			task.Status = "completed"
 			task.Progress = 100
 			task.Phase = "completed"
+			task.CompletedAt = time.Now().Format(time.RFC3339)  // 【修复】设置完成时间
 		} else {
 			// 全量迁移完成，准备进入增量同步
 			task.Progress = 100
 			task.Phase = "incremental"
+			task.IncrStartAt = time.Now().Format(time.RFC3339)  // 记录增量开始时间
 		}
 	}
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
 	tasksMu.Unlock()
+	
+	// 【修复】广播任务状态更新
+	broadcastTaskUpdate(task.ID)
+	if task.MigrationMode == "full_only" {
+		broadcastTaskStatus(task.ID, "completed")
+	}
 
 	taskLog.Info("Full migration completed", map[string]interface{}{
-		"migrated_keys": mc,
-		"failed_keys":   fc,
-		"skipped_keys":  sc,
-		"filtered_keys": ftc,
-		"duration":      time.Since(startTime).String(),
-		"avg_speed":     int64(float64(mc) / time.Since(startTime).Seconds()),
+		"migrated_keys":   mc,
+		"failed_keys":     fc,
+		"skipped_keys":    sc,
+		"filtered_keys":   ftc,
+		"migration_mode":  task.MigrationMode,
+		"duration":        time.Since(startTime).String(),
+		"avg_speed":       int64(float64(mc) / time.Since(startTime).Seconds()),
 	})
 }
 
@@ -5850,44 +6032,12 @@ func (rl *RateLimiter) Stop() {
 }
 
 // matchKeyFilter 检查Key是否匹配过滤规则
+// 这是统一的 Key 过滤入口，内部调用 matchKeyFilterV2
 func matchKeyFilter(key string, options *TaskOptions) bool {
 	if options == nil || options.KeyFilter == nil {
 		return true
 	}
-
-	filter := options.KeyFilter
-	switch filter.Mode {
-	case "prefix":
-		// 检查排除前缀
-		for _, prefix := range filter.ExcludePrefixes {
-			if strings.HasPrefix(key, prefix) {
-				return false
-			}
-		}
-		// 如果设置了包含前缀，只迁移匹配的
-		if len(filter.Prefixes) > 0 {
-			for _, prefix := range filter.Prefixes {
-				if strings.HasPrefix(key, prefix) {
-					return true
-				}
-			}
-			return false
-		}
-		return true
-	case "pattern":
-		// 正则匹配（简化实现，使用 strings.Contains）
-		if len(filter.Patterns) > 0 {
-			for _, pattern := range filter.Patterns {
-				if strings.Contains(key, pattern) {
-					return true
-				}
-			}
-			return false
-		}
-		return true
-	default:
-		return true
-	}
+	return matchKeyFilterV2(key, options.KeyFilter)
 }
 
 // migrateKeyWithPolicy 根据冲突策略迁移Key
@@ -6297,6 +6447,17 @@ func matchKeyFilterV2(key string, filter *KeyFilter) bool {
 		}
 		for _, pattern := range filter.Patterns {
 			if matchSimplePattern(key, pattern) {
+				return true
+			}
+		}
+		return false
+	case "keys", "keylist":
+		// keylist 模式：只迁移指定的 Key 列表
+		if len(filter.Keys) == 0 {
+			return true // 如果没有指定 Keys，则迁移所有（兼容旧行为）
+		}
+		for _, k := range filter.Keys {
+			if key == k {
 				return true
 			}
 		}
@@ -6873,33 +7034,70 @@ func startFakeSlaves(
 			// 创建并启动 FakeSlave（需要传入 targetClient）
 			fs := replication.NewFakeSlave(config, targetClient)
 			fs.SetBinlogHandler(binlogHandler) // 设置 binlog 处理回调
-			if err := fs.Start(ctx); err != nil {
-				taskLog.Error("Failed to start FakeSlave", map[string]interface{}{
-					"node":     nodeAddr,
-					"store_id": storeID,
-					"error":    err.Error(),
-				})
-				continue
-			}
-
 			fakeSlaves = append(fakeSlaves, fs)
-			taskLog.Debug("FakeSlave started (real-time mode)", map[string]interface{}{
-				"node":             nodeAddr,
-				"node_idx":         nodeIdx,
-				"store_id":         storeID,
-				"start_binlog_pos": startBinlogPos,
-			})
-		}
-		nodeClient.Close()
+
+			// 【BUG FIX】使用 goroutine 启动 FakeSlave，避免阻塞
+			go func(fs *replication.FakeSlave, nodeAddr string, storeID int) {
+				if err := fs.Start(ctx); err != nil {
+					if ctx.Err() == nil {
+						taskLog.Error("FakeSlave stopped with error", map[string]interface{}{
+							"node":     nodeAddr,
+							"store_id": storeID,
+						"error":    err.Error(),
+					})
+				}
+			}
+		}(fs, nodeAddr, storeID)
+
+		// 【日志优化】升级为 Info，FakeSlave 启动是重要事件
+		taskLog.Info("FakeSlave started (real-time mode)", map[string]interface{}{
+			"node":             nodeAddr,
+			"node_idx":         nodeIdx,
+			"store_id":         storeID,
+			"start_binlog_pos": startBinlogPos,
+		})
 	}
+	nodeClient.Close()
+}
 
 	if len(fakeSlaves) == 0 {
 		return nil, fmt.Errorf("failed to start any FakeSlave")
 	}
 
+	// 等待至少一个 FakeSlave 连接成功（最多等待 30 秒）
+	taskLog.Info("Waiting for FakeSlaves to connect...", map[string]interface{}{
+		"total": len(fakeSlaves),
+	})
+
+	connectedCount := 0
+	waitTimeout := time.After(30 * time.Second)
+	checkInterval := time.NewTicker(500 * time.Millisecond)
+	defer checkInterval.Stop()
+
+waitLoop:
+	for connectedCount == 0 {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled while waiting for FakeSlave connection")
+		case <-waitTimeout:
+			taskLog.Warn("Timeout waiting for FakeSlave connections, continuing anyway", nil)
+			break waitLoop
+		case <-checkInterval.C:
+			connectedCount = 0
+			for _, fs := range fakeSlaves {
+				if fs.IsConnected() {
+					connectedCount++
+				}
+			}
+			if connectedCount > 0 {
+				break waitLoop
+			}
+		}
+	}
+
 	taskLog.Info("FakeSlaves started in real-time mode", map[string]interface{}{
-		"connected": len(fakeSlaves),
-		"total":     len(sourceNodes) * kvstorecount,
+		"connected": connectedCount,
+		"total":     len(fakeSlaves),
 	})
 
 	return fakeSlaves, nil
@@ -7180,6 +7378,11 @@ func processBinlogEntries(
 
 	for _, entry := range entries {
 		// Key 已经在 FakeSlave 中过滤过了，这里直接处理
+		taskLog.Debug("Processing binlog entry", map[string]interface{}{
+			"op_type": entry.OpType,
+			"key":     entry.Key,
+			"key_len": len(entry.Key),
+		})
 		switch entry.OpType {
 		case "CMD":
 			// CMD 类型：entry.Value 是 RESP 格式的 Redis 命令字符串
@@ -7220,11 +7423,17 @@ func processBinlogEntries(
 		case "SET":
 			// 【BUG-2 修复】SET 类型：不再使用 RESTORE 命令（Tendis 间 DUMP 格式可能不兼容）
 			// 改为从源端重新读取数据并使用原生命令写入
+			taskLog.Debug("Entering SET case", map[string]interface{}{"key": entry.Key})
 			if len(entry.Key) > 0 {
 				ttl := time.Duration(entry.TTL) * time.Millisecond
 				
 				// 从源端重新获取 Key 的类型和值
 				keyType, err := sourceClient.Type(ctx, entry.Key).Result()
+				taskLog.Debug("Got key type from source", map[string]interface{}{
+					"key":      entry.Key,
+					"key_type": keyType,
+					"error":    err,
+				})
 				if err != nil || keyType == "none" {
 					// Key 可能已被删除，跳过
 					taskLog.Debug("Binlog SET key not found in source", map[string]interface{}{
@@ -7248,6 +7457,7 @@ func processBinlogEntries(
 						"binlog", "target", "SET", "incremental", 0)
 					continue
 				}
+				taskLog.Debug("Binlog SET sync success", map[string]interface{}{"key": entry.Key})
 				synced++
 			}
 
@@ -7279,7 +7489,15 @@ func processBinlogEntries(
 	task.IncrKeysSkipped += skipped
 	task.IncrKeysFailed += failed
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	newTotal := task.IncrKeysSynced
 	tasksMu.Unlock()
+
+	taskLog.Info("Binlog batch processed", map[string]interface{}{
+		"synced":     synced,
+		"skipped":    skipped,
+		"failed":     failed,
+		"total_sync": newTotal,
+	})
 
 	return nil
 }
@@ -9060,7 +9278,7 @@ func errorKeysHandler(w http.ResponseWriter, r *http.Request, id string, log *lo
 	errorKeyMu.RUnlock()
 
 	tasksMu.RLock()
-	task, ok := tasks[id]
+	_, ok := tasks[id]
 	tasksMu.RUnlock()
 
 	if !ok {
@@ -9068,12 +9286,27 @@ func errorKeysHandler(w http.ResponseWriter, r *http.Request, id string, log *lo
 		return
 	}
 
+	// 统计各类型错误Key数量（基于实际列表计算，确保一致性）
+	var failedCount, skippedCount, largeKeyCount int64
+	for _, k := range keys {
+		switch k.Reason {
+		case "failed", "timeout":
+			failedCount++
+		case "skipped", "conflict":
+			skippedCount++
+		case "large_key":
+			largeKeyCount++
+		default:
+			failedCount++ // 默认算作失败
+		}
+	}
+
 	// 统计
 	stats := map[string]int64{
 		"total":      int64(len(keys)),
-		"failed":     task.KeysFailed,
-		"skipped":    task.KeysSkipped,
-		"large_keys": 0,
+		"failed":     failedCount,
+		"skipped":    skippedCount,
+		"large_keys": largeKeyCount,
 	}
 
 	// 只返回前100条
@@ -9667,6 +9900,10 @@ func restartTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *
 }
 
 // retryFailedKeysHandler 重试失败的 key
+// 【修复】
+// 1. 重试所有失败的 Key，不再限制 BatchSize
+// 2. 使用任务原本的 worker 数量并行重试
+// 3. 重试过程完全在后端独立运行，不受前端页面状态影响
 func retryFailedKeysHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger, taskLog *logger.TaskLogger) {
 	tasksMu.RLock()
 	task, ok := tasks[id]
@@ -9677,10 +9914,27 @@ func retryFailedKeysHandler(w http.ResponseWriter, r *http.Request, id string, l
 		return
 	}
 
-	// 获取失败的 key 列表
+	// 检查是否已经在重试中
+	if task.Status == "retrying" {
+		jsonResponse(w, map[string]interface{}{
+			"code":    400,
+			"message": "Task is already retrying failed keys",
+		})
+		return
+	}
+
+	// 获取失败的 key 列表（只获取 reason 为 failed 的 key）
 	errorKeyMu.RLock()
-	failedKeys := errorKeys[id]
+	allErrorKeys := errorKeys[id]
 	errorKeyMu.RUnlock()
+
+	// 只筛选 failed 类型的 key 进行重试
+	var failedKeys []ErrorKey
+	for _, ek := range allErrorKeys {
+		if ek.Reason == "failed" || ek.Reason == "timeout" {
+			failedKeys = append(failedKeys, ek)
+		}
+	}
 
 	if len(failedKeys) == 0 {
 		jsonResponse(w, map[string]interface{}{
@@ -9695,53 +9949,337 @@ func retryFailedKeysHandler(w http.ResponseWriter, r *http.Request, id string, l
 
 	// 解析请求参数
 	var req struct {
-		MaxRetries int `json:"max_retries"`
-		BatchSize  int `json:"batch_size"`
+		MaxRetries  int `json:"max_retries"`
+		WorkerCount int `json:"worker_count"` // 可选：覆盖任务的 worker 数量
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
 	if req.MaxRetries <= 0 {
 		req.MaxRetries = 3
 	}
-	if req.BatchSize <= 0 {
-		req.BatchSize = 100
+
+	// 【修复】使用任务原本的 worker 数量，除非请求中指定
+	workerCount := 4 // 默认值
+	if task.Options != nil && task.Options.WorkerCount > 0 {
+		workerCount = task.Options.WorkerCount
+	}
+	if req.WorkerCount > 0 {
+		workerCount = req.WorkerCount
+	}
+	// 限制最大 worker 数量
+	if workerCount > 32 {
+		workerCount = 32
 	}
 
-	// 限制批次大小
+	// 【修复】重试所有失败的 key，不再限制 BatchSize
 	keysToRetry := failedKeys
-	if len(keysToRetry) > req.BatchSize {
-		keysToRetry = keysToRetry[:req.BatchSize]
-	}
+
+	// 保存原状态，设置为重试中
+	tasksMu.Lock()
+	previousStatus := task.Status
+	task.Status = "retrying"
+	tasksMu.Unlock()
+
+	// 通过 WebSocket 广播状态变更
+	broadcastTaskStatus(id, "retrying")
 
 	log.Info("Starting retry of failed keys", map[string]interface{}{
-		"task_id":      id,
-		"total_failed": len(failedKeys),
-		"batch_size":   len(keysToRetry),
-		"max_retries":  req.MaxRetries,
+		"task_id":         id,
+		"total_failed":    len(failedKeys),
+		"keys_to_retry":   len(keysToRetry),
+		"max_retries":     req.MaxRetries,
+		"worker_count":    workerCount,
+		"previous_status": previousStatus,
 	})
 
-	taskLog.Info("Retrying failed keys", map[string]interface{}{
-		"count":       len(keysToRetry),
-		"max_retries": req.MaxRetries,
+	taskLog.Info("🔄 开始重试失败的Key（并行模式）", map[string]interface{}{
+		"count":           len(keysToRetry),
+		"max_retries":     req.MaxRetries,
+		"worker_count":    workerCount,
+		"previous_status": previousStatus,
 	})
 
-	// 异步重试
+	// 【修复】异步并行重试，完全在后端独立运行
 	go func() {
-		retryFailedKeysAsync(task, keysToRetry, req.MaxRetries, taskLog)
+		retryFailedKeysAsyncParallel(task, keysToRetry, req.MaxRetries, workerCount, taskLog, previousStatus)
 	}()
 
 	jsonResponse(w, map[string]interface{}{
 		"code":    0,
-		"message": "Retry started",
+		"message": "Retry started (parallel mode)",
 		"data": map[string]interface{}{
-			"keys_to_retry": len(keysToRetry),
-			"total_failed":  len(failedKeys),
+			"keys_to_retry":   len(keysToRetry),
+			"total_failed":    len(failedKeys),
+			"worker_count":    workerCount,
+			"previous_status": previousStatus,
 		},
 	})
 }
 
-// retryFailedKeysAsync 异步重试失败的 key
-func retryFailedKeysAsync(task *Task, keysToRetry []ErrorKey, maxRetries int, taskLog *logger.TaskLogger) {
+// retryFailedKeysAsyncParallel 并行异步重试失败的 key
+// 【修复】使用多个 worker 并行重试，提高效率，且完全在后端独立运行
+func retryFailedKeysAsyncParallel(task *Task, keysToRetry []ErrorKey, maxRetries int, workerCount int, taskLog *logger.TaskLogger, previousStatus string) {
+	ctx := context.Background()
+
+	// 连接 Redis
+	sourceAddrs := strings.Split(task.SourceCluster, ",")
+	targetAddrs := strings.Split(task.TargetCluster, ",")
+
+	for i := range sourceAddrs {
+		sourceAddrs[i] = strings.TrimSpace(sourceAddrs[i])
+	}
+	for i := range targetAddrs {
+		targetAddrs[i] = strings.TrimSpace(targetAddrs[i])
+	}
+
+	sourceClient, _, err := connectRedis(ctx, sourceAddrs, task.SourcePassword)
+	if err != nil {
+		taskLog.Error("Failed to connect source for retry", map[string]interface{}{"error": err.Error()})
+		// 恢复原状态
+		tasksMu.Lock()
+		task.Status = previousStatus
+		tasksMu.Unlock()
+		broadcastTaskStatus(task.ID, previousStatus)
+		return
+	}
+	defer sourceClient.Close()
+
+	targetClient, _, err := connectRedis(ctx, targetAddrs, task.TargetPassword)
+	if err != nil {
+		taskLog.Error("Failed to connect target for retry", map[string]interface{}{"error": err.Error()})
+		// 恢复原状态
+		tasksMu.Lock()
+		task.Status = previousStatus
+		tasksMu.Unlock()
+		broadcastTaskStatus(task.ID, previousStatus)
+		return
+	}
+	defer targetClient.Close()
+
+	var successCount, failCount int64
+	var processedCount int64
+	totalKeys := int64(len(keysToRetry))
+
+	// 创建 key 通道
+	keyChan := make(chan ErrorKey, workerCount*2)
+
+	// 启动 worker goroutines
+	var wg sync.WaitGroup
+	for w := 0; w < workerCount; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			for errorKey := range keyChan {
+				key := errorKey.Key
+				var migrated bool
+				var reason string
+
+				for retry := 0; retry < maxRetries; retry++ {
+					migrated, _, reason = migrateKeyWithPolicy(ctx, sourceClient, targetClient, key, "replace")
+					if migrated {
+						break
+					}
+					if reason == "skipped" {
+						break
+					}
+					time.Sleep(time.Duration((retry+1)*100) * time.Millisecond)
+				}
+
+				if migrated {
+					atomic.AddInt64(&successCount, 1)
+					// 从错误列表中移除
+					removeErrorKey(task.ID, key)
+
+					tasksMu.Lock()
+					task.KeysMigrated++
+					task.KeysFailed--
+					tasksMu.Unlock()
+				} else {
+					atomic.AddInt64(&failCount, 1)
+					// 更新错误原因
+					if reason != "" {
+						updateErrorKeyReason(task.ID, key, reason)
+					}
+				}
+
+				// 更新已处理计数
+				processed := atomic.AddInt64(&processedCount, 1)
+
+				// 每 50 个 Key 或最后一个 Key 时广播进度
+				if processed%50 == 0 || processed == totalKeys {
+					currentSuccess := atomic.LoadInt64(&successCount)
+					currentFail := atomic.LoadInt64(&failCount)
+					broadcastTaskProgress(task.ID, map[string]interface{}{
+						"retry_progress": map[string]interface{}{
+							"current":    processed,
+							"total":      totalKeys,
+							"success":    currentSuccess,
+							"failed":     currentFail,
+							"percentage": float64(processed) / float64(totalKeys) * 100,
+						},
+					})
+				}
+			}
+		}(w)
+	}
+
+	// 发送所有 key 到通道
+	for _, errorKey := range keysToRetry {
+		keyChan <- errorKey
+	}
+	close(keyChan)
+
+	// 等待所有 worker 完成
+	wg.Wait()
+
+	finalSuccess := atomic.LoadInt64(&successCount)
+	finalFail := atomic.LoadInt64(&failCount)
+
+	taskLog.Info("✅ 并行重试完成", map[string]interface{}{
+		"success":      finalSuccess,
+		"failed":       finalFail,
+		"total":        totalKeys,
+		"worker_count": workerCount,
+	})
+
+	// 恢复原状态
+	tasksMu.Lock()
+	task.Status = previousStatus
+	tasksMu.Unlock()
+	broadcastTaskStatus(task.ID, previousStatus)
+
+	// 广播最终结果
+	broadcastTaskProgress(task.ID, map[string]interface{}{
+		"retry_complete": true,
+		"retry_result": map[string]interface{}{
+			"success": finalSuccess,
+			"failed":  finalFail,
+			"total":   totalKeys,
+		},
+	})
+}
+
+// updateErrorKeyReason 更新错误 key 的原因
+func updateErrorKeyReason(taskID, key, reason string) {
+	errorKeyMu.Lock()
+	defer errorKeyMu.Unlock()
+
+	if keys, ok := errorKeys[taskID]; ok {
+		for i, k := range keys {
+			if k.Key == key {
+				errorKeys[taskID][i].Detail = reason
+				errorKeys[taskID][i].Timestamp = time.Now().Format(time.RFC3339)
+				break
+			}
+		}
+	}
+}
+
+// retryFailedKeysAsync 异步重试失败的 key（保留旧版本供兼容）
+func retryFailedKeysAsync(task *Task, keysToRetry []ErrorKey, maxRetries int, taskLog *logger.TaskLogger, previousStatus string) {
+	ctx := context.Background()
+
+	// 连接 Redis
+	sourceAddrs := strings.Split(task.SourceCluster, ",")
+	targetAddrs := strings.Split(task.TargetCluster, ",")
+
+	for i := range sourceAddrs {
+		sourceAddrs[i] = strings.TrimSpace(sourceAddrs[i])
+	}
+	for i := range targetAddrs {
+		targetAddrs[i] = strings.TrimSpace(targetAddrs[i])
+	}
+
+	sourceClient, _, err := connectRedis(ctx, sourceAddrs, task.SourcePassword)
+	if err != nil {
+		taskLog.Error("Failed to connect source for retry", map[string]interface{}{"error": err.Error()})
+		// 恢复原状态
+		tasksMu.Lock()
+		task.Status = previousStatus
+		tasksMu.Unlock()
+		broadcastTaskStatus(task.ID, previousStatus)
+		return
+	}
+	defer sourceClient.Close()
+
+	targetClient, _, err := connectRedis(ctx, targetAddrs, task.TargetPassword)
+	if err != nil {
+		taskLog.Error("Failed to connect target for retry", map[string]interface{}{"error": err.Error()})
+		// 恢复原状态
+		tasksMu.Lock()
+		task.Status = previousStatus
+		tasksMu.Unlock()
+		broadcastTaskStatus(task.ID, previousStatus)
+		return
+	}
+	defer targetClient.Close()
+
+	var successCount, failCount int64
+	totalKeys := len(keysToRetry)
+
+	for i, errorKey := range keysToRetry {
+		key := errorKey.Key
+		var migrated bool
+		var reason string
+
+		for retry := 0; retry < maxRetries; retry++ {
+			migrated, _, reason = migrateKeyWithPolicy(ctx, sourceClient, targetClient, key, "replace")
+			if migrated {
+				break
+			}
+			if reason == "skipped" {
+				break
+			}
+			time.Sleep(time.Duration((retry+1)*100) * time.Millisecond)
+		}
+
+		if migrated {
+			successCount++
+			// 从错误列表中移除
+			removeErrorKey(task.ID, key)
+
+			tasksMu.Lock()
+			task.KeysMigrated++
+			task.KeysFailed--
+			tasksMu.Unlock()
+		} else {
+			failCount++
+			taskLog.Warn("Retry failed", map[string]interface{}{
+				"key":    key,
+				"reason": reason,
+			})
+		}
+
+		// 每 10 个 Key 或最后一个 Key 时广播进度
+		if (i+1)%10 == 0 || i == totalKeys-1 {
+			broadcastTaskProgress(task.ID, map[string]interface{}{
+				"retry_progress": map[string]interface{}{
+					"current":   i + 1,
+					"total":     totalKeys,
+					"success":   successCount,
+					"failed":    failCount,
+					"percentage": float64(i+1) / float64(totalKeys) * 100,
+				},
+			})
+		}
+	}
+
+	taskLog.Info("✅ 重试完成", map[string]interface{}{
+		"success": successCount,
+		"failed":  failCount,
+		"total":   totalKeys,
+	})
+
+	// 恢复原状态
+	tasksMu.Lock()
+	task.Status = previousStatus
+	tasksMu.Unlock()
+	broadcastTaskStatus(task.ID, previousStatus)
+}
+
+// retryFailedKeysAsyncSilent 静默异步重试失败的 key（用于自动重试，不改变任务状态）
+func retryFailedKeysAsyncSilent(task *Task, keysToRetry []ErrorKey, maxRetries int, taskLog *logger.TaskLogger) {
 	ctx := context.Background()
 
 	// 连接 Redis
@@ -9798,18 +10336,16 @@ func retryFailedKeysAsync(task *Task, keysToRetry []ErrorKey, maxRetries int, ta
 			tasksMu.Unlock()
 		} else {
 			failCount++
-			taskLog.Warn("Retry failed", map[string]interface{}{
-				"key":    key,
-				"reason": reason,
-			})
 		}
 	}
 
-	taskLog.Info("Retry completed", map[string]interface{}{
-		"success": successCount,
-		"failed":  failCount,
-		"total":   len(keysToRetry),
-	})
+	if successCount > 0 || failCount > 0 {
+		taskLog.Info("🔄 自动重试完成", map[string]interface{}{
+			"success": successCount,
+			"failed":  failCount,
+			"total":   len(keysToRetry),
+		})
+	}
 }
 
 // removeErrorKey 从错误列表中移除 key
@@ -11305,11 +11841,11 @@ func resetFailureTracker(taskID string) {
 
 // retryFailedKeysForRunningTasks 为运行中的任务重试失败的 Key
 func retryFailedKeysForRunningTasks() {
-	// 获取所有运行中的任务
+	// 获取所有运行中或增量同步中的任务（修复：增量阶段也需要自动重试）
 	var runningTasks []*Task
 	tasksMu.RLock()
 	for _, task := range tasks {
-		if task.Status == "running" {
+		if task.Status == "running" || task.Status == "incremental" {
 			runningTasks = append(runningTasks, task)
 		}
 	}
@@ -11341,9 +11877,9 @@ func retryFailedKeysForRunningTasks() {
 			"batch_size":   len(keysToRetry),
 		})
 
-		// 异步重试
+		// 异步重试（自动重试不改变状态，传空字符串表示保持当前状态）
 		go func(t *Task, keys []ErrorKey) {
-			retryFailedKeysAsync(t, keys, 3, logger.WithTask(t.ID))
+			retryFailedKeysAsyncSilent(t, keys, 3, logger.WithTask(t.ID))
 		}(task, keysToRetry)
 	}
 }
@@ -12330,12 +12866,20 @@ func verifyTaskHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 	switch {
 	case action == "" && r.Method == "GET":
 		getVerifyTaskHandler(w, r, id, log)
+	case action == "" && r.Method == "PUT":
+		updateVerifyTaskHandler(w, r, id, log)
 	case action == "" && r.Method == "DELETE":
 		deleteVerifyTaskHandler(w, r, id, log)
 	case action == "start" && r.Method == "POST":
 		startVerifyTaskHandler(w, r, id, log)
 	case action == "stop" && r.Method == "POST":
 		stopVerifyTaskHandler(w, r, id, log)
+	case action == "rerun" && r.Method == "POST":
+		rerunVerifyTaskHandler(w, r, id, log)
+	case action == "mismatch-details" && r.Method == "GET":
+		getMismatchDetailsHandler(w, r, id, log)
+	case strings.HasPrefix(action, "mismatch-details/download"):
+		downloadMismatchDetailsHandler(w, r, id, log)
 	default:
 		http.NotFound(w, r)
 	}
@@ -12440,6 +12984,294 @@ func stopVerifyTaskHandler(w http.ResponseWriter, r *http.Request, id string, lo
 	jsonResponse(w, map[string]interface{}{
 		"code":    0,
 		"message": "success",
+	})
+}
+
+// updateVerifyTaskHandler 更新校验任务配置
+func updateVerifyTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
+	verifyTasksMu.Lock()
+	task, ok := verifyTasks[id]
+	if ok && task.Status == "running" {
+		verifyTasksMu.Unlock()
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "Cannot update running task"})
+		return
+	}
+	verifyTasksMu.Unlock()
+
+	if !ok {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Verify task not found"})
+		return
+	}
+
+	var req struct {
+		Name           string `json:"name"`
+		SourceCluster  struct {
+			Addrs    []string `json:"addrs"`
+			Password string   `json:"password"`
+		} `json:"source_cluster"`
+		TargetCluster struct {
+			Addrs    []string `json:"addrs"`
+			Password string   `json:"password"`
+		} `json:"target_cluster"`
+		VerifyMode         string           `json:"verify_mode"`
+		SampleRate         float64          `json:"sample_rate"`
+		MaxKeys            int64            `json:"max_keys"`
+		KeyFilter          *KeyFilterConfig `json:"key_filter"`
+		CompareTTL         bool             `json:"compare_ttl"`
+		TTLTolerance       int64            `json:"ttl_tolerance"`
+		Concurrency        int              `json:"concurrency"`
+		QPS                int              `json:"qps"`
+		CompareMode        string           `json:"compare_mode"`
+		SkipLargeKey       bool             `json:"skip_large_key"`
+		LargeKeyThreshold  int64            `json:"large_key_threshold"`
+		DBList             string           `json:"db_list"`
+		CompareRounds      int              `json:"compare_rounds"`
+		RoundInterval      int              `json:"round_interval"`
+		Direction          string           `json:"direction"`
+		SmartCompare       bool             `json:"smart_compare"`
+		FieldLevelCompare  bool             `json:"field_level_compare"`
+		FieldScanThreshold int64            `json:"field_scan_threshold"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "Invalid request body"})
+		return
+	}
+
+	verifyTasksMu.Lock()
+	// 更新任务配置
+	if req.Name != "" {
+		task.Name = req.Name
+	}
+	if len(req.SourceCluster.Addrs) > 0 {
+		task.SourceCluster = strings.Join(req.SourceCluster.Addrs, ",")
+		task.SourcePassword = req.SourceCluster.Password
+	}
+	if len(req.TargetCluster.Addrs) > 0 {
+		task.TargetCluster = strings.Join(req.TargetCluster.Addrs, ",")
+		task.TargetPassword = req.TargetCluster.Password
+	}
+	if req.VerifyMode != "" {
+		task.VerifyMode = req.VerifyMode
+	}
+	if req.SampleRate > 0 {
+		task.SampleRate = req.SampleRate
+	}
+	if req.MaxKeys > 0 {
+		task.MaxKeys = req.MaxKeys
+	}
+	if req.KeyFilter != nil {
+		task.KeyFilter = req.KeyFilter
+	}
+	task.CompareTTL = req.CompareTTL
+	task.TTLTolerance = req.TTLTolerance
+	if req.Concurrency > 0 {
+		task.Concurrency = req.Concurrency
+	}
+	if req.QPS > 0 {
+		task.QPS = req.QPS
+	}
+	if req.CompareMode != "" {
+		task.CompareMode = req.CompareMode
+	}
+	task.SkipLargeKey = req.SkipLargeKey
+	if req.LargeKeyThreshold > 0 {
+		task.LargeKeyThreshold = req.LargeKeyThreshold
+	}
+	if req.DBList != "" {
+		task.DBList = req.DBList
+	}
+	if req.CompareRounds > 0 {
+		task.CompareRounds = req.CompareRounds
+	}
+	if req.RoundInterval > 0 {
+		task.RoundInterval = req.RoundInterval
+	}
+	if req.Direction != "" {
+		task.Direction = req.Direction
+	}
+	task.SmartCompare = req.SmartCompare
+	task.FieldLevelCompare = req.FieldLevelCompare
+	if req.FieldScanThreshold > 0 {
+		task.FieldScanThreshold = req.FieldScanThreshold
+	}
+	verifyTasksMu.Unlock()
+
+	// 保存校验任务状态
+	saveVerifyTasksState()
+
+	log.Info("Verify task updated", map[string]interface{}{"task_id": id})
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+		"data":    task,
+	})
+}
+
+// rerunVerifyTaskHandler 重新执行校验任务
+func rerunVerifyTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
+	verifyTasksMu.Lock()
+	task, ok := verifyTasks[id]
+	if ok {
+		if task.Status == "running" {
+			verifyTasksMu.Unlock()
+			jsonResponse(w, map[string]interface{}{"code": 400, "message": "Task is already running"})
+			return
+		}
+		// 重置任务状态和结果
+		task.Status = "running"
+		task.StartedAt = time.Now().Format(time.RFC3339)
+		task.CompletedAt = ""
+		task.Result = &VerifyTaskResult{
+			Progress: 0,
+		}
+	}
+	verifyTasksMu.Unlock()
+
+	if !ok {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Verify task not found"})
+		return
+	}
+
+	log.Info("Verify task rerun started", map[string]interface{}{"task_id": id})
+
+	// 在后台运行校验任务
+	go runVerifyTask(task)
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+	})
+}
+
+// getMismatchDetailsHandler 获取不匹配详情
+func getMismatchDetailsHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
+	verifyTasksMu.RLock()
+	task, ok := verifyTasks[id]
+	verifyTasksMu.RUnlock()
+
+	if !ok {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Verify task not found"})
+		return
+	}
+
+	// 获取分页参数
+	limitStr := r.URL.Query().Get("limit")
+	offsetStr := r.URL.Query().Get("offset")
+	limit := 10000
+	offset := 0
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+	if offsetStr != "" {
+		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
+			offset = o
+		}
+	}
+
+	var details []map[string]interface{}
+	totalCount := 0
+
+	if task.Result != nil && task.Result.Details != nil {
+		totalCount = len(task.Result.Details)
+		end := offset + limit
+		if end > totalCount {
+			end = totalCount
+		}
+		if offset < totalCount {
+			for _, d := range task.Result.Details[offset:end] {
+				details = append(details, map[string]interface{}{
+					"key":          d.Key,
+					"type":         d.Type,
+					"source_value": d.SourceValue,
+					"target_value": d.TargetValue,
+					"source_ttl":   d.SourceTTL,
+					"target_ttl":   d.TargetTTL,
+				})
+			}
+		}
+	}
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+		"data": map[string]interface{}{
+			"total":   totalCount,
+			"limit":   limit,
+			"offset":  offset,
+			"details": details,
+		},
+	})
+}
+
+// downloadMismatchDetailsHandler 下载不匹配详情
+func downloadMismatchDetailsHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
+	verifyTasksMu.RLock()
+	task, ok := verifyTasks[id]
+	verifyTasksMu.RUnlock()
+
+	if !ok {
+		http.Error(w, "Verify task not found", http.StatusNotFound)
+		return
+	}
+
+	// 设置下载头
+	filename := fmt.Sprintf("verify_mismatch_%s.csv", id[:8])
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+
+	// 写入 BOM 以支持 Excel 正确识别 UTF-8
+	w.Write([]byte{0xEF, 0xBB, 0xBF})
+
+	// 写入 CSV 头
+	w.Write([]byte("Key,差异类型,缺失方,源端值,目标端值,源端TTL,目标端TTL\n"))
+
+	if task.Result != nil && task.Result.Details != nil {
+		for _, d := range task.Result.Details {
+			lackSide := ""
+			switch d.Type {
+			case "missing", "lack_target":
+				lackSide = "目标端缺失"
+			case "extra", "lack_source":
+				lackSide = "源端缺失"
+			}
+			
+			typeText := ""
+			switch d.Type {
+			case "missing":
+				typeText = "缺失"
+			case "extra":
+				typeText = "多余"
+			case "value_mismatch":
+				typeText = "值不匹配"
+			case "ttl_mismatch":
+				typeText = "TTL不匹配"
+			case "length_mismatch":
+				typeText = "长度不匹配"
+			case "lack_target":
+				typeText = "目标端缺失"
+			case "lack_source":
+				typeText = "源端缺失"
+			default:
+				typeText = d.Type
+			}
+
+			// 转义 CSV 字段
+			srcVal := escapeCSV(d.SourceValue)
+			tgtVal := escapeCSV(d.TargetValue)
+			keyVal := escapeCSV(d.Key)
+
+			line := fmt.Sprintf("%s,%s,%s,%s,%s,%d,%d\n",
+				keyVal, typeText, lackSide, srcVal, tgtVal, d.SourceTTL, d.TargetTTL)
+			w.Write([]byte(line))
+		}
+	}
+
+	log.Info("Mismatch details downloaded", map[string]interface{}{
+		"task_id": id,
+		"count":   len(task.Result.Details),
 	})
 }
 
@@ -12958,7 +13790,9 @@ func scanKeysFromNode(ctx context.Context, node *redis.Client, task *VerifyTask,
 			*scannedKeys++
 			// 根据采样率或全量模式决定是否采样
 			shouldSample := task.VerifyMode == "full" || rand.Float64() < task.SampleRate
-			if shouldSample && int64(len(*keysToVerify)) < task.MaxKeys {
+			// 全量校验模式不限制 MaxKeys
+			maxKeysReached := task.VerifyMode != "full" && int64(len(*keysToVerify)) >= task.MaxKeys
+			if shouldSample && !maxKeysReached {
 				// 检查 Key 过滤
 				if matchVerifyKeyFilter(key, task.KeyFilter) {
 					*keysToVerify = append(*keysToVerify, key)
@@ -12981,7 +13815,9 @@ func scanKeysFromNode(ctx context.Context, node *redis.Client, task *VerifyTask,
 		mu.Unlock()
 
 		cursor = newCursor
-		if cursor == 0 || int64(len(*keysToVerify)) >= task.MaxKeys {
+		// 全量校验模式不受 MaxKeys 限制，只有 cursor=0 时才退出
+		maxKeysLimit := task.VerifyMode != "full" && int64(len(*keysToVerify)) >= task.MaxKeys
+		if cursor == 0 || maxKeysLimit {
 			break
 		}
 	}
@@ -13015,7 +13851,9 @@ func scanKeysFromClient(ctx context.Context, client redis.Cmdable, task *VerifyT
 		for _, key := range keys {
 			*scannedKeys++
 			shouldSample := task.VerifyMode == "full" || rand.Float64() < task.SampleRate
-			if shouldSample && int64(len(*keysToVerify)) < task.MaxKeys {
+			// 全量校验模式不限制 MaxKeys
+			maxKeysReached := task.VerifyMode != "full" && int64(len(*keysToVerify)) >= task.MaxKeys
+			if shouldSample && !maxKeysReached {
 				if matchVerifyKeyFilter(key, task.KeyFilter) {
 					*keysToVerify = append(*keysToVerify, key)
 				}
@@ -13037,7 +13875,9 @@ func scanKeysFromClient(ctx context.Context, client redis.Cmdable, task *VerifyT
 		mu.Unlock()
 
 		cursor = newCursor
-		if cursor == 0 || int64(len(*keysToVerify)) >= task.MaxKeys {
+		// 全量校验模式不受 MaxKeys 限制
+		maxKeysLimit := task.VerifyMode != "full" && int64(len(*keysToVerify)) >= task.MaxKeys
+		if cursor == 0 || maxKeysLimit {
 			break
 		}
 	}

@@ -587,7 +587,13 @@ func getScanMatchPattern(filter *KeyFilter) string {
 
 	// 如果是 pattern 模式且只有一个模式，使用 SCAN MATCH
 	if filter.Mode == "pattern" && len(filter.Patterns) == 1 {
-		return "*" + filter.Patterns[0] + "*"
+		pattern := filter.Patterns[0]
+		// 如果 pattern 已经包含通配符，直接使用
+		if strings.Contains(pattern, "*") {
+			return pattern
+		}
+		// 否则，作为包含匹配
+		return "*" + pattern + "*"
 	}
 
 	// 其他情况：服务端无法完全过滤，返回 * 后在客户端过滤

@@ -196,16 +196,32 @@ func (m *Master) heartbeatLoop() {
 }
 
 // recoverTasks 恢复未完成的任务
+// 重要修复：自动恢复之前 running 的任务，而不是只标记为 paused
 func (m *Master) recoverTasks() error {
-	tasks, _, err := m.store.ListTasksWithFilter("running", 1, 100)
+	// 恢复之前 running 的任务
+	runningTasks, _, err := m.store.ListTasksWithFilter("running", 1, 100)
 	if err != nil {
 		return err
 	}
 
-	for _, task := range tasks {
-		log.Printf("Recovering task: %s", task.ID)
-		// 暂停任务，等待用户手动恢复
-		m.store.UpdateTaskStatus(task.ID, model.TaskStatusPaused)
+	// 也恢复之前 paused 但实际上应该 running 的任务（服务重启场景）
+	pausedTasks, _, err := m.store.ListTasksWithFilter("paused", 1, 100)
+	if err != nil {
+		log.Printf("Warning: list paused tasks failed: %v", err)
+	}
+
+	allTasks := append(runningTasks, pausedTasks...)
+
+	for _, task := range allTasks {
+		log.Printf("Recovering task: %s (previous status: %s)", task.ID, task.Status)
+		
+		// 重新启动任务（会自动从断点恢复）
+		if err := m.StartTask(task.ID); err != nil {
+			log.Printf("Warning: auto-recover task %s failed: %v, marking as paused", task.ID, err)
+			m.store.UpdateTaskStatus(task.ID, model.TaskStatusPaused)
+		} else {
+			log.Printf("Task %s auto-recovered successfully", task.ID)
+		}
 	}
 
 	return nil
@@ -243,7 +259,15 @@ func (m *Master) StartTask(taskID string) error {
 	}
 
 	if task.Status == model.TaskStatusRunning {
-		return fmt.Errorf("task already running")
+		// 检查 runner 是否真的在运行
+		m.tasksMu.RLock()
+		_, exists := m.tasks[taskID]
+		m.tasksMu.RUnlock()
+		if exists {
+			return fmt.Errorf("task already running")
+		}
+		// runner 不存在但状态是 running，说明上次崩溃了，继续启动
+		log.Printf("Task %s status is running but no runner found, restarting...", taskID)
 	}
 
 	// 更新状态

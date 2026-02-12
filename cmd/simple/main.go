@@ -1,13 +1,17 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -92,8 +96,42 @@ type Task struct {
 	// 内部字段（不序列化）
 	workerPool   *DynamicWorkerPool `json:"-"`
 	speedTracker *SpeedTracker      `json:"-"`  // 滑动窗口速度追踪器
+	// 集群拓扑健康告警（前端展示用）
+	TopologyWarnings []string `json:"topology_warnings,omitempty"`
+
 	fakeSlaves   []*replication.FakeSlave `json:"-"` // Binlog 接收器（每个节点一个）
 	cacheManager *replication.BinlogCacheManager `json:"-"` // Binlog 缓存管理器
+	stopCh       chan struct{} `json:"-"` // 任务停止通道（用于优雅停止迁移 goroutine）
+	stopOnce     sync.Once     `json:"-"` // 确保 stopCh 只关闭一次
+	startedTime  time.Time     `json:"-"` // 任务启动时间（用于启动冷却期检查）
+	cancelFunc   context.CancelFunc `json:"-"` // 【P1修复】任务级别 context 取消函数，用于从外部取消所有子 goroutine
+	
+	// 【死锁修复】任务级互斥锁，用于保护统计字段的高频更新
+	// 替代全局 tasksMu 的写锁，避免高频 ticker 与 HTTP handler 争抢全局锁导致死锁
+	statsMu sync.Mutex `json:"-"`
+}
+
+// Init 初始化/重置 Task 的运行时控制字段（stopCh、stopOnce、startedTime）。
+// 必须在 tasksMu 写锁内调用。
+// 场景：创建任务、启动任务、恢复任务、重启任务、自动恢复任务、从持久化恢复。
+func (t *Task) Init() {
+	t.stopCh = make(chan struct{})
+	t.stopOnce = sync.Once{}
+	t.startedTime = time.Now()
+}
+
+// Cleanup 安全停止 Task 的运行时控制（关闭 stopCh + 取消 context）。
+// 必须在 tasksMu 写锁内调用。
+// 场景：暂停、停止、删除任务、优雅关闭。
+func (t *Task) Cleanup() {
+	if t.stopCh != nil {
+		t.stopOnce.Do(func() {
+			close(t.stopCh)
+		})
+	}
+	if t.cancelFunc != nil {
+		t.cancelFunc()
+	}
 }
 
 // SpeedTracker 滑动窗口速度追踪器，用于计算实时速度
@@ -231,6 +269,7 @@ type TaskOptions struct {
 	SmartRetry           *SmartRetryConfig     `json:"smart_retry,omitempty"`      // 问题5修复：智能重试配置
 	VerifyConfig         *VerifyConfig         `json:"verify_config,omitempty"`    // 数据校验配置
 	KeyListFile          string                `json:"key_list_file,omitempty"`    // Key 清单文件路径（支持 CSV/JSON/TXT）
+	ReadFromSlave        bool                  `json:"read_from_slave"`            // 从 slave 节点读取数据（生产环境推荐，避免影响 master）
 }
 
 // VerifyConfig 数据校验配置
@@ -693,6 +732,10 @@ var (
 	templateMu sync.RWMutex
 	errorKeys  = make(map[string][]ErrorKey) // taskID -> error keys
 	errorKeyMu sync.RWMutex
+	// 【BUG-FIX】已从错误列表中移除的 Key 集合（重试成功后添加）
+	// 用于在 getAllErrorKeys 读取落盘文件时过滤掉已成功重试的 Key
+	removedErrorKeys   = make(map[string]map[string]bool) // taskID -> set of removed keys
+	removedErrorKeysMu sync.RWMutex
 	startTime  time.Time
 	dataDir    = "./data" // 数据目录，可通过命令行参数修改
 	
@@ -746,6 +789,7 @@ type FullSyncCheckpoint struct {
 	StartTime        string            `json:"start_time"`
 	UpdatedAt        string            `json:"updated_at"`
 	IsComplete       bool              `json:"is_complete"`        // 全量是否完成
+	mu               sync.RWMutex      `json:"-"`                  // 【BUG-FIX】保护 NodeCursors 的并发访问
 }
 
 // ConsecutiveFailureTracker 连续失败追踪器
@@ -877,8 +921,9 @@ func pauseAllRunningTasks() {
 	for _, task := range tasks {
 		if task.Status == "running" || task.Status == "retrying" {
 			task.Status = "paused"
-			task.PausedAt = now.Format(time.RFC3339)  // 记录暂停时间
+			task.PausedAt = now.Format(time.RFC3339)
 			task.UpdatedAt = now.Format(time.RFC3339)
+			task.Cleanup() // 统一清理运行时控制字段
 			pausedCount++
 			logger.Info("Task paused for shutdown", map[string]interface{}{
 				"task_id":   task.ID,
@@ -897,18 +942,20 @@ func pauseAllRunningTasks() {
 
 // saveAllFullSyncCheckpoints 保存所有全量同步断点
 func saveAllFullSyncCheckpoints() {
-	fullSyncCheckpointsMu.RLock()
-	defer fullSyncCheckpointsMu.RUnlock()
-
+	// 【审计修复】使用写锁（之前用 RLock 但修改了 UpdatedAt 字段，且 MarshalIndent 遍历 NodeCursors 需要内部锁保护）
+	fullSyncCheckpointsMu.Lock()
+	checkpointDir := "./data/checkpoints"
+	os.MkdirAll(checkpointDir, 0755)
 	for taskID, checkpoint := range fullSyncCheckpoints {
 		if checkpoint != nil {
+			checkpoint.mu.RLock()
 			checkpoint.UpdatedAt = time.Now().Format(time.RFC3339)
-			checkpointDir := "./data/checkpoints"
-			os.MkdirAll(checkpointDir, 0755)
 			data, _ := json.MarshalIndent(checkpoint, "", "  ")
+			checkpoint.mu.RUnlock()
 			os.WriteFile(fmt.Sprintf("%s/full-%s.json", checkpointDir, taskID), data, 0644)
 		}
 	}
+	fullSyncCheckpointsMu.Unlock()
 }
 
 // saveAllIncrementalCheckpoints 保存所有增量同步断点
@@ -954,7 +1001,9 @@ func initDataDirectories() {
 	}
 }
 
-// recoverUnfinishedTasks 恢复未完成的任务
+// recoverUnfinishedTasks 恢复所有持久化的任务
+// 之前运行中的任务恢复为 paused 状态（需用户手动 resume）
+// 已完成/失败/停止的任务原样恢复，不丢失历史记录
 func recoverUnfinishedTasks() {
 	// 从文件加载持久化的任务状态
 	tasksFile := "./data/tasks-state.json"
@@ -971,42 +1020,67 @@ func recoverUnfinishedTasks() {
 	}
 
 	recoveredCount := 0
+	resumableCount := 0
 	for id, savedTask := range savedTasks {
-		// 只恢复之前正在运行的任务
-		if savedTask.Status == "running" || savedTask.Status == "paused" || savedTask.Status == "retrying" {
-			// 创建新任务对象
-			task := &Task{
-				ID:             savedTask.ID,
-				Name:           savedTask.Name,
-				Status:         "paused", // 恢复后设为暂停状态，需要用户手动启动
-				Progress:       savedTask.Progress,
-				SourceCluster:  savedTask.SourceCluster,
-				TargetCluster:  savedTask.TargetCluster,
-				SourcePassword: savedTask.SourcePassword,
-				TargetPassword: savedTask.TargetPassword,
-				MigrationMode:  savedTask.MigrationMode,
-				CreatedAt:      savedTask.CreatedAt,
-				UpdatedAt:      time.Now().Format(time.RFC3339),
-				StartedAt:      savedTask.StartedAt,
-				FullStartAt:    savedTask.FullStartAt,
-				IncrStartAt:    savedTask.IncrStartAt,
-				KeysTotal:      savedTask.KeysTotal,
-				KeysToMigrate:  savedTask.KeysToMigrate,  // 【新增】恢复待迁移Key数
-				KeysMigrated:   savedTask.KeysMigrated,
-				KeysFailed:     savedTask.KeysFailed,
-				KeysSkipped:    savedTask.KeysSkipped,
-				KeysFiltered:   savedTask.KeysFiltered,
-				BytesMigrated:  savedTask.BytesMigrated,
-				BytesTotal:     savedTask.BytesTotal,
-				Phase:          savedTask.Phase,
-				Options:        savedTask.Options,
-			}
+		// 确定恢复后的状态
+		recoveredStatus := savedTask.Status
+		isResumable := false
+		if savedTask.Status == "running" || savedTask.Status == "retrying" {
+			// 之前运行中的任务恢复为 paused，等待用户手动恢复
+			recoveredStatus = "paused"
+			isResumable = true
+			resumableCount++
+		}
 
-			tasksMu.Lock()
-			tasks[id] = task
-			tasksMu.Unlock()
+		// 创建新任务对象
+		task := &Task{
+			ID:             savedTask.ID,
+			Name:           savedTask.Name,
+			Status:         recoveredStatus,
+			Progress:       savedTask.Progress,
+			SourceCluster:  savedTask.SourceCluster,
+			TargetCluster:  savedTask.TargetCluster,
+			SourcePassword: savedTask.SourcePassword,
+			TargetPassword: savedTask.TargetPassword,
+			MigrationMode:  savedTask.MigrationMode,
+			CreatedAt:      savedTask.CreatedAt,
+			UpdatedAt:      time.Now().Format(time.RFC3339),
+			StartedAt:      savedTask.StartedAt,
+			FullStartAt:    savedTask.FullStartAt,
+			IncrStartAt:    savedTask.IncrStartAt,
+			CompletedAt:    savedTask.CompletedAt,
+			PausedAt:       savedTask.PausedAt,
+			PausedDuration: savedTask.PausedDuration,
+			KeysTotal:      savedTask.KeysTotal,
+			KeysToMigrate:  savedTask.KeysToMigrate,
+			KeysMigrated:   savedTask.KeysMigrated,
+			KeysFailed:     savedTask.KeysFailed,
+			KeysSkipped:    savedTask.KeysSkipped,
+			KeysFiltered:   savedTask.KeysFiltered,
+			BytesMigrated:  savedTask.BytesMigrated,
+			BytesTotal:     savedTask.BytesTotal,
+			Phase:          savedTask.Phase,
+			Speed:          savedTask.Speed,
+			ActiveWorkers:  savedTask.ActiveWorkers,
+			IncrKeysSynced:   savedTask.IncrKeysSynced,
+			IncrKeysSkipped:  savedTask.IncrKeysSkipped,
+			IncrKeysFailed:   savedTask.IncrKeysFailed,
+			IncrKeysFiltered: savedTask.IncrKeysFiltered,
+			IncrBinlogPos:    savedTask.IncrBinlogPos,
+			IncrLagMs:        savedTask.IncrLagMs,
+			IncrHeartbeats:   savedTask.IncrHeartbeats,
+			IncrReconnects:   savedTask.IncrReconnects,
+			IncrSyncMode:     savedTask.IncrSyncMode,
+			Options:        savedTask.Options,
+		}
+		task.Init() // 统一初始化运行时控制字段
 
-			// 恢复错误 key 列表
+		tasksMu.Lock()
+		tasks[id] = task
+		tasksMu.Unlock()
+
+		// 对可恢复的任务，加载错误 key 和断点
+		if isResumable || savedTask.Status == "paused" {
 			if keys := loadErrorKeysFromFile(id); keys != nil {
 				logger.Info("Error keys recovered", map[string]interface{}{
 					"task_id":    id,
@@ -1014,7 +1088,6 @@ func recoverUnfinishedTasks() {
 				})
 			}
 
-			// 加载全量同步断点
 			if checkpoint := loadFullSyncCheckpoint(id); checkpoint != nil {
 				logger.Info("Full sync checkpoint loaded", map[string]interface{}{
 					"task_id":        id,
@@ -1024,43 +1097,49 @@ func recoverUnfinishedTasks() {
 				})
 			}
 
-			// 加载增量同步断点
 			if checkpoint := loadIncrementalCheckpoint(id); checkpoint != nil {
 				logger.Info("Incremental checkpoint loaded", map[string]interface{}{
 					"task_id":     id,
 					"synced_keys": checkpoint.SyncedKeys,
 				})
 			}
-
-			recoveredCount++
-			logger.Info("Task recovered", map[string]interface{}{
-				"task_id":         id,
-				"task_name":       task.Name,
-				"previous_status": savedTask.Status,
-				"progress":        task.Progress,
-				"phase":           task.Phase,
-			})
+		} else {
+			// 对已完成/失败的任务，也加载错误 key（用于查看历史）
+			loadErrorKeysFromFile(id)
 		}
+
+		recoveredCount++
+		logger.Info("Task recovered", map[string]interface{}{
+			"task_id":         id,
+			"task_name":       task.Name,
+			"previous_status": savedTask.Status,
+			"recovered_status": recoveredStatus,
+			"progress":        task.Progress,
+			"phase":           task.Phase,
+		})
 	}
 
 	if recoveredCount > 0 {
 		logger.Info("Tasks recovery completed", map[string]interface{}{
-			"recovered_count": recoveredCount,
-			"message":         "Recovered tasks are paused. Use resume API to continue.",
+			"total_recovered":  recoveredCount,
+			"resumable_count":  resumableCount,
+			"message":          "Previously running tasks are paused. Use resume API to continue.",
 		})
 	}
 }
 
 // saveTasksState 保存任务状态到文件
+// 保存所有任务（包括 completed/failed/stopped），确保重启后不丢失
 func saveTasksState() {
 	tasksMu.RLock()
 	tasksToSave := make(map[string]*Task)
-	taskIDs := make([]string, 0)
+	activeTaskIDs := make([]string, 0)
 	for id, task := range tasks {
-		// 只保存运行中、暂停或重试中的任务
+		// 保存所有非 pending 状态的任务（pending 由模板创建，不需要持久化）
+		tasksToSave[id] = task
+		// 只对运行中/暂停/重试中的任务保存错误 key
 		if task.Status == "running" || task.Status == "paused" || task.Status == "retrying" {
-			tasksToSave[id] = task
-			taskIDs = append(taskIDs, id)
+			activeTaskIDs = append(activeTaskIDs, id)
 		}
 	}
 	tasksMu.RUnlock()
@@ -1080,8 +1159,8 @@ func saveTasksState() {
 		logger.Warn("Failed to save tasks state", map[string]interface{}{"error": err.Error()})
 	}
 
-	// 同时保存所有任务的错误 key
-	for _, id := range taskIDs {
+	// 保存活跃任务的错误 key
+	for _, id := range activeTaskIDs {
 		saveErrorKeysToFile(id)
 	}
 }
@@ -1113,13 +1192,25 @@ func startPeriodicStateSave() {
 }
 
 func mainHandler(w http.ResponseWriter, r *http.Request) {
+	// 【死锁修复】全局 panic recovery，防止 handler 中 panic 导致 tasksMu 锁不释放
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Error("HTTP handler panic recovered", map[string]interface{}{
+				"panic":  fmt.Sprintf("%v", rec),
+				"method": r.Method,
+				"path":   r.URL.Path,
+			})
+			http.Error(w, fmt.Sprintf(`{"code":500,"message":"Internal server error: %v"}`, rec), http.StatusInternalServerError)
+		}
+	}()
+
 	// 生成请求ID
 	requestID := uuid.New().String()
 	startTime := time.Now()
 	
 	// CORS
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")  // 【BUG-FIX】添加 PATCH
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("X-Request-ID", requestID)
 	
@@ -1211,8 +1302,11 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/assets/"):
 		http.FileServer(http.Dir("./web/dist")).ServeHTTP(rw, r)
 		
-	// SPA 入口
+	// SPA 入口（禁止缓存 index.html，确保每次加载最新版本）
 	default:
+		rw.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		rw.Header().Set("Pragma", "no-cache")
+		rw.Header().Set("Expires", "0")
 		http.ServeFile(rw, r, "./web/dist/index.html")
 	}
 
@@ -1247,6 +1341,38 @@ func jsonResponse(w http.ResponseWriter, data interface{}) {
 func initDemoData() {
 	// 预置模板任务
 	now := time.Now().Format("2006-01-02 15:04:05")
+	
+	// 模拟生产 A - 高性能配置（512 workers, 5000 scan batch, 1536 connections）
+	templates["template-prod-a"] = &TaskTemplate{
+		ID:            "template-prod-a",
+		Name:          "模拟生产A-02112204",
+		Description:   "高性能配置：512 workers, 5000 scan batch, 1536 connections，适合大规模生产环境迁移",
+		SourceCluster: "10.31.36.8:8902,10.31.36.10:8903,10.31.36.12:8901",
+		TargetCluster: "10.31.36.3:8902,10.31.36.15:8901,10.31.36.13:8903",
+		MigrationMode: "full_and_incremental",
+		Options: &TaskOptions{
+			WorkerCount:       512,
+			ScanBatchSize:     5000,
+			ConflictPolicy:    "skip",
+			LargeKeyThreshold: 10485760, // 10MB
+			KeyFilter: &KeyFilter{
+				Mode: "all",
+			},
+			RateLimit: &RateLimit{
+				SourceQPS:         0,
+				TargetQPS:         0,
+				SourceConnections: 1536,
+				TargetConnections: 1536,
+			},
+			RetryConfig: &RetryConfig{
+				MaxRetries:          3,
+				FullRetryIntervalMs: 100,
+				IncrRetryIntervalMs: 1000,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
 	
 	// 测试环境 A - 主从模式集群
 	templates["template-env-a"] = &TaskTemplate{
@@ -2147,12 +2273,10 @@ func createTaskHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 		Phase:          "full",
 		Options:        options,
 	}
+	task.Init() // 统一初始化运行时控制字段
 
 	tasksMu.Lock()
 	tasks[task.ID] = task
-	
-	// 保留最近3个任务，清理旧任务
-	cleanupOldTasks()
 	tasksMu.Unlock()
 
 	log.Info("Task created", map[string]interface{}{
@@ -2176,39 +2300,8 @@ func createTaskHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 	})
 }
 
-// cleanupOldTasks 清理旧任务，保留最近3个（必须在tasksMu锁内调用）
-func cleanupOldTasks() {
-	const maxTasks = 3
-	if len(tasks) <= maxTasks {
-		return
-	}
-	
-	// 获取所有任务并按创建时间排序
-	taskList := make([]*Task, 0, len(tasks))
-	for _, t := range tasks {
-		taskList = append(taskList, t)
-	}
-	sort.Slice(taskList, func(i, j int) bool {
-		return taskList[i].CreatedAt > taskList[j].CreatedAt // 降序，最新在前
-	})
-	
-	// 删除超出限制的旧任务
-	for i := maxTasks; i < len(taskList); i++ {
-		oldTask := taskList[i]
-		// 如果任务正在运行，跳过
-		if oldTask.Status == "running" {
-			continue
-		}
-		// 清理该任务的日志
-		logger.Default().ClearTaskLogs(oldTask.ID)
-		// 删除任务
-		delete(tasks, oldTask.ID)
-		logger.Default().Info("Old task cleaned up", map[string]interface{}{
-			"task_id":   oldTask.ID,
-			"task_name": oldTask.Name,
-		})
-	}
-}
+// 注意：已移除 cleanupOldTasks 自动清理逻辑
+// 任务只能由用户手动删除，不再自动删除任何任务
 
 func taskHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/tasks/")
@@ -2233,6 +2326,8 @@ func taskHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogg
 	case action == "" && r.Method == "DELETE":
 		deleteTaskHandler(w, r, id, log, taskLog)
 	case action == "config" && r.Method == "PUT":
+		updateTaskConfigHandler(w, r, id, log, taskLog)
+	case action == "config" && r.Method == "PATCH":  // 【BUG-FIX】添加 PATCH 方法支持
 		updateTaskConfigHandler(w, r, id, log, taskLog)
 	case action == "start" && r.Method == "POST":
 		startTaskHandler(w, r, id, log, taskLog)
@@ -2274,6 +2369,8 @@ func taskHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogg
 		stopIncrementalHandler(w, r, id, log, taskLog)
 	case action == "complete" && r.Method == "POST":
 		completeTaskHandler(w, r, id, log, taskLog)
+	case action == "preflight-check" && r.Method == "POST":
+		preflightCheckHandler(w, r, id, log)
 	case action == "metrics" && r.Method == "GET":
 		taskMetricsHandler(w, r, id, log)
 	case action == "conflicts" && r.Method == "GET":
@@ -2420,6 +2517,8 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 			"incr_heartbeats":    task.IncrHeartbeats,
 			"incr_reconnects":    task.IncrReconnects,
 			"incr_sync_mode":     task.IncrSyncMode,
+			// 集群拓扑告警
+			"topology_warnings":  task.TopologyWarnings,
 			// P2 改进：详细进度指标
 			"detailed_progress": detailedProgress,
 		},
@@ -2591,8 +2690,24 @@ func calculateElapsedTime(task *Task) string {
 
 func deleteTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger, taskLog *logger.TaskLogger) {
 	tasksMu.Lock()
-	delete(tasks, id)
+	task, ok := tasks[id]
+	if ok {
+		// 删除前停止 running/paused 的任务，防止僵尸 goroutine
+		if task.Status == "running" || task.Status == "paused" {
+			task.Cleanup() // 统一清理运行时控制字段
+			task.Status = "stopped"
+		}
+		delete(tasks, id)
+	}
 	tasksMu.Unlock()
+	
+	if !ok {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Task not found"})
+		return
+	}
+	
+	// 删除任务时同步清理该任务的日志
+	logger.Default().ClearTaskLogs(id)
 	
 	log.Info("Task deleted", map[string]interface{}{"task_id": id})
 	taskLog.Info("Task deleted")
@@ -2660,11 +2775,26 @@ func updateTaskConfigHandler(w http.ResponseWriter, r *http.Request, id string, 
 	if task.workerPool != nil {
 		currentActive := task.workerPool.GetActiveWorkerCount()
 		if oldWorkerCount != task.Options.WorkerCount {
+			// 【BUG-FIX】实际调用 SetWorkerCount 使变更生效
+			task.workerPool.SetWorkerCount(task.Options.WorkerCount)
+			
 			if task.Options.WorkerCount > oldWorkerCount {
 				adjustMsg = fmt.Sprintf("increasing workers from %d to %d (current active: %d)", oldWorkerCount, task.Options.WorkerCount, currentActive)
 			} else {
 				adjustMsg = fmt.Sprintf("decreasing workers from %d to %d gracefully (current active: %d)", oldWorkerCount, task.Options.WorkerCount, currentActive)
 			}
+			
+			taskLog.Info("Workers dynamically adjusted", map[string]interface{}{
+				"old_count":      oldWorkerCount,
+				"new_count":      task.Options.WorkerCount,
+				"current_active": currentActive,
+			})
+		}
+		
+		// 【BUG-FIX】动态更新限速器
+		if req.RateLimit != nil {
+			task.workerPool.UpdateRateLimiter(req.RateLimit.SourceQPS)
+			task.workerPool.UpdateTargetRateLimiter(req.RateLimit.TargetQPS)
 		}
 	}
 	
@@ -2705,17 +2835,27 @@ func startTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *lo
 		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Task not found"})
 		return
 	}
-	
+	// 【审计修复】只有 pending 状态才能启动，防止重复启动
+	if task.Status != "pending" {
+		currentStatus := task.Status
+		tasksMu.Unlock()
+		jsonResponse(w, map[string]interface{}{
+			"code":    400,
+			"message": fmt.Sprintf("Task cannot be started (current status: %s, expected: pending)", currentStatus),
+		})
+		return
+	}
+	// 初始化运行时控制字段
+	task.Init()
 	task.Status = "running"
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
 	task.StartedAt = time.Now().Format("2006-01-02 15:04:05")
-	go simulateProgress(task)
 	tasksMu.Unlock()
+
+	go simulateProgress(task)
 	
 	log.Info("Task started", map[string]interface{}{"task_id": id})
-	taskLog.Info("Task started", map[string]interface{}{
-		"keys_total": task.KeysTotal,
-	})
+	taskLog.Info("Task started", nil)
 	
 	jsonResponse(w, map[string]interface{}{"code": 0, "message": "success"})
 }
@@ -2749,13 +2889,20 @@ func pauseTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *lo
 	now := time.Now()
 	task.PausedAt = now.Format(time.RFC3339)  // 记录暂停时间
 	task.UpdatedAt = now.Format(time.RFC3339)
+	task.Cleanup() // 统一清理运行时控制字段
 	tasksMu.Unlock()
 	
-	log.Info("Task paused", map[string]interface{}{"task_id": id})
-	taskLog.Info("【BUG-4 FIX】Task paused successfully", map[string]interface{}{
-		"progress":  task.Progress,
-		"paused_at": task.PausedAt,
-		"phase":     task.Phase,
+	// 【关键修复】用户手动暂停时，禁用自动恢复
+	// 只有 autoStopTask（因连续失败自动暂停）才应该触发自动恢复
+	// 否则 autoRecoveryLoop 会在几秒后自动恢复任务，违背用户意愿
+	disableAutoRecoveryForTask(task.ID)
+	
+	log.Info("Task paused by user (auto-recovery disabled)", map[string]interface{}{"task_id": id})
+	taskLog.Info("Task paused by user", map[string]interface{}{
+		"progress":          task.Progress,
+		"paused_at":         task.PausedAt,
+		"phase":             task.Phase,
+		"auto_recovery":     "disabled",
 	})
 	
 	jsonResponse(w, map[string]interface{}{"code": 0, "message": "success"})
@@ -2764,33 +2911,57 @@ func pauseTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *lo
 func resumeTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger, taskLog *logger.TaskLogger) {
 	tasksMu.Lock()
 	task, ok := tasks[id]
-	if ok {
-		// 计算本次暂停的时长并累加
-		if task.PausedAt != "" {
-			loc := time.Local
-			pausedTime, err := time.ParseInLocation(time.RFC3339, task.PausedAt, loc)
-			if err != nil {
-				pausedTime, _ = time.ParseInLocation("2006-01-02 15:04:05", task.PausedAt, loc)
-			}
-			if !pausedTime.IsZero() {
-				pausedSeconds := int64(time.Since(pausedTime).Seconds())
-				task.PausedDuration += pausedSeconds  // 累计暂停时长
-			}
-		}
-		task.Status = "running"
-		task.PausedAt = ""  // 清空暂停时间
-		task.UpdatedAt = time.Now().Format(time.RFC3339)
-		go simulateProgress(task)
+	if !ok {
+		tasksMu.Unlock()
+		log.Warn("Task not found for resume", map[string]interface{}{"task_id": id})
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Task not found"})
+		return
 	}
-	tasksMu.Unlock()
-	
-	if ok {
-		log.Info("Task resumed", map[string]interface{}{"task_id": id})
-		taskLog.Info("Task resumed", map[string]interface{}{
-			"paused_duration": task.PausedDuration,
+	// 【审计修复】只有 paused 状态才能恢复，防止对 running/completed/failed 任务误操作
+	if task.Status != "paused" {
+		currentStatus := task.Status
+		tasksMu.Unlock()
+		jsonResponse(w, map[string]interface{}{
+			"code":    400,
+			"message": fmt.Sprintf("Task is not paused (current status: %s)", currentStatus),
 		})
+		return
 	}
+	// 计算本次暂停的时长并累加
+	if task.PausedAt != "" {
+		loc := time.Local
+		pausedTime, err := time.ParseInLocation(time.RFC3339, task.PausedAt, loc)
+		if err != nil {
+			pausedTime, _ = time.ParseInLocation("2006-01-02 15:04:05", task.PausedAt, loc)
+		}
+		if !pausedTime.IsZero() {
+			pausedSeconds := int64(time.Since(pausedTime).Seconds())
+			task.PausedDuration += pausedSeconds
+		}
+	}
+	// 重新初始化运行时控制字段
+	task.Init()
+	task.Status = "running"
+	task.PausedAt = ""
+	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	pausedDuration := task.PausedDuration
 	
+	// 【核心设计】恢复任务时不重置任何计数器
+	// task.KeysMigrated/KeysFailed/KeysSkipped 等保留历史累积值
+	// doFullMigration 中 worker 直接通过原子操作递增 task 字段
+	// 暂停恢复后自然在原来数字上继续累加
+	tasksMu.Unlock()
+
+	// 【注意】不清空 errorKeys 内存列表
+	// errorKeys 保留了之前的失败记录，恢复后如果产生新的失败会继续追加
+	// task.KeysFailed 始终是准确的总量（worker 直接原子递增/递减）
+
+	go simulateProgress(task)
+	
+	log.Info("Task resumed", map[string]interface{}{"task_id": id})
+	taskLog.Info("Task resumed", map[string]interface{}{
+		"paused_duration": pausedDuration,
+	})
 	jsonResponse(w, map[string]interface{}{"code": 0, "message": "success"})
 }
 
@@ -3899,7 +4070,56 @@ func simulateProgress(task *Task) {
 	taskLog := logger.WithTask(task.ID)
 	taskLog.Info("Migration started - connecting to clusters")
 
-	ctx := context.Background()
+	// 【BUG-FIX】panic recover 保护：确保 defer sourceClient.Close() 等清理代码一定执行
+	// 场景：FakeSlave.Stop() double-close panic → 跳过后续 defer → 连接泄漏 → 僵尸连接
+	defer func() {
+		if r := recover(); r != nil {
+			taskLog.Error("【PANIC RECOVERED】simulateProgress panic", map[string]interface{}{
+				"panic": fmt.Sprintf("%v", r),
+			})
+			tasksMu.Lock()
+			if task.Status == "running" {
+				task.Status = "paused"
+				task.UpdatedAt = time.Now().Format(time.RFC3339)
+			}
+			tasksMu.Unlock()
+		}
+	}()
+
+	// 【P0-BUG FIX】防御性检查：如果 stopCh 为 nil 或已关闭，必须重新初始化
+	tasksMu.Lock()
+	needNewStopCh := task.stopCh == nil
+	if !needNewStopCh {
+		select {
+		case <-task.stopCh:
+			needNewStopCh = true
+		default:
+		}
+	}
+	if needNewStopCh {
+		task.Init()
+		taskLog.Info("Re-initialized task control fields (stopCh was nil or closed)")
+	}
+	if task.startedTime.IsZero() {
+		task.startedTime = time.Now()
+	}
+	tasksMu.Unlock()
+	
+	taskLog.Info("【BUG-FIX】Task initialized with stopCh and startedTime", map[string]interface{}{
+		"started_time":           task.startedTime.Format(time.RFC3339),
+		"startup_cooldown_secs": StartupCooldownSeconds,
+	})
+
+	// 【P1修复】使用可取消的 context 替代 context.Background()
+	// 这样暂停/停止时可以通过 task.cancelFunc() 取消整个 context 树，
+	// 包括集群拓扑刷新 goroutine、binlogCtx 等所有子 context，防止 goroutine 泄漏
+	ctx, ctxCancel := context.WithCancel(context.Background())
+	defer ctxCancel() // simulateProgress 退出时确保清理
+
+	// 保存 cancel 函数到 task，让外部 handler 也能取消
+	tasksMu.Lock()
+	task.cancelFunc = ctxCancel
+	tasksMu.Unlock()
 
 	// ==================== P0-BUG1 修复：检查是否需要跳过全量阶段 ====================
 	// 如果任务恢复时已经处于增量阶段，则直接跳过全量迁移
@@ -3953,13 +4173,20 @@ func simulateProgress(task *Task) {
 		}
 	}
 
+	// 源端是否从 slave 读取
+	readFromSlave := false
+	if task.Options != nil && task.Options.ReadFromSlave {
+		readFromSlave = true
+	}
+
 	taskLog.Info("Connection pool config", map[string]interface{}{
-		"source_pool_size": sourcePoolSize,
-		"target_pool_size": targetPoolSize,
+		"source_pool_size":  sourcePoolSize,
+		"target_pool_size":  targetPoolSize,
+		"read_from_slave":   readFromSlave,
 	})
 
-	// 尝试连接源端（使用配置的连接池大小）
-	sourceClient, sourceIsCluster, err := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, sourcePoolSize)
+	// 尝试连接源端（使用配置的连接池大小，支持从 slave 读取）
+	sourceClient, sourceIsCluster, err := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, sourcePoolSize, readFromSlave)
 	if err != nil {
 		taskLog.Error("Failed to connect source cluster", map[string]interface{}{"error": err.Error()})
 		tasksMu.Lock()
@@ -3970,8 +4197,8 @@ func simulateProgress(task *Task) {
 	}
 	defer sourceClient.Close()
 
-	// 尝试连接目标端（使用配置的连接池大小）
-	targetClient, targetIsCluster, err := connectRedisWithPoolSize(ctx, targetAddrs, task.TargetPassword, targetPoolSize)
+	// 尝试连接目标端（目标端始终走 master，因为要写入数据）
+	targetClient, targetIsCluster, err := connectRedisWithPoolSize(ctx, targetAddrs, task.TargetPassword, targetPoolSize, false)
 	if err != nil {
 		taskLog.Error("Failed to connect target cluster", map[string]interface{}{"error": err.Error()})
 		tasksMu.Lock()
@@ -3987,6 +4214,63 @@ func simulateProgress(task *Task) {
 		"target_mode": map[bool]string{true: "cluster", false: "standalone"}[targetIsCluster],
 	})
 
+	// ==================== 集群拓扑验证和刷新 ====================
+	// 【BUG-FIX】验证集群拓扑是否健康，避免 `:0` 节点导致连接失败
+	if targetIsCluster {
+		if clusterClient, ok := targetClient.(*redis.ClusterClient); ok {
+			// 1. 强制刷新集群拓扑（避免使用缓存的错误拓扑）
+			taskLog.Info("Refreshing target cluster topology...")
+			clusterClient.ReloadState(ctx) // ReloadState 返回 void
+			taskLog.Info("Target cluster topology refreshed successfully")
+			
+			// 2. 验证集群拓扑（检查是否有无效节点如 `:0`）
+			// 目标集群始终走 master（写入），所以 readFromSlave=false
+			if err := validateClusterTopology(ctx, clusterClient, taskLog, false); err != nil {
+				taskLog.Error("⚠️ Target cluster topology validation failed", map[string]interface{}{
+					"error": err.Error(),
+				})
+				// 不中断任务，记录告警到任务状态，前端展示
+				tasksMu.Lock()
+				task.TopologyWarnings = append(task.TopologyWarnings, "目标集群: "+err.Error())
+				tasksMu.Unlock()
+			}
+			
+			// 3. 启动定期刷新机制（每30秒刷新一次，防止拓扑变化）
+			go func() {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				
+				for {
+					select {
+					case <-ticker.C:
+						clusterClient.ReloadState(ctx) // ReloadState 返回 void
+						taskLog.Debug("Periodic cluster topology reload succeeded")
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+		}
+	}
+	
+	// 同样处理源集群
+	if sourceIsCluster {
+		if clusterClient, ok := sourceClient.(*redis.ClusterClient); ok {
+			taskLog.Info("Refreshing source cluster topology...")
+			clusterClient.ReloadState(ctx) // ReloadState 返回 void
+			
+			if err := validateClusterTopology(ctx, clusterClient, taskLog, readFromSlave); err != nil {
+				taskLog.Warn("⚠️ Source cluster topology validation failed", map[string]interface{}{
+					"error": err.Error(),
+				})
+				// 记录告警到任务状态
+				tasksMu.Lock()
+				task.TopologyWarnings = append(task.TopologyWarnings, "源集群: "+err.Error())
+				tasksMu.Unlock()
+			}
+		}
+	}
+
 	// ==================== 时间差校准检测 ====================
 	// 检测源端和目标端的时间差，用于 TTL 精度告警
 	checkClusterTimeSkew(ctx, sourceClient, targetClient, taskLog)
@@ -4001,17 +4285,41 @@ func simulateProgress(task *Task) {
 		})
 	}
 
-	// 获取源端Key总数
-	totalKeys, err := getDBSize(ctx, sourceClient, sourceIsCluster)
+	// 获取源端Key总数（带超时：小集群快速返回，大集群超时跳过）
+	// 外层 30 秒总超时 + 每个节点 10 秒单独超时
+	// 超时后 totalKeys = -1，KeysTotal 由后续 SCAN 动态累加
+	dbSizeCtx, dbSizeCancel := context.WithTimeout(ctx, 30*time.Second)
+	totalKeys, err := getDBSize(dbSizeCtx, sourceClient, sourceIsCluster)
+	dbSizeCancel()
+	
 	if err != nil {
-		taskLog.Warn("Failed to get source DB size, using estimate", map[string]interface{}{"error": err.Error()})
-		totalKeys = 10000 // 默认估算值
+		taskLog.Warn("DBSIZE timeout or failed, will use SCAN to track progress", map[string]interface{}{
+			"error": err.Error(),
+			"note":  "This is normal for large clusters. KeysTotal will be tracked by SCAN progress.",
+		})
+		totalKeys = -1
+	} else if totalKeys == 0 {
+		taskLog.Warn("DBSIZE returned 0 (may be inaccurate for Tendis), treating as unknown", map[string]interface{}{
+			"note": "KeysTotal will be tracked by SCAN progress",
+		})
+		totalKeys = -1
+	} else {
+		taskLog.Info("Source cluster total keys (from DBSIZE)", map[string]interface{}{
+			"total_keys": totalKeys,
+		})
 	}
 
 	// ==================== P2-BUG4 修复: 只在首次设置 FullStartAt ====================
 	tasksMu.Lock()
-	task.KeysTotal = totalKeys
-	task.BytesTotal = totalKeys * 256 // 估算平均每个key 256 bytes
+	// KeysTotal 初始化策略：
+	// 1. 首次启动（KeysTotal == 0）且 DBSIZE 有效 → 用 DBSIZE 初始化（小集群快速展示进度）
+	// 2. 恢复任务（KeysTotal > 0）→ 不覆盖，保留之前 SCAN 动态累加的准确值
+	// 3. DBSIZE 超时/失败（totalKeys == -1）→ 不设置，由 SCAN 过程动态累加
+	// 4. 后续 ticker 中 totalToMigrate > KeysTotal 时会自动调大
+	if task.KeysTotal == 0 && totalKeys > 0 {
+		task.KeysTotal = totalKeys
+		task.BytesTotal = totalKeys * 256
+	}
 	// 【P2-BUG4 修复】只在 FullStartAt 为空时设置，避免恢复时覆盖原始时间
 	if task.FullStartAt == "" && !shouldSkipFullSync {
 		task.FullStartAt = time.Now().Format("2006-01-02 15:04:05")
@@ -4035,7 +4343,17 @@ func simulateProgress(task *Task) {
 	// 【P0-BUG1 修复】合并配置和自动检测的跳过逻辑
 	actualSkipFullSync := skipFullSyncConfig || shouldSkipFullSync
 	skipIncremental := task.Options != nil && task.Options.SkipIncremental
-	needIncremental := !skipIncremental && task.MigrationMode == "full_and_incremental"
+	
+	// 【BUG-FIX】支持 migration_mode: "incremental" 纯增量模式
+	// - "full_only": 只做全量迁移
+	// - "full_and_incremental": 全量+增量迁移
+	// - "incremental": 纯增量迁移（跳过全量，直接启动 FakeSlave）
+	isIncrementalOnly := task.MigrationMode == "incremental"
+	if isIncrementalOnly {
+		actualSkipFullSync = true  // 纯增量模式跳过全量
+		taskLog.Info("【纯增量模式】migration_mode=incremental, skipping full migration")
+	}
+	needIncremental := !skipIncremental && (task.MigrationMode == "full_and_incremental" || isIncrementalOnly)
 
 	// ==================== 【关键修复】全量+增量模式下，先启动 FakeSlave ====================
 	// 问题描述：之前的实现在全量完成后才启动 FakeSlave，导致全量期间的数据变更丢失
@@ -4186,7 +4504,8 @@ func simulateProgress(task *Task) {
 		return
 	}
 
-	if status == "running" && mode == "full_and_incremental" {
+	// 【BUG-FIX】支持纯增量模式：mode 可以是 "full_and_incremental" 或 "incremental"
+	if status == "running" && (mode == "full_and_incremental" || mode == "incremental") {
 		taskLog.Info("Starting incremental sync phase")
 		tasksMu.Lock()
 		task.Phase = "incremental"
@@ -4286,7 +4605,7 @@ func simulateProgress(task *Task) {
 
 // connectRedis 连接Redis，返回通用客户端接口
 func connectRedis(ctx context.Context, addrs []string, password string) (redis.UniversalClient, bool, error) {
-	return connectRedisWithPoolSize(ctx, addrs, password, 0)
+	return connectRedisWithPoolSize(ctx, addrs, password, 0, false)
 }
 
 // ==================== 时间差校准检测 ====================
@@ -4345,6 +4664,94 @@ func checkClusterTimeSkew(ctx context.Context, sourceClient, targetClient redis.
 	}
 }
 
+// validateClusterTopology 验证集群拓扑是否健康（检测无效节点如 `:0`）
+// readFromSlave=true 时，slave 地址异常也视为 error（因为需要从 slave 读取数据）
+// readFromSlave=false 时，slave 地址异常仅记录 WARN（不影响迁移）
+func validateClusterTopology(ctx context.Context, client *redis.ClusterClient, taskLog *logger.TaskLogger, readFromSlave bool) error {
+	slots, err := client.ClusterSlots(ctx).Result()
+	if err != nil {
+		return fmt.Errorf("CLUSTER SLOTS failed: %w", err)
+	}
+	
+	invalidMasters := []string{}
+	invalidSlaves := []string{}
+	totalSlots := 0
+	validSlots := 0
+	
+	for _, slot := range slots {
+		slotCount := int(slot.End - slot.Start + 1)
+		totalSlots += slotCount
+		
+		if len(slot.Nodes) == 0 {
+			invalidMasters = append(invalidMasters, fmt.Sprintf("slots %d-%d -> no nodes", slot.Start, slot.End))
+			continue
+		}
+		
+		// 第一个节点是 master
+		master := slot.Nodes[0]
+		if master.Addr == "" || master.Addr == ":0" || strings.HasPrefix(master.Addr, ":") {
+			invalidMasters = append(invalidMasters, fmt.Sprintf("slots %d-%d -> invalid master addr '%s'",
+				slot.Start, slot.End, master.Addr))
+		} else {
+			validSlots += slotCount
+		}
+		
+		// 后续节点是 slave
+		for i := 1; i < len(slot.Nodes); i++ {
+			node := slot.Nodes[i]
+			if node.Addr == "" || node.Addr == ":0" || strings.HasPrefix(node.Addr, ":") {
+				invalidSlaves = append(invalidSlaves, fmt.Sprintf("slots %d-%d -> invalid slave addr '%s'",
+					slot.Start, slot.End, node.Addr))
+			}
+		}
+	}
+	
+	// master 地址异常始终返回 error
+	if len(invalidMasters) > 0 {
+		return fmt.Errorf("found %d invalid master node(s) in cluster topology: %v (total slots: %d, valid: %d)", 
+			len(invalidMasters), invalidMasters, totalSlots, validSlots)
+	}
+	
+	// slave 地址异常：根据 readFromSlave 决定严重程度
+	if len(invalidSlaves) > 0 {
+		if readFromSlave {
+			// 需要从 slave 读取数据，slave 异常会真正影响迁移
+			return fmt.Errorf("found %d invalid slave node(s) (read_from_slave=true, will affect migration): %v (total slots: %d)", 
+				len(invalidSlaves), invalidSlaves, totalSlots)
+		}
+		// 不从 slave 读取，仅记录 WARN
+		if taskLog != nil {
+			taskLog.Warn("Cluster has slave nodes with invalid addresses (not affecting migration, read_from_slave=false)", map[string]interface{}{
+				"invalid_slaves": invalidSlaves,
+				"count":          len(invalidSlaves),
+			})
+		}
+	}
+	
+	// 检查 slot 覆盖是否完整（应该是 16384）
+	if totalSlots != 16384 {
+		if taskLog != nil {
+			taskLog.Warn("Cluster slots coverage incomplete", map[string]interface{}{
+				"total_slots":    totalSlots,
+				"expected_slots": 16384,
+				"missing_slots":  16384 - totalSlots,
+			})
+		}
+	}
+	
+	if taskLog != nil {
+		taskLog.Info("✅ Cluster topology validation passed", map[string]interface{}{
+			"total_slots":      totalSlots,
+			"valid_slots":      validSlots,
+			"invalid_masters":  0,
+			"invalid_slaves":   len(invalidSlaves),
+			"read_from_slave":  readFromSlave,
+		})
+	}
+	
+	return nil
+}
+
 // getRedisTime 获取 Redis 服务器时间
 func getRedisTime(ctx context.Context, client redis.UniversalClient) (time.Time, error) {
 	result, err := client.Time(ctx).Result()
@@ -4354,27 +4761,51 @@ func getRedisTime(ctx context.Context, client redis.UniversalClient) (time.Time,
 	return result, nil
 }
 
-// connectRedisWithPoolSize 连接Redis，支持自定义连接池大小
-func connectRedisWithPoolSize(ctx context.Context, addrs []string, password string, poolSize int) (redis.UniversalClient, bool, error) {
+// connectRedisWithPoolSize 连接Redis，支持自定义连接池大小和 ReadOnly 模式
+// readFromSlave=true 时，集群模式下优先从 slave 读取数据（生产环境推荐）
+func connectRedisWithPoolSize(ctx context.Context, addrs []string, password string, poolSize int, readFromSlave bool) (redis.UniversalClient, bool, error) {
 	// 设置默认连接池大小
 	if poolSize <= 0 {
 		poolSize = 10 // 默认10个连接
 	}
-	
+
 	// 先尝试集群模式
-	clusterClient := redis.NewClusterClient(&redis.ClusterOptions{
+	clusterOpts := &redis.ClusterOptions{
 		Addrs:        addrs,
 		Password:     password,
 		PoolSize:     poolSize,           // 每个节点的连接池大小
 		MinIdleConns: poolSize / 4,       // 最小空闲连接数
 		PoolTimeout:  30 * time.Second,   // 等待连接的超时时间
+		IdleTimeout:  5 * time.Minute,    // 空闲连接超时，防止连接泄漏产生僵尸连接
 		DialTimeout:  10 * time.Second,   // 连接超时
 		ReadTimeout:  60 * time.Second,   // 读取超时（大 Key RESTORE 可能需要较长时间）
 		WriteTimeout: 60 * time.Second,   // 写入超时
-	})
-	if err := clusterClient.Ping(ctx).Err(); err == nil {
+	}
+	
+	// 【生产环境优化】从 slave 读取数据，减轻 master 压力
+	if readFromSlave {
+		clusterOpts.ReadOnly = true         // 允许从 slave 读取
+		clusterOpts.RouteByLatency = true   // 按延迟路由到最快的 slave
+	}
+	
+	clusterClient := redis.NewClusterClient(clusterOpts)
+	
+	// 【BUG-FIX】增加集群连接的详细日志
+	clusterErr := clusterClient.Ping(ctx).Err()
+	if clusterErr == nil {
+		logger.Info("[connectRedis] Connected as cluster mode", map[string]interface{}{
+			"addrs":           addrs,
+			"pool_size":       poolSize,
+			"read_from_slave": readFromSlave,
+		})
 		return clusterClient, true, nil
 	}
+	
+	// 集群模式失败，记录日志
+	logger.Debug("[connectRedis] Cluster mode failed, trying standalone", map[string]interface{}{
+		"addrs":         addrs,
+		"cluster_error": clusterErr.Error(),
+	})
 	clusterClient.Close()
 
 	// 尝试单机模式
@@ -4384,6 +4815,7 @@ func connectRedisWithPoolSize(ctx context.Context, addrs []string, password stri
 		PoolSize:     poolSize,           // 连接池大小
 		MinIdleConns: poolSize / 4,       // 最小空闲连接数
 		PoolTimeout:  30 * time.Second,   // 等待连接的超时时间
+		IdleTimeout:  5 * time.Minute,    // 【BUG-FIX】空闲连接超时，防止连接泄漏产生僵尸连接
 		DialTimeout:  10 * time.Second,   // 连接超时
 		ReadTimeout:  60 * time.Second,   // 读取超时（大 Key RESTORE 可能需要较长时间）
 		WriteTimeout: 60 * time.Second,   // 写入超时
@@ -4392,10 +4824,17 @@ func connectRedisWithPoolSize(ctx context.Context, addrs []string, password stri
 		standaloneClient.Close()
 		return nil, false, err
 	}
+	
+	logger.Info("[connectRedis] Connected as standalone mode", map[string]interface{}{
+		"addr":      addrs[0],
+		"pool_size": poolSize,
+	})
 	return standaloneClient, false, nil
 }
 
 // getDBSize 获取数据库Key数量
+// getDBSize 获取 Redis/Tendis 集群的总 Key 数量
+// 【BUG-FIX】注意：Tendis 的 DBSIZE 命令可能返回不准确的值（如 0），建议使用 -1 表示未知
 func getDBSize(ctx context.Context, client redis.UniversalClient, isCluster bool) (int64, error) {
 	if !isCluster {
 		return client.DBSize(ctx).Result()
@@ -4405,18 +4844,41 @@ func getDBSize(ctx context.Context, client redis.UniversalClient, isCluster bool
 	clusterClient := client.(*redis.ClusterClient)
 	var total int64
 	var mu sync.Mutex
+	var firstErr error
 
 	err := clusterClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
-		size, err := node.DBSize(ctx).Result()
+		// 【BUG-FIX】为每个节点设置单独的超时（避免某个慢节点拖累整体）
+		nodeCtx, nodeCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer nodeCancel()
+		
+		size, err := node.DBSize(nodeCtx).Result()
 		if err != nil {
-			return err
+			// 记录第一个错误，但继续尝试其他节点
+			if firstErr == nil {
+				firstErr = err
+			}
+			logger.Debug("[getDBSize] Node DBSIZE failed", map[string]interface{}{
+				"node":  node.Options().Addr,
+				"error": err.Error(),
+			})
+			return nil // 继续尝试其他节点
 		}
+		
 		mu.Lock()
 		total += size
 		mu.Unlock()
 		return nil
 	})
-	return total, err
+	
+	// 如果所有节点都失败，返回错误
+	if err != nil {
+		return 0, err
+	}
+	if total == 0 && firstErr != nil {
+		return 0, firstErr
+	}
+	
+	return total, nil
 }
 
 // WorkerInfo Worker信息
@@ -4629,10 +5091,15 @@ func (p *DynamicWorkerPool) addWorker() {
 	
 	go p.workerLoop(workerInfo)
 	
-	p.taskLog.Info("Worker started", map[string]interface{}{
-		"worker_id":      workerID,
-		"active_workers": atomic.LoadInt32(&p.activeWorkers),
-	})
+	// 仅在 worker 数量达到里程碑时记录日志，避免 512 个 worker 产生 512 条日志
+	active := atomic.LoadInt32(&p.activeWorkers)
+	target := atomic.LoadInt32(&p.targetWorkers)
+	if active == 1 || active%100 == 0 || active == target {
+		p.taskLog.Info("Workers scaling", map[string]interface{}{
+			"active_workers": active,
+			"target_workers": target,
+		})
+	}
 }
 
 // removeWorkerSmart 智能选择Worker停止：优先空闲Worker，其次LIFO（优雅停止）
@@ -4830,10 +5297,11 @@ func (p *DynamicWorkerPool) processKeyBatch(workerID int, keys []string) {
 	}
 	
 	// 检查任务状态
-	tasksMu.RLock()
+	// 【死锁修复】使用 task.statsMu 代替全局 tasksMu
+	p.task.statsMu.Lock()
 	status := p.task.Status
 	keyFilter := p.task.Options.KeyFilter
-	tasksMu.RUnlock()
+	p.task.statsMu.Unlock()
 	if status != "running" {
 		return
 	}
@@ -4846,6 +5314,7 @@ func (p *DynamicWorkerPool) processKeyBatch(workerID int, keys []string) {
 	}
 
 	// 影子模式：只读取源端数据，不写入目标端
+	// 【优化】移除了每批次输出 shadow_mode 的日志，shadow_mode 状态只在任务启动时输出一次
 	if p.shadowMode {
 		scanned, matched, skippedKeys, bytesRead, largeKeys, typeDistribution := p.processShadowBatch(keys, keyFilter)
 		
@@ -4917,6 +5386,9 @@ func (p *DynamicWorkerPool) processKeyBatch(workerID int, keys []string) {
 // processShadowBatch 影子模式批量处理：只读取源端数据进行分析，不写入目标端
 // 返回：扫描数、匹配数、跳过数、读取字节数、大 Key 数、类型分布
 func (p *DynamicWorkerPool) processShadowBatch(keys []string, keyFilter *KeyFilter) (scanned, matched, skippedKeys, bytesRead, largeKeys int64, typeDistribution map[string]int64) {
+	p.taskLog.Info("processShadowBatch called - NO WRITE to target", map[string]interface{}{
+		"key_count": len(keys),
+	})
 	typeDistribution = make(map[string]int64)
 	scanned = int64(len(keys))
 	
@@ -5006,9 +5478,10 @@ func (p *DynamicWorkerPool) GetShadowStats() *ShadowModeStats {
 // processKey 处理单个Key的迁移（保留用于兼容）
 func (p *DynamicWorkerPool) processKey(workerID int, key string) {
 	// 检查任务状态
-	tasksMu.RLock()
+	// 【死锁修复】使用 task.statsMu 代替全局 tasksMu
+	p.task.statsMu.Lock()
 	status := p.task.Status
-	tasksMu.RUnlock()
+	p.task.statsMu.Unlock()
 	if status != "running" {
 		return
 	}
@@ -5176,6 +5649,16 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 	var sourceLimiter *RateLimiter
 	var targetLimiter *RateLimiter
 
+	// 【审查修复】确保 RateLimiter goroutine 不泄露
+	defer func() {
+		if sourceLimiter != nil {
+			sourceLimiter.Stop()
+		}
+		if targetLimiter != nil {
+			targetLimiter.Stop()
+		}
+	}()
+
 	if task.Options != nil {
 		if task.Options.ScanBatchSize > 0 {
 			batchSize = int64(task.Options.ScanBatchSize)
@@ -5215,13 +5698,12 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 		"target_qps":   targetQPS,
 	})
 
-	// 统计计数器（使用原子操作）
-	var migratedCount int64
-	var migratedBytes int64
-	var failedCount int64
-	var skippedCount int64
-	var filteredCount int64
-	var keysToMigrateCount int64  // 【修复】符合过滤条件的待迁移 Key 数（SCAN 后本地过滤统计）
+	// 统计计数器：直接使用 task 字段（原子操作）
+	// 【核心设计】worker 通过 atomic.AddInt64(&task.KeysMigrated, 1) 直接递增 task 字段
+	// 暂停恢复后，task 字段保留历史值，worker 继续在原来的数字上累加
+	// 不需要局部变量、baseline、retryAdj 等额外机制，简洁直观
+	// 自动重试成功：直接 atomic.AddInt64(&task.KeysMigrated, 1) + atomic.AddInt64(&task.KeysFailed, -1)
+	// 所有数字始终反映"整个任务"的总量
 	startTime := time.Now()
 	lastLogTime := time.Now()
 	var lastLogMu sync.Mutex
@@ -5235,10 +5717,12 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 	// 创建Key通道（缓冲区大小动态调整）
 	keyChan := make(chan string, workerCount*100)
 
-	// 创建动态Worker池（无 processedKeys 参数）
+	// 创建动态Worker池
+	// 直接传 task 字段指针，worker 通过原子操作直接递增 task 的计数器
+	// 暂停恢复后无需任何额外处理，数字自然在原来基础上累加
 	workerPool := NewDynamicWorkerPool(ctx, task, keyChan, taskLog,
 		sourceClient, targetClient, conflictPolicy, sourceLimiter, targetLimiter,
-		&migratedCount, &migratedBytes, &failedCount, &skippedCount, &filteredCount)
+		&task.KeysMigrated, &task.BytesMigrated, &task.KeysFailed, &task.KeysSkipped, &task.KeysFiltered)
 	
 	// 启动初始Worker
 	workerPool.Start(workerCount)
@@ -5259,17 +5743,19 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 			case <-stopProgress:
 				return
 			case <-ticker.C:
-				mc := atomic.LoadInt64(&migratedCount)
-				mb := atomic.LoadInt64(&migratedBytes)
-				fc := atomic.LoadInt64(&failedCount)
-				sc := atomic.LoadInt64(&skippedCount)
-				ftc := atomic.LoadInt64(&filteredCount)
+				// 直接读取 task 字段（worker 通过原子操作直接递增）
+				mc := atomic.LoadInt64(&task.KeysMigrated)
+				mb := atomic.LoadInt64(&task.BytesMigrated)
+				fc := atomic.LoadInt64(&task.KeysFailed)
+				sc := atomic.LoadInt64(&task.KeysSkipped)
+				ftc := atomic.LoadInt64(&task.KeysFiltered)
 				
 				// 记录速度采样点
 				speedTracker.Record(mc, mb)
 				
 				// 检查是否需要动态调整配置
-				tasksMu.RLock()
+				// 【死锁修复】使用 task.statsMu 代替全局 tasksMu，避免高频锁争抢
+				task.statsMu.Lock()
 				targetWorkerCount := 4
 				targetSourceQPS := 0
 				targetTargetQPS := 0
@@ -5282,7 +5768,7 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 						targetTargetQPS = task.Options.RateLimit.TargetQPS
 					}
 				}
-				tasksMu.RUnlock()
+				task.statsMu.Unlock()
 				
 				// 动态调整Worker
 				workerPool.SetWorkerCount(targetWorkerCount)
@@ -5300,42 +5786,40 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 				realTimeSpeed := speedTracker.GetSpeed()
 				bytesSpeed := speedTracker.GetBytesSpeed()
 
-				tasksMu.Lock()
-				task.KeysMigrated = mc
-				task.BytesMigrated = mb
-				task.KeysFailed = fc
-				task.KeysSkipped = sc
-				task.KeysFiltered = ftc
-				task.ActiveWorkers = currentWorkers  // 更新当前活跃Worker数
+				// 【死锁修复】使用 task.statsMu 代替全局 tasksMu 更新统计字段
+				task.statsMu.Lock()
+				// task 的 KeysMigrated/KeysFailed 等已由 worker 原子递增，无需再赋值
+				task.ActiveWorkers = currentWorkers
 				
-				// 【修复】实时更新待迁移 Key 数
-				// 待迁移 Key 数 = SCAN 扫描到的、符合过滤条件的 Key 总数
-				// 由 keysToMigrateCount 在 SCAN 阶段统计（经过本地过滤）
-				toMigrate := atomic.LoadInt64(&keysToMigrateCount)
-				task.KeysToMigrate = toMigrate
-				
-				// 动态调整 KeysTotal：使用待迁移数作为总数（更准确）
-				// KeysTotal 代表"需要处理的 Key 总数"
-				if toMigrate > task.KeysTotal {
-					task.KeysTotal = toMigrate
-					task.BytesTotal = toMigrate * 256 // 同步更新估算字节数
+				// KeysToMigrate 计算：使用已处理量推导，避免暂停恢复后 SCAN 重复扫描导致膨胀
+				// 公式：KeysToMigrate = max(已有值, 已迁移+失败+跳过+过滤)
+				// 这样暂停恢复后，只有真正新处理的 key 才会推高 KeysToMigrate
+				totalProcessed := mc + fc + sc + ftc
+				totalToMigrate := task.KeysToMigrate
+				if totalProcessed > totalToMigrate {
+					totalToMigrate = totalProcessed
+					task.KeysToMigrate = totalToMigrate
 				}
 				
-				// 进度 = 已处理数 / 待迁移数
-				processedKeys := mc + sc + ftc
-				if toMigrate > 0 {
-					task.Progress = float64(mc + sc) / float64(toMigrate) * 100
+				// 动态调整 KeysTotal：使用待迁移数作为总数
+				if totalToMigrate > task.KeysTotal {
+					task.KeysTotal = totalToMigrate
+					task.BytesTotal = totalToMigrate * 256
+				}
+				
+				// 进度 = (已迁移 + 已跳过) / 待迁移总数
+				if totalToMigrate > 0 {
+					task.Progress = float64(mc + sc) / float64(totalToMigrate) * 100
 					if task.Progress > 100 {
 						task.Progress = 100
 					}
-				} else if processedKeys > 0 {
-					// 还没扫描到符合条件的 Key，使用已处理数估算
+				} else if (mc + sc + ftc) > 0 {
 					task.Progress = 0
 				}
 				// 使用实时速度（滑动窗口），而不是平均速度
 				task.Speed = realTimeSpeed
 				task.UpdatedAt = time.Now().Format(time.RFC3339)
-				tasksMu.Unlock()
+				task.statsMu.Unlock()
 
 				// 每10秒记录一次详细日志（包含性能分析信息）
 				lastLogMu.Lock()
@@ -5348,7 +5832,7 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 					
 					taskLog.Info("Migration progress", map[string]interface{}{
 						"progress":         fmt.Sprintf("%.1f%%", task.Progress),
-						"keys_to_migrate":  toMigrate,  // 待迁移 Key 数
+						"keys_to_migrate":  totalToMigrate,
 						"migrated_keys":    mc,
 						"failed_keys":      fc,
 						"skipped_keys":     sc,
@@ -5421,21 +5905,22 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 		}
 
 		// 更新实际需要迁移的 Key 数
-		tasksMu.Lock()
+		task.statsMu.Lock()
 		task.KeysTotal = int64(len(existingKeys))
-		tasksMu.Unlock()
+		task.statsMu.Unlock()
 
 		// 分发 Key 到 Worker
+		// 【死锁修复】使用 ctx.Done()/stopCh 检测停止信号，避免逐 key 获取全局读锁
 		go func() {
 			defer close(keyChan)
 			for _, key := range existingKeys {
-				tasksMu.RLock()
-				status := task.Status
-				tasksMu.RUnlock()
-				if status != "running" {
+				select {
+				case <-ctx.Done():
 					return
+				case <-task.stopCh:
+					return
+				case keyChan <- key:
 				}
-				keyChan <- key
 			}
 			taskLog.Info("All keys from list dispatched to workers", map[string]interface{}{
 				"total": len(existingKeys),
@@ -5447,9 +5932,9 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 		close(stopProgress)
 
 		taskLog.Info("Key list migration completed", map[string]interface{}{
-			"migrated": atomic.LoadInt64(&migratedCount),
-			"failed":   atomic.LoadInt64(&failedCount),
-			"skipped":  atomic.LoadInt64(&skippedCount),
+			"migrated": atomic.LoadInt64(&task.KeysMigrated),
+			"failed":   atomic.LoadInt64(&task.KeysFailed),
+			"skipped":  atomic.LoadInt64(&task.KeysSkipped),
 		})
 		return
 	}
@@ -5578,12 +6063,27 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 	}
 	
 	if sourceIsCluster {
-		// 集群模式：并行遍历所有master节点
+		// 集群模式：并行遍历节点
 		clusterClient := sourceClient.(*redis.ClusterClient)
 		var scanWg sync.WaitGroup
-		var nodeCursorsMu sync.Mutex
+		// 【BUG-FIX】使用 fullCheckpoint.mu 替代局部 nodeCursorsMu，避免 saveFullSyncCheckpoint 遍历时的并发问题
 
-		clusterClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+		// 【生产环境优化】根据 readFromSlave 选择遍历 master 还是 slave 节点
+		// readFromSlave=true: ForEachSlave - 从 slave 读取，不影响 master 服务
+		// readFromSlave=false: ForEachMaster - 传统模式，从 master 读取
+		readFromSlave := task.Options != nil && task.Options.ReadFromSlave
+		forEachNode := clusterClient.ForEachMaster
+		nodeType := "master"
+		if readFromSlave {
+			forEachNode = clusterClient.ForEachSlave
+			nodeType = "slave"
+		}
+		taskLog.Info("Full migration SCAN node selection", map[string]interface{}{
+			"node_type":       nodeType,
+			"read_from_slave": readFromSlave,
+		})
+
+		forEachNode(ctx, func(ctx context.Context, node *redis.Client) error {
 			scanWg.Add(1)
 			go func(nodeClient *redis.Client) {
 				defer scanWg.Done()
@@ -5594,7 +6094,7 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 				// 【P1-BUG3 修复】从断点恢复 cursor（支持前缀维度）
 				var cursor uint64
 				var cursorFound bool
-				nodeCursorsMu.Lock()
+				fullCheckpoint.mu.Lock()
 				checkpointKey := getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)
 				
 				// 尝试多种 key 格式查找 cursor
@@ -5635,14 +6135,31 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 					taskLog.Info("📍 Node already completed in previous run, skipping", map[string]interface{}{
 						"node": nodeAddr,
 					})
-					nodeCursorsMu.Unlock()
+					fullCheckpoint.mu.Unlock()
 					return
 				}
-				nodeCursorsMu.Unlock()
+				fullCheckpoint.mu.Unlock()
 				
 				consecutiveScanFailures := 0
 				
 				for {
+					// 【BUG-FIX】优先检查 stopCh，响应更快
+					select {
+					case <-task.stopCh:
+						taskLog.Info("【BUG-FIX】Received stop signal via stopCh, saving checkpoint and exiting", map[string]interface{}{
+							"node": nodeAddr,
+						})
+						safeCursor := getSafeCheckpointCursor(cursor)
+						fullCheckpoint.mu.Lock()
+						fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = safeCursor
+						fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
+						fullCheckpoint.mu.Unlock()
+						saveFullSyncCheckpoint(task.ID, fullCheckpoint)
+						return
+					default:
+						// 继续执行
+					}
+					
 					tasksMu.RLock()
 					status := task.Status
 					tasksMu.RUnlock()
@@ -5653,10 +6170,10 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 							time.Sleep(50 * time.Millisecond)
 						}
 						safeCursor := getSafeCheckpointCursor(cursor)
-						nodeCursorsMu.Lock()
+						fullCheckpoint.mu.Lock()
 						fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = safeCursor
 						fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
-						nodeCursorsMu.Unlock()
+						fullCheckpoint.mu.Unlock()
 						saveFullSyncCheckpoint(task.ID, fullCheckpoint)
 						taskLog.Info("Checkpoint saved on pause (zero-loss)", map[string]interface{}{
 							"node": nodeAddr, "scan_cursor": cursor, "safe_cursor": safeCursor, "chan_pending": len(keyChan),
@@ -5682,10 +6199,10 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 							shouldPause := recordSourceFailure(task.ID, taskLog)
 							if shouldPause {
 								safeCursor := getSafeCheckpointCursor(cursor)
-								nodeCursorsMu.Lock()
+								fullCheckpoint.mu.Lock()
 								fullCheckpoint.NodeCursors[nodeAddr] = safeCursor
 								fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
-								nodeCursorsMu.Unlock()
+								fullCheckpoint.mu.Unlock()
 								saveFullSyncCheckpoint(task.ID, fullCheckpoint)
 								saveErrorKeysToFile(task.ID)
 								autoStopTask(task.ID, "Too many consecutive source failures", taskLog)
@@ -5705,18 +6222,25 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 					var matchedInBatch int64
 					var pushedInBatch int64
 					for _, key := range keys {
-						tasksMu.RLock()
-						status := task.Status
-						tasksMu.RUnlock()
-						if status != "running" {
-							// 【零丢失】主动停止时保存安全 cursor
+						// 【死锁修复】使用 stopCh + ctx 检测停止，不再使用 tasksMu.RLock()
+						select {
+						case <-task.stopCh:
 							safeCursor := getSafeCheckpointCursor(cursor)
-							nodeCursorsMu.Lock()
+							fullCheckpoint.mu.Lock()
 							fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = safeCursor
 							fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
-							nodeCursorsMu.Unlock()
+							fullCheckpoint.mu.Unlock()
 							saveFullSyncCheckpoint(task.ID, fullCheckpoint)
 							return
+						case <-ctx.Done():
+							safeCursor := getSafeCheckpointCursor(cursor)
+							fullCheckpoint.mu.Lock()
+							fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = safeCursor
+							fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
+							fullCheckpoint.mu.Unlock()
+							saveFullSyncCheckpoint(task.ID, fullCheckpoint)
+							return
+						default:
 						}
 						// 检查是否符合过滤条件（本地二次过滤，处理排除前缀等情况）
 						if matchKeyFilterV2(key, keyFilter) {
@@ -5726,9 +6250,6 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 						pushedInBatch++
 					}
 					
-					// 累加待迁移 Key 数
-					atomic.AddInt64(&keysToMigrateCount, matchedInBatch)
-
 					cursor = newCursor
 					atomic.AddInt64(&scannedKeysCount, int64(len(keys)))
 					
@@ -5741,21 +6262,21 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 					currentScanned := atomic.LoadInt64(&scannedKeysCount)
 					if currentScanned%checkpointSaveInterval == 0 || time.Since(lastCheckpointSave) > 30*time.Second {
 						safeCursor := getSafeCheckpointCursor(cursor)
-						nodeCursorsMu.Lock()
+						fullCheckpoint.mu.Lock()
 						fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = safeCursor
 						fullCheckpoint.TotalScannedKeys = currentScanned
 						fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
-						nodeCursorsMu.Unlock()
+						fullCheckpoint.mu.Unlock()
 						saveFullSyncCheckpoint(task.ID, fullCheckpoint)
 						lastCheckpointSave = time.Now()
 					}
 					
 					if cursor == 0 {
 						// 该节点扫描完成
-						nodeCursorsMu.Lock()
+						fullCheckpoint.mu.Lock()
 						fullCheckpoint.NodeCursors[getPrefixCheckpointKey(task.ID, nodeAddr, scanMatchPattern)] = 0 // 标记完成
 						fullCheckpoint.UpdatedAt = time.Now().Format(time.RFC3339)
-						nodeCursorsMu.Unlock()
+						fullCheckpoint.mu.Unlock()
 						break
 					}
 				}
@@ -5845,9 +6366,10 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 			var matchedInBatch int64
 			var pushedInBatch int64
 			for _, key := range keys {
-				tasksMu.RLock()
+				// 【死锁修复】使用 task.statsMu 代替全局 tasksMu 检查状态
+				task.statsMu.Lock()
 				status := task.Status
-				tasksMu.RUnlock()
+				task.statsMu.Unlock()
 				if status != "running" {
 					// 【零丢失】主动停止时保存安全 cursor
 					safeCursor := getSafeCheckpointCursor(cursor)
@@ -5864,9 +6386,6 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 				pushedInBatch++
 			}
 			
-			// 累加待迁移 Key 数
-			atomic.AddInt64(&keysToMigrateCount, matchedInBatch)
-
 			cursor = newCursor
 			atomic.AddInt64(&scannedKeysCount, int64(len(keys)))
 			atomic.AddInt64(&totalPushedKeys, pushedInBatch)
@@ -5903,70 +6422,114 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 	task.workerPool = nil
 	tasksMu.Unlock()
 
-	// 标记全量完成
-	markFullSyncComplete(task.ID)
-	
 	// 保存错误 key
 	saveErrorKeysToFile(task.ID)
 
-	// 最终更新统计
-	mc := atomic.LoadInt64(&migratedCount)
-	fc := atomic.LoadInt64(&failedCount)
-	sc := atomic.LoadInt64(&skippedCount)
-	ftc := atomic.LoadInt64(&filteredCount)
+	// 最终统计：task 字段已由 worker 原子递增，直接读取
+	mc := atomic.LoadInt64(&task.KeysMigrated)
+	fc := atomic.LoadInt64(&task.KeysFailed)
+	sc := atomic.LoadInt64(&task.KeysSkipped)
+	ftc := atomic.LoadInt64(&task.KeysFiltered)
+
+	// 【关键修复】判断全量是否真正完成（而非被暂停/停止中途退出）
+	// 只有当任务仍处于 running 状态时，才说明全量是自然完成的
+	// 如果任务被暂停（paused）或停止（stopped），SCAN goroutine 是中途退出的，
+	// 此时绝不能标记 markFullSyncComplete，否则恢复时会跳过全量
+	tasksMu.RLock()
+	currentStatus := task.Status
+	tasksMu.RUnlock()
+	
+	fullMigrationReallyCompleted := (currentStatus == "running")
+	
+	if fullMigrationReallyCompleted {
+		// 全量真正完成，标记 checkpoint
+		markFullSyncComplete(task.ID)
+	} else {
+		// 全量被中途打断（暂停/停止），只保存当前进度，不标记完成
+		taskLog.Warn("Full migration interrupted (NOT marking as complete)", map[string]interface{}{
+			"status":        currentStatus,
+			"migrated_keys": mc,
+			"note":          "Checkpoint cursors already saved by SCAN goroutines, will resume from breakpoint",
+		})
+		// 确保 checkpoint 不会被误标为完成
+		var cpToSave *FullSyncCheckpoint
+		fullSyncCheckpointsMu.Lock()
+		if cp, ok := fullSyncCheckpoints[task.ID]; ok {
+			cp.IsComplete = false
+			cp.Phase = "full"
+			cp.ProcessedKeys = mc
+			cp.UpdatedAt = time.Now().Format(time.RFC3339)
+			cpToSave = cp
+		}
+		fullSyncCheckpointsMu.Unlock()
+		// 【审计修复】使用锁内获取的引用，避免锁外读取 map
+		if cpToSave != nil {
+			saveFullSyncCheckpoint(task.ID, cpToSave)
+		}
+	}
 
 	tasksMu.Lock()
-	task.KeysMigrated = mc
-	task.KeysFailed = fc
-	task.KeysSkipped = sc
-	task.KeysFiltered = ftc
 	
-	// 【修复】计算待迁移 Key 数 = 符合过滤条件的 Key（已迁移 + 失败）
-	// 注意：KeysSkipped 是"目标端已存在而跳过的 Key"，不是需要迁移的 Key
-	// 真正"待迁移"的是：SCAN 到的总数 - 被过滤的 = 已迁移 + 失败 + 冲突跳过
-	// 但从用户视角，"待迁移"指的是"需要新迁移"，所以不包含冲突跳过的
-	// 这里使用：全量 SCAN 匹配数 = 已迁移 + 失败 + 冲突跳过（不含被前缀过滤的）
-	task.KeysToMigrate = mc + fc + sc
-	
-	// 修复：全量完成时，用实际处理的 Key 数量更新 KeysTotal
-	// 这样可以确保 KeysTotal 准确反映实际处理的数量
-	processedKeys := mc + sc + ftc
-	if processedKeys > task.KeysTotal {
-		task.KeysTotal = processedKeys
-		task.BytesTotal = processedKeys * 256
+	// 最终更新 KeysToMigrate：使用已处理量推导（与 ticker 逻辑一致）
+	totalProcessedFinal := mc + fc + sc + ftc
+	if totalProcessedFinal > task.KeysToMigrate {
+		task.KeysToMigrate = totalProcessedFinal
 	}
 	
-	if task.Status == "running" {
+	// 全量完成时，用实际处理的 Key 总数更新 KeysTotal
+	if totalProcessedFinal > task.KeysTotal {
+		task.KeysTotal = totalProcessedFinal
+		task.BytesTotal = totalProcessedFinal * 256
+	}
+	
+	if fullMigrationReallyCompleted {
 		if task.MigrationMode == "full_only" {
 			task.Status = "completed"
 			task.Progress = 100
 			task.Phase = "completed"
-			task.CompletedAt = time.Now().Format(time.RFC3339)  // 【修复】设置完成时间
+			task.CompletedAt = time.Now().Format(time.RFC3339)
 		} else {
 			// 全量迁移完成，准备进入增量同步
 			task.Progress = 100
 			task.Phase = "incremental"
-			task.IncrStartAt = time.Now().Format(time.RFC3339)  // 记录增量开始时间
+			task.IncrStartAt = time.Now().Format(time.RFC3339)
 		}
 	}
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
 	tasksMu.Unlock()
 	
-	// 【修复】广播任务状态更新
+	// 广播任务状态更新
 	broadcastTaskUpdate(task.ID)
-	if task.MigrationMode == "full_only" {
+	if fullMigrationReallyCompleted && task.MigrationMode == "full_only" {
 		broadcastTaskStatus(task.ID, "completed")
 	}
 
-	taskLog.Info("Full migration completed", map[string]interface{}{
-		"migrated_keys":   mc,
-		"failed_keys":     fc,
-		"skipped_keys":    sc,
-		"filtered_keys":   ftc,
-		"migration_mode":  task.MigrationMode,
-		"duration":        time.Since(startTime).String(),
-		"avg_speed":       int64(float64(mc) / time.Since(startTime).Seconds()),
-	})
+	elapsed := time.Since(startTime)
+	avgSpeed := int64(0)
+	if elapsed.Seconds() > 0 {
+		avgSpeed = int64(float64(mc) / elapsed.Seconds())
+	}
+	if fullMigrationReallyCompleted {
+		taskLog.Info("Full migration completed", map[string]interface{}{
+			"migrated_keys":   mc,
+			"failed_keys":     fc,
+			"skipped_keys":    sc,
+			"filtered_keys":   ftc,
+			"migration_mode":  task.MigrationMode,
+			"duration":        elapsed.String(),
+			"avg_speed":       avgSpeed,
+		})
+	} else {
+		taskLog.Info("Full migration interrupted", map[string]interface{}{
+			"status":          currentStatus,
+			"migrated_keys":   mc,
+			"failed_keys":     fc,
+			"skipped_keys":    sc,
+			"filtered_keys":   ftc,
+			"duration":        elapsed.String(),
+			"avg_speed":       avgSpeed,
+		})
+	}
 }
 
 // RateLimiter 简单的限速器
@@ -5975,6 +6538,7 @@ type RateLimiter struct {
 	ticker   *time.Ticker
 	tokens   chan struct{}
 	stopChan chan struct{}
+	stopOnce sync.Once          // 【审查修复】防止 double-close panic
 }
 
 // NewRateLimiter 创建限速器
@@ -6033,8 +6597,50 @@ func (rl *RateLimiter) Stop() {
 	if rl == nil {
 		return
 	}
-	close(rl.stopChan)
+	// 【审查修复】使用 sync.Once 防止 double-close panic
+	rl.stopOnce.Do(func() {
+		close(rl.stopChan)
+	})
 	rl.ticker.Stop()
+}
+
+// getOutboundIP 获取本机可以连接到目标地址的出口 IP
+// 【BUG-FIX】FakeSlave 需要告知 Tendis 主节点回连的 IP，必须是主节点可达的地址
+func getOutboundIP(targetAddr string) (string, error) {
+	// 使用 UDP 连接（不需要真正建立连接）来获取本机出口 IP
+	// 这样可以获取到连接目标时使用的本机 IP
+	host, _, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		host = targetAddr
+	}
+
+	conn, err := net.Dial("udp", net.JoinHostPort(host, "1"))
+	if err != nil {
+		return "", fmt.Errorf("failed to dial UDP: %w", err)
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String(), nil
+}
+
+// getLocalIPForFakeSlave 获取 FakeSlave 应该使用的监听 IP
+// 根据源端地址自动检测本机可达的 IP
+func getLocalIPForFakeSlave(sourceAddr string, taskLog *logger.TaskLogger) string {
+	ip, err := getOutboundIP(sourceAddr)
+	if err != nil {
+		taskLog.Warn("Failed to detect outbound IP, using 0.0.0.0", map[string]interface{}{
+			"source_addr": sourceAddr,
+			"error":       err.Error(),
+		})
+		return "0.0.0.0"
+	}
+
+	taskLog.Info("Detected outbound IP for FakeSlave", map[string]interface{}{
+		"source_addr":  sourceAddr,
+		"outbound_ip":  ip,
+	})
+	return ip
 }
 
 // matchKeyFilter 检查Key是否匹配过滤规则
@@ -6228,6 +6834,7 @@ type PipelineMigrateResult struct {
 
 // MigrateBatchWithPipeline 使用 Pipeline 批量迁移 Key（P2 改进：提高迁移效率）
 // 对比单个迁移：减少网络往返次数，提高吞吐量
+// 【BUG-FIX】对于集群模式的目标端，改用逐个 RESTORE 避免 MOVED 错误
 func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient redis.UniversalClient, keys []string, policy string) []PipelineMigrateResult {
 	if len(keys) == 0 {
 		return nil
@@ -6237,6 +6844,16 @@ func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient re
 	for i, key := range keys {
 		results[i] = PipelineMigrateResult{Key: key}
 	}
+
+	// 【BUG-FIX】暂停/停止时 context 会被取消，此时不应将 Key 标记为失败
+	// 否则会产生大量虚假的 "context canceled" 失败记录
+	if ctx.Err() != nil {
+		// context 已取消，直接返回空结果（不设置 Reason，不计入失败）
+		return results
+	}
+
+	// 【BUG-FIX】检测目标端是否为集群模式
+	_, targetIsCluster := targetClient.(*redis.ClusterClient)
 
 	// 阶段 1: 批量 DUMP（从源端获取数据）
 	sourcePipe := sourceClient.Pipeline()
@@ -6250,6 +6867,10 @@ func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient re
 
 	_, err := sourcePipe.Exec(ctx)
 	if err != nil && err != redis.Nil {
+		// 【BUG-FIX】如果是 context 取消导致的错误，不标记为失败
+		if ctx.Err() != nil {
+			return results
+		}
 		// Pipeline 执行失败，所有 Key 都标记为失败
 		for i := range results {
 			results[i].Reason = "source pipeline failed: " + err.Error()
@@ -6314,32 +6935,46 @@ func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient re
 		// RESTORE REPLACE 是 Redis 3.0+ 支持的原子操作
 	}
 
-	// 阶段 3: 批量 RESTORE 到目标端
-	restorePipe := targetClient.Pipeline()
-	restoreCmds := make([]*redis.StatusCmd, len(keys))
-
-	for i, key := range keys {
-		if dr, ok := dumpResults[i]; ok {
-			if policy == "replace" {
-				// 使用 RESTORE REPLACE 原子替换
-				restoreCmds[i] = restorePipe.RestoreReplace(ctx, key, dr.TTL, dr.Data)
-			} else {
-				restoreCmds[i] = restorePipe.Restore(ctx, key, dr.TTL, dr.Data)
-			}
-		}
+	// 阶段 3: RESTORE 到目标端
+	// 【BUG-FIX】暂停时 context 取消检查
+	if ctx.Err() != nil {
+		return results
 	}
-
-	_, err = restorePipe.Exec(ctx)
-	if err != nil && err != redis.Nil {
-		// 部分失败，需要检查每个命令的结果
-		for i := range keys {
-			if restoreCmds[i] != nil {
-				if err := restoreCmds[i].Err(); err != nil {
+	// 【BUG-FIX】集群模式下逐个执行 RESTORE（避免 MOVED 错误）
+	// 非集群模式下使用 Pipeline 批量执行（高性能）
+	if targetIsCluster {
+		// 集群模式：逐个执行 RESTORE（ClusterClient 会自动处理 MOVED 重定向）
+		// 【BUG-FIX】添加重试机制，处理 go-redis 的 ":0" 地址解析问题
+		clusterClient := targetClient.(*redis.ClusterClient)
+		for i, key := range keys {
+			// 【BUG-FIX】每个 Key 执行前检查 context 是否取消
+			if ctx.Err() != nil {
+				break
+			}
+			if dr, ok := dumpResults[i]; ok {
+				var err error
+				maxRetries := 3
+				for retry := 0; retry < maxRetries; retry++ {
+					if policy == "replace" {
+						err = clusterClient.RestoreReplace(ctx, key, dr.TTL, dr.Data).Err()
+					} else {
+						err = clusterClient.Restore(ctx, key, dr.TTL, dr.Data).Err()
+					}
+					if err == nil {
+						break
+					}
+					// 【关键】检测 :0 地址错误，刷新集群拓扑后重试
 					errStr := err.Error()
-					// BUSYKEY 错误表示 Key 已存在，应该归类为 skipped 而不是 failed
-					// 这种情况通常发生在：
-					// 1. 增量同步比全量迁移更快地写入了这个 Key
-					// 2. EXISTS 检查和 RESTORE 执行之间的竞态条件
+					if strings.Contains(errStr, "dial tcp :0") || strings.Contains(errStr, "connection refused") {
+						// 刷新集群节点信息
+						clusterClient.ReloadState(ctx)
+						time.Sleep(time.Duration(100*(retry+1)) * time.Millisecond)
+						continue
+					}
+					break // 其他错误不重试
+				}
+				if err != nil {
+					errStr := err.Error()
 					if strings.Contains(errStr, "BUSYKEY") {
 						results[i].Reason = "skipped"
 					} else {
@@ -6351,10 +6986,47 @@ func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient re
 			}
 		}
 	} else {
-		// 全部成功
-		for i := range keys {
-			if restoreCmds[i] != nil && results[i].Reason == "" {
-				results[i].Migrated = true
+		// 非集群模式：使用 Pipeline 批量执行（高性能）
+		restorePipe := targetClient.Pipeline()
+		restoreCmds := make([]*redis.StatusCmd, len(keys))
+
+		for i, key := range keys {
+			if dr, ok := dumpResults[i]; ok {
+				if policy == "replace" {
+					restoreCmds[i] = restorePipe.RestoreReplace(ctx, key, dr.TTL, dr.Data)
+				} else {
+					restoreCmds[i] = restorePipe.Restore(ctx, key, dr.TTL, dr.Data)
+				}
+			}
+		}
+
+		_, err = restorePipe.Exec(ctx)
+		if err != nil && err != redis.Nil {
+			// 【BUG-FIX】如果是 context 取消导致的错误，不标记为失败
+			if ctx.Err() != nil {
+				return results
+			}
+			// 部分失败，需要检查每个命令的结果
+			for i := range keys {
+				if restoreCmds[i] != nil {
+					if err := restoreCmds[i].Err(); err != nil {
+						errStr := err.Error()
+						if strings.Contains(errStr, "BUSYKEY") {
+							results[i].Reason = "skipped"
+						} else {
+							results[i].Reason = "restore failed: " + errStr
+						}
+					} else {
+						results[i].Migrated = true
+					}
+				}
+			}
+		} else {
+			// 全部成功
+			for i := range keys {
+				if restoreCmds[i] != nil && results[i].Reason == "" {
+					results[i].Migrated = true
+				}
 			}
 		}
 	}
@@ -6635,6 +7307,14 @@ func doIncrementalSyncWithFakeSlave(
 		"total_slaves": len(sourceNodes) * kvstorecount,
 	})
 
+	// 【BUG-FIX】检测本机可达源端的 IP（用于 INCRSYNC 回连）
+	var fakeSlaveIP string
+	if len(sourceNodes) > 0 {
+		fakeSlaveIP = getLocalIPForFakeSlave(sourceNodes[0], taskLog)
+	} else {
+		fakeSlaveIP = "0.0.0.0"
+	}
+
 	// 为每个节点的每个 store 创建 FakeSlave
 	var wg sync.WaitGroup
 	fakeSlaves := make([]*replication.FakeSlave, 0, len(sourceNodes)*kvstorecount)
@@ -6676,7 +7356,7 @@ func doIncrementalSyncWithFakeSlave(
 				SourcePassword:   task.SourcePassword,
 				StoreID:          uint32(storeID),
 				StartBinlogPos:   startBinlogPos,
-				FakeListenIP:     "127.0.0.1",
+				FakeListenIP:     fakeSlaveIP, // 【BUG-FIX】使用自动检测的可达 IP
 				FakeListenPort:   uint16(16379 + nodeIdx*kvstorecount + storeID),
 				ReadTimeout:      30 * time.Second,
 				HeartbeatTimeout: 60 * time.Second,
@@ -6831,6 +7511,14 @@ func startFakeSlavesWithCache(
 		"total_slaves": len(sourceNodes) * kvstorecount,
 	})
 
+	// 【BUG-FIX】检测本机可达源端的 IP（用于 INCRSYNC 回连）
+	var fakeSlaveIP string
+	if len(sourceNodes) > 0 {
+		fakeSlaveIP = getLocalIPForFakeSlave(sourceNodes[0], taskLog)
+	} else {
+		fakeSlaveIP = "0.0.0.0"
+	}
+
 	// 为每个节点的每个 store 创建 FakeSlave
 	// Tendis 每个节点有 kvstorecount 个 store，每个 store 有独立的 binlog
 	fakeSlaves := make([]*replication.FakeSlave, 0, len(sourceNodes)*kvstorecount)
@@ -6871,7 +7559,7 @@ func startFakeSlavesWithCache(
 				SourcePassword:   task.SourcePassword,
 				StoreID:          uint32(storeID),
 				StartBinlogPos:   startBinlogPos,
-				FakeListenIP:     "127.0.0.1",
+				FakeListenIP:     fakeSlaveIP, // 【BUG-FIX】使用自动检测的可达 IP
 				FakeListenPort:   uint16(16379 + nodeIdx*kvstorecount + storeID),
 				ReadTimeout:      30 * time.Second,
 				HeartbeatTimeout: 60 * time.Second,
@@ -7157,7 +7845,16 @@ func waitForFakeSlaves(
 
 	select {
 	case <-ctx.Done():
-		taskLog.Info("Incremental sync cancelled, stopping FakeSlaves...")
+		taskLog.Info("Incremental sync cancelled via context, stopping FakeSlaves...")
+		for _, fs := range fakeSlaves {
+			fs.Stop()
+		}
+		<-done
+	case <-task.stopCh:
+		// 【P1修复】同时监听 task.stopCh 作为双保险
+		// 当外部 handler 关闭 stopCh 时，即使 context 链取消有延迟，也能立即响应
+		taskLog.Info("Incremental sync cancelled via stopCh, stopping FakeSlaves...")
+		cancel() // 取消 binlogCtx，让统计 goroutine 也能退出
 		for _, fs := range fakeSlaves {
 			fs.Stop()
 		}
@@ -7380,10 +8077,46 @@ func processBinlogEntries(
 		return nil
 	}
 
-	var synced, skipped, failed int64
+	// 【Shadow Mode 修复】影子模式下只统计不写入
+	if task.Options != nil && task.Options.ShadowMode {
+		taskLog.Info("Shadow mode: skipping binlog entries (read-only)", map[string]interface{}{
+			"entry_count": len(entries),
+		})
+		// 只更新统计，不执行写入
+		atomic.AddInt64(&task.IncrKeysSynced, int64(len(entries)))
+		return nil
+	}
+
+	// 【BUG-FIX】获取 Key Filter 配置用于增量阶段过滤
+	var keyFilter *KeyFilter
+	if task.Options != nil {
+		keyFilter = task.Options.KeyFilter
+	}
+
+	var synced, skipped, failed, filtered int64
 
 	for _, entry := range entries {
-		// Key 已经在 FakeSlave 中过滤过了，这里直接处理
+		// 【BUG-FIX】增量阶段 Key Filter 检查
+		// 确定需要检查的 Key
+		keyToCheck := entry.Key
+		if entry.OpType == "CMD" && keyToCheck == "" {
+			// 从命令中提取 Key
+			args := parseRESPCommand(string(entry.Value))
+			if len(args) >= 2 {
+				keyToCheck = args[1] // 大多数命令的第二个参数是 Key
+			}
+		}
+		
+		// 应用 Key Filter
+		if keyToCheck != "" && keyFilter != nil && !matchKeyFilterV2(keyToCheck, keyFilter) {
+			taskLog.Debug("Incremental: key filtered out", map[string]interface{}{
+				"key":         keyToCheck,
+				"filter_mode": keyFilter.Mode,
+			})
+			filtered++
+			continue
+		}
+		
 		taskLog.Debug("Processing binlog entry", map[string]interface{}{
 			"op_type": entry.OpType,
 			"key":     entry.Key,
@@ -7490,18 +8223,21 @@ func processBinlogEntries(
 	}
 
 	// 更新任务统计
-	tasksMu.Lock()
+	// 【死锁修复】使用 task.statsMu 代替全局 tasksMu
+	task.statsMu.Lock()
 	task.IncrKeysSynced += synced
 	task.IncrKeysSkipped += skipped
 	task.IncrKeysFailed += failed
+	task.IncrKeysFiltered += filtered  // 【BUG-FIX】统计增量阶段被过滤的 Key
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
 	newTotal := task.IncrKeysSynced
-	tasksMu.Unlock()
+	task.statsMu.Unlock()
 
 	taskLog.Info("Binlog batch processed", map[string]interface{}{
 		"synced":     synced,
 		"skipped":    skipped,
 		"failed":     failed,
+		"filtered":   filtered,
 		"total_sync": newTotal,
 	})
 
@@ -7532,7 +8268,8 @@ func updateFakeSlaveStats(task *Task, fakeSlaves []*replication.FakeSlave, taskL
 		nodeOffsets[fmt.Sprintf("store_%d", i)] = pos
 	}
 
-	tasksMu.Lock()
+	// 【死锁修复】使用 task.statsMu 代替全局 tasksMu
+	task.statsMu.Lock()
 	task.IncrKeysFiltered = filteredBinlogs
 	task.IncrBinlogPos = maxBinlogPos
 	task.IncrHeartbeats = heartbeats
@@ -7541,7 +8278,7 @@ func updateFakeSlaveStats(task *Task, fakeSlaves []*replication.FakeSlave, taskL
 	keysSynced := task.IncrKeysSynced
 	keysSkipped := task.IncrKeysSkipped
 	keysFailed := task.IncrKeysFailed
-	tasksMu.Unlock()
+	task.statsMu.Unlock()
 
 	// 【断点保存】定期保存 FakeSlave 断点信息
 	saveFakeSlaveCheckpoint(task.ID, nodeOffsets, keysSynced, keysSkipped, keysFailed, filteredBinlogs)
@@ -7728,7 +8465,8 @@ func doIncrementalSync(ctx context.Context, task *Task, sourceClient, targetClie
 			}
 
 			// 更新任务统计（包括速度）
-			tasksMu.Lock()
+			// 【死锁修复】使用 task.statsMu 代替全局 tasksMu
+			task.statsMu.Lock()
 			task.KeysMigrated += roundSynced
 			task.KeysSkipped += roundSkipped
 			task.KeysFailed += roundFailed
@@ -7740,7 +8478,7 @@ func doIncrementalSync(ctx context.Context, task *Task, sourceClient, targetClie
 				// 如果本轮没有变化，显示状态为"监听中"，速度保持之前值或显示为0
 				// 这里不更新速度，保持上次的速度值，让用户知道还在运行
 			}
-			tasksMu.Unlock()
+			task.statsMu.Unlock()
 
 			// 更新断点中的上一轮统计
 			avgDuration := (totalRoundDuration / time.Duration(scanRounds)).String()
@@ -8283,9 +9021,10 @@ func doIncrementalSyncWithBinlog(
 			saveBinlogCheckpoint(task.ID, nodeOffsets, keysSynced, keysSkipped, keysFailed)
 
 		case <-ticker.C:
-			tasksMu.RLock()
+			// 【死锁修复】使用 task.statsMu 代替全局 tasksMu 检查状态
+			task.statsMu.Lock()
 			status := task.Status
-			tasksMu.RUnlock()
+			task.statsMu.Unlock()
 
 			if status != "running" {
 				saveBinlogCheckpoint(task.ID, nodeOffsets, keysSynced, keysSkipped, keysFailed)
@@ -8303,12 +9042,13 @@ func doIncrementalSyncWithBinlog(
 			keysFailed += roundFailed
 
 			if roundSynced > 0 || roundSkipped > 0 || roundFailed > 0 {
-				tasksMu.Lock()
+				// 【死锁修复】使用 task.statsMu 代替全局 tasksMu
+				task.statsMu.Lock()
 				task.KeysMigrated += roundSynced
 				task.KeysSkipped += roundSkipped
 				task.KeysFailed += roundFailed
 				task.UpdatedAt = time.Now().Format(time.RFC3339)
-				tasksMu.Unlock()
+				task.statsMu.Unlock()
 
 				taskLog.Debug("Binlog sync round", map[string]interface{}{
 					"synced":  roundSynced,
@@ -8790,19 +9530,28 @@ func getErrorKeysStats(taskID string) map[string]interface{} {
 }
 
 // getAllErrorKeys 获取所有错误 Key（包括落盘的）
+// 【BUG-FIX】过滤已通过重试成功移除的 Key
 func getAllErrorKeys(taskID string, limit int) []ErrorKey {
+	// 获取已移除的 Key 集合
+	removedErrorKeysMu.RLock()
+	removed := removedErrorKeys[taskID]
+	removedErrorKeysMu.RUnlock()
+
 	errorKeyMu.RLock()
 	memoryKeys := errorKeys[taskID]
 	errorKeyMu.RUnlock()
 
-	// 如果内存中的数据足够，直接返回
-	if limit > 0 && len(memoryKeys) >= limit {
-		return memoryKeys[:limit]
-	}
-
-	// 需要从文件加载更多
+	// 过滤内存中已移除的 Key（理论上内存中已被 removeErrorKey 移除，这里做双重保障）
 	allKeys := make([]ErrorKey, 0, len(memoryKeys))
-	allKeys = append(allKeys, memoryKeys...)
+	for _, k := range memoryKeys {
+		if removed != nil && removed[k.Key] {
+			continue
+		}
+		allKeys = append(allKeys, k)
+		if limit > 0 && len(allKeys) >= limit {
+			return allKeys
+		}
+	}
 
 	errorKeysTrackersMu.RLock()
 	tracker := errorKeysTrackers[taskID]
@@ -8812,7 +9561,7 @@ func getAllErrorKeys(taskID string, limit int) []ErrorKey {
 	}
 	errorKeysTrackersMu.RUnlock()
 
-	// 从文件加载（按时间倒序，最新的先加载）
+	// 从文件加载（按时间倒序，最新的先加载），过滤已移除的 Key
 	for i := len(files) - 1; i >= 0 && (limit <= 0 || len(allKeys) < limit); i-- {
 		data, err := os.ReadFile(files[i])
 		if err != nil {
@@ -8824,16 +9573,15 @@ func getAllErrorKeys(taskID string, limit int) []ErrorKey {
 			continue
 		}
 
-		// 计算还需要多少
-		need := limit - len(allKeys)
-		if limit <= 0 {
-			need = len(fileKeys)
+		for _, k := range fileKeys {
+			if removed != nil && removed[k.Key] {
+				continue
+			}
+			allKeys = append(allKeys, k)
+			if limit > 0 && len(allKeys) >= limit {
+				return allKeys
+			}
 		}
-		if need > len(fileKeys) {
-			need = len(fileKeys)
-		}
-
-		allKeys = append(allKeys, fileKeys[:need]...)
 	}
 
 	return allKeys
@@ -8982,22 +9730,30 @@ func getIncrementalCheckpoint(taskID string) *IncrementalSyncCheckpoint {
 // ==================== 全量同步断点（SCAN cursor 持久化）====================
 
 // saveFullSyncCheckpoint 保存全量同步断点（异步写入磁盘，不阻塞主流程）
+// 【BUG-FIX】修复并发 map 读写导致的 panic：使用内部锁保护 NodeCursors 遍历
 func saveFullSyncCheckpoint(taskID string, checkpoint *FullSyncCheckpoint) {
-	// 先更新内存（同步操作，确保一致性）
-	fullSyncCheckpointsMu.Lock()
-	// 深拷贝 checkpoint，避免并发修改问题
+	// 【BUG-FIX】使用 checkpoint 内部锁保护 NodeCursors 的遍历
+	// 问题：调用方可能正在修改 NodeCursors，这里遍历会导致 concurrent map iteration and map write panic
+	checkpoint.mu.RLock()
+	nodeCursorsCopy := make(map[string]uint64)
+	for k, v := range checkpoint.NodeCursors {
+		nodeCursorsCopy[k] = v
+	}
+	checkpoint.mu.RUnlock()
+
+	// 创建完整的深拷贝（不包含锁）
 	cpCopy := &FullSyncCheckpoint{
 		TaskID:           checkpoint.TaskID,
-		NodeCursors:      make(map[string]uint64),
+		NodeCursors:      nodeCursorsCopy,
 		ProcessedKeys:    checkpoint.ProcessedKeys,
 		TotalScannedKeys: checkpoint.TotalScannedKeys,
 		Phase:            checkpoint.Phase,
 		IsComplete:       checkpoint.IsComplete,
 		UpdatedAt:        checkpoint.UpdatedAt,
 	}
-	for k, v := range checkpoint.NodeCursors {
-		cpCopy.NodeCursors[k] = v
-	}
+
+	// 保存到内存
+	fullSyncCheckpointsMu.Lock()
 	fullSyncCheckpoints[taskID] = cpCopy
 	fullSyncCheckpointsMu.Unlock()
 
@@ -9069,15 +9825,16 @@ func updateFullSyncCursor(taskID, nodeAddr string, cursor uint64, processedKeys 
 // markFullSyncComplete 标记全量同步完成
 func markFullSyncComplete(taskID string) {
 	fullSyncCheckpointsMu.Lock()
-	if cp, ok := fullSyncCheckpoints[taskID]; ok {
+	cp, ok := fullSyncCheckpoints[taskID]
+	if ok {
 		cp.IsComplete = true
 		cp.Phase = "incremental"
 		cp.UpdatedAt = time.Now().Format(time.RFC3339)
 	}
 	fullSyncCheckpointsMu.Unlock()
 
-	// 保存到文件
-	if cp := fullSyncCheckpoints[taskID]; cp != nil {
+	// 【审计修复】在锁外保存，但使用锁内获取的 cp 引用（避免锁外读取 map）
+	if ok && cp != nil {
 		saveFullSyncCheckpoint(taskID, cp)
 	}
 }
@@ -9146,6 +9903,7 @@ func saveAllErrorKeys() {
 const (
 	MaxConsecutiveFailures = 10  // 连续失败次数阈值
 	FailureCooldownSeconds = 60  // 失败冷却时间（秒）
+	StartupCooldownSeconds = 60  // 【BUG-FIX】启动冷却期：任务启动后 60 秒内不触发自动暂停
 )
 
 // getFailureTracker 获取或创建失败追踪器
@@ -9164,6 +9922,23 @@ func getFailureTracker(taskID string) *ConsecutiveFailureTracker {
 
 // recordSourceFailure 记录源端失败
 func recordSourceFailure(taskID string, taskLog *logger.TaskLogger) bool {
+	// 【BUG-FIX】检查启动冷却期：任务启动后 60 秒内不触发自动暂停
+	tasksMu.RLock()
+	task, ok := tasks[taskID]
+	var startedTime time.Time
+	if ok && !task.startedTime.IsZero() {
+		startedTime = task.startedTime
+	}
+	tasksMu.RUnlock()
+	
+	if ok && !startedTime.IsZero() && time.Since(startedTime) < time.Duration(StartupCooldownSeconds)*time.Second {
+		taskLog.Debug("【Startup Cooldown】Ignoring failure during startup cooldown period", map[string]interface{}{
+			"elapsed_seconds":  time.Since(startedTime).Seconds(),
+			"cooldown_seconds": StartupCooldownSeconds,
+		})
+		return false // 启动冷却期内不触发自动暂停
+	}
+	
 	tracker := getFailureTracker(taskID)
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
@@ -9194,6 +9969,23 @@ func recordSourceSuccess(taskID string) {
 
 // recordTargetFailure 记录目标端失败
 func recordTargetFailure(taskID string, taskLog *logger.TaskLogger) bool {
+	// 【BUG-FIX】检查启动冷却期：任务启动后 60 秒内不触发自动暂停
+	tasksMu.RLock()
+	task, ok := tasks[taskID]
+	var startedTime time.Time
+	if ok && !task.startedTime.IsZero() {
+		startedTime = task.startedTime
+	}
+	tasksMu.RUnlock()
+	
+	if ok && !startedTime.IsZero() && time.Since(startedTime) < time.Duration(StartupCooldownSeconds)*time.Second {
+		taskLog.Debug("【Startup Cooldown】Ignoring failure during startup cooldown period", map[string]interface{}{
+			"elapsed_seconds":  time.Since(startedTime).Seconds(),
+			"cooldown_seconds": StartupCooldownSeconds,
+		})
+		return false // 启动冷却期内不触发自动暂停
+	}
+	
 	tracker := getFailureTracker(taskID)
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
@@ -9223,30 +10015,51 @@ func recordTargetSuccess(taskID string) {
 }
 
 // autoStopTask 自动暂停任务
+// 【BUG-FIX】真正停止正在运行的迁移 goroutine
+// 【BUG-FIX-2】只有真正成功将状态从 running 改为 paused 的调用才启用自动恢复
+// 避免多个 worker 同时失败时反复调用 enableAutoRecoveryForTask 覆盖用户的 disable
 func autoStopTask(taskID string, reason string, taskLog *logger.TaskLogger) {
 	tasksMu.Lock()
 	task, ok := tasks[taskID]
+	didPause := false
 	if ok && task.Status == "running" {
 		now := time.Now()
 		task.Status = "paused"
 		task.PausedAt = now.Format(time.RFC3339)  // 记录暂停时间
 		task.UpdatedAt = now.Format(time.RFC3339)
+		didPause = true
+		
+		// 通过 Cleanup 关闭 stopCh 并取消 context，通知迁移 goroutine 停止
+		task.Cleanup()
 	}
 	tasksMu.Unlock()
 
-	if ok {
-		taskLog.Error("Task auto-paused due to failures", map[string]interface{}{
-			"reason":    reason,
-			"paused_at": task.PausedAt,
-		})
-
-		// 启用自动恢复（当检测到集群恢复时自动继续任务）
-		enableAutoRecoveryForTask(taskID, reason)
-
-		// 保存状态
-		saveTasksState()
-		saveErrorKeysToFile(taskID)
+	// 【BUG-FIX-2】只有真正执行了暂停操作才启用自动恢复和做后续清理
+	// 如果任务已经不是 running（可能被用户手动暂停了），跳过所有操作
+	// 这避免了竞态：用户 disable auto-recovery 后，后续到达的 autoStopTask 又 enable 它
+	if !didPause {
+		return
 	}
+
+	taskLog.Error("Task auto-paused due to failures", map[string]interface{}{
+		"reason":    reason,
+		"paused_at": task.PausedAt,
+	})
+
+	// 启用自动恢复（当检测到集群恢复时自动继续任务）
+	enableAutoRecoveryForTask(taskID, reason)
+
+	// 【关键】清除全量迁移运行标记，防止恢复时跳过全量
+	fullMigrationMu.Lock()
+	delete(fullMigrationRunning, taskID)
+	fullMigrationMu.Unlock()
+	taskLog.Info("【BUG-FIX】Cleared fullMigrationRunning flag for task", map[string]interface{}{
+		"task_id": taskID,
+	})
+
+	// 保存状态
+	saveTasksState()
+	saveErrorKeysToFile(taskID)
 }
 
 // getFailureStats 获取失败统计
@@ -9277,14 +10090,21 @@ func getFailureStats(taskID string) map[string]interface{} {
 	return stats
 }
 
-// errorKeysHandler 获取错误Key列表
-func errorKeysHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
-	errorKeyMu.RLock()
-	keys := errorKeys[id]
-	errorKeyMu.RUnlock()
+// ==================== 迁移前依赖校验 API ====================
 
+// PreflightCheckItem 单项校验结果
+type PreflightCheckItem struct {
+	Name     string `json:"name"`     // 校验项名称
+	Status   string `json:"status"`   // passed, failed, warning
+	Required bool   `json:"required"` // 是否为必须通过项
+	Message  string `json:"message"`  // 结果描述
+	Detail   string `json:"detail"`   // 详细信息
+}
+
+// preflightCheckHandler 迁移前依赖校验
+func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
 	tasksMu.RLock()
-	_, ok := tasks[id]
+	task, ok := tasks[id]
 	tasksMu.RUnlock()
 
 	if !ok {
@@ -9292,69 +10112,456 @@ func errorKeysHandler(w http.ResponseWriter, r *http.Request, id string, log *lo
 		return
 	}
 
-	// 统计各类型错误Key数量（基于实际列表计算，确保一致性）
-	var failedCount, skippedCount, largeKeyCount int64
-	for _, k := range keys {
-		switch k.Reason {
-		case "failed", "timeout":
-			failedCount++
-		case "skipped", "conflict":
-			skippedCount++
-		case "large_key":
-			largeKeyCount++
-		default:
-			failedCount++ // 默认算作失败
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var checks []PreflightCheckItem
+	allPassed := true
+	hasBlocker := false // 是否有必须通过但未通过的项
+
+	// ===== 1. 源集群连接校验（必须） =====
+	sourceAddrs := strings.Split(task.SourceCluster, ",")
+	for i := range sourceAddrs {
+		sourceAddrs[i] = strings.TrimSpace(sourceAddrs[i])
+	}
+	sourceClient, sourceIsCluster, sourceErr := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, 5, false)
+	if sourceErr != nil {
+		checks = append(checks, PreflightCheckItem{
+			Name:     "源集群连接",
+			Status:   "failed",
+			Required: true,
+			Message:  "源集群连接失败",
+			Detail:   sourceErr.Error(),
+		})
+		allPassed = false
+		hasBlocker = true
+	} else {
+		defer sourceClient.Close()
+		modeStr := "单机模式"
+		if sourceIsCluster {
+			modeStr = "集群模式"
+		}
+		checks = append(checks, PreflightCheckItem{
+			Name:     "源集群连接",
+			Status:   "passed",
+			Required: true,
+			Message:  fmt.Sprintf("源集群连接成功（%s）", modeStr),
+			Detail:   fmt.Sprintf("节点地址: %s", strings.Join(sourceAddrs, ", ")),
+		})
+	}
+
+	// ===== 2. 目标集群连接校验（必须） =====
+	targetAddrs := strings.Split(task.TargetCluster, ",")
+	for i := range targetAddrs {
+		targetAddrs[i] = strings.TrimSpace(targetAddrs[i])
+	}
+	targetClient, targetIsCluster, targetErr := connectRedisWithPoolSize(ctx, targetAddrs, task.TargetPassword, 5, false)
+	if targetErr != nil {
+		checks = append(checks, PreflightCheckItem{
+			Name:     "目标集群连接",
+			Status:   "failed",
+			Required: true,
+			Message:  "目标集群连接失败",
+			Detail:   targetErr.Error(),
+		})
+		allPassed = false
+		hasBlocker = true
+	} else {
+		defer targetClient.Close()
+		modeStr := "单机模式"
+		if targetIsCluster {
+			modeStr = "集群模式"
+		}
+		checks = append(checks, PreflightCheckItem{
+			Name:     "目标集群连接",
+			Status:   "passed",
+			Required: true,
+			Message:  fmt.Sprintf("目标集群连接成功（%s）", modeStr),
+			Detail:   fmt.Sprintf("节点地址: %s", strings.Join(targetAddrs, ", ")),
+		})
+	}
+
+	// ===== 3. 源集群拓扑校验 =====
+	if sourceErr == nil && sourceIsCluster {
+		if clusterClient, ok := sourceClient.(*redis.ClusterClient); ok {
+			// preflight check 不知道是否 readFromSlave，先按 false 检查
+			if err := validateClusterTopology(ctx, clusterClient, nil, false); err != nil {
+				checks = append(checks, PreflightCheckItem{
+					Name:     "源集群拓扑",
+					Status:   "warning",
+					Required: false,
+					Message:  "源集群拓扑存在异常节点",
+					Detail:   err.Error(),
+				})
+				allPassed = false
+			} else {
+				checks = append(checks, PreflightCheckItem{
+					Name:     "源集群拓扑",
+					Status:   "passed",
+					Required: false,
+					Message:  "源集群拓扑正常，16384 slots 覆盖完整",
+				})
+			}
 		}
 	}
 
-	// 统计
-	stats := map[string]int64{
-		"total":      int64(len(keys)),
-		"failed":     failedCount,
-		"skipped":    skippedCount,
-		"large_keys": largeKeyCount,
+	// ===== 4. 目标集群拓扑校验 =====
+	if targetErr == nil && targetIsCluster {
+		if clusterClient, ok := targetClient.(*redis.ClusterClient); ok {
+			if err := validateClusterTopology(ctx, clusterClient, nil, false); err != nil {
+				checks = append(checks, PreflightCheckItem{
+					Name:     "目标集群拓扑",
+					Status:   "warning",
+					Required: false,
+					Message:  "目标集群拓扑存在异常节点",
+					Detail:   err.Error(),
+				})
+				allPassed = false
+			} else {
+				checks = append(checks, PreflightCheckItem{
+					Name:     "目标集群拓扑",
+					Status:   "passed",
+					Required: false,
+					Message:  "目标集群拓扑正常，16384 slots 覆盖完整",
+				})
+			}
+		}
 	}
 
-	// 只返回前100条
-	items := keys
-	if len(items) > 100 {
-		items = items[:100]
+	// ===== 5. 时间同步校验 =====
+	if sourceErr == nil && targetErr == nil {
+		sourceTime, err1 := getRedisTime(ctx, sourceClient)
+		targetTime, err2 := getRedisTime(ctx, targetClient)
+		if err1 == nil && err2 == nil {
+			skew := sourceTime.Sub(targetTime)
+			if skew < 0 {
+				skew = -skew
+			}
+			if skew > 5*time.Second {
+				checks = append(checks, PreflightCheckItem{
+					Name:     "时间同步",
+					Status:   "warning",
+					Required: false,
+					Message:  fmt.Sprintf("源端与目标端时间差 %s，超过 5 秒", skew.String()),
+					Detail:   fmt.Sprintf("源端: %s, 目标端: %s，TTL 精度可能受影响", sourceTime.Format("2006-01-02 15:04:05"), targetTime.Format("2006-01-02 15:04:05")),
+				})
+				allPassed = false
+			} else {
+				checks = append(checks, PreflightCheckItem{
+					Name:     "时间同步",
+					Status:   "passed",
+					Required: false,
+					Message:  fmt.Sprintf("时间同步正常（差值 %s）", skew.String()),
+					Detail:   fmt.Sprintf("源端: %s, 目标端: %s", sourceTime.Format("2006-01-02 15:04:05"), targetTime.Format("2006-01-02 15:04:05")),
+				})
+			}
+		} else {
+			detail := ""
+			if err1 != nil {
+				detail += "源端: " + err1.Error()
+			}
+			if err2 != nil {
+				if detail != "" {
+					detail += "; "
+				}
+				detail += "目标端: " + err2.Error()
+			}
+			checks = append(checks, PreflightCheckItem{
+				Name:     "时间同步",
+				Status:   "warning",
+				Required: false,
+				Message:  "获取集群时间失败，无法校验",
+				Detail:   detail,
+			})
+		}
 	}
+
+	// ===== 6. Binlog/INCRSYNC 支持校验（增量模式必须） =====
+	needIncremental := task.MigrationMode == "full_and_incremental" || task.MigrationMode == "incremental_only"
+	if sourceErr == nil && needIncremental {
+		binlogSupported, binlogMsg := CheckTendisBinlogSupport(ctx, sourceClient)
+		if binlogSupported {
+			checks = append(checks, PreflightCheckItem{
+				Name:     "Binlog/增量同步",
+				Status:   "passed",
+				Required: true,
+				Message:  "源端支持 Binlog 增量同步",
+				Detail:   binlogMsg,
+			})
+		} else {
+			checks = append(checks, PreflightCheckItem{
+				Name:     "Binlog/增量同步",
+				Status:   "failed",
+				Required: true,
+				Message:  "源端不支持 Binlog 增量同步",
+				Detail:   binlogMsg + "。增量同步需要 Tendis 并开启 binlog-enabled=yes",
+			})
+			allPassed = false
+			hasBlocker = true
+		}
+	}
+
+	// ===== 7. 源端数据量预估 =====
+	if sourceErr == nil {
+		dbSizeCtx, dbSizeCancel := context.WithTimeout(ctx, 10*time.Second)
+		totalKeys, err := getDBSize(dbSizeCtx, sourceClient, sourceIsCluster)
+		dbSizeCancel()
+		if err != nil {
+			checks = append(checks, PreflightCheckItem{
+				Name:     "源端数据量",
+				Status:   "warning",
+				Required: false,
+				Message:  "无法获取源端 Key 总数",
+				Detail:   err.Error(),
+			})
+		} else {
+			checks = append(checks, PreflightCheckItem{
+				Name:     "源端数据量",
+				Status:   "passed",
+				Required: false,
+				Message:  fmt.Sprintf("源端 Key 总数: %s", formatKeyCount(totalKeys)),
+				Detail:   fmt.Sprintf("DBSIZE 返回 %d", totalKeys),
+			})
+		}
+	}
+
+	// ===== 8. Key 过滤配置校验 =====
+	if task.Options != nil && task.Options.KeyFilter != nil {
+		kf := task.Options.KeyFilter
+		if kf.Mode == "prefix" && len(kf.Prefixes) == 0 && len(kf.ExcludePrefixes) == 0 {
+			checks = append(checks, PreflightCheckItem{
+				Name:     "Key过滤配置",
+				Status:   "warning",
+				Required: false,
+				Message:  "Key过滤模式为 prefix，但未配置任何前缀",
+				Detail:   "将迁移所有 Key",
+			})
+		} else {
+			detail := fmt.Sprintf("模式: %s", kf.Mode)
+			if len(kf.Prefixes) > 0 {
+				detail += fmt.Sprintf(", 包含前缀: %v", kf.Prefixes)
+			}
+			if len(kf.ExcludePrefixes) > 0 {
+				detail += fmt.Sprintf(", 排除前缀: %v", kf.ExcludePrefixes)
+			}
+			checks = append(checks, PreflightCheckItem{
+				Name:     "Key过滤配置",
+				Status:   "passed",
+				Required: false,
+				Message:  "Key过滤配置正常",
+				Detail:   detail,
+			})
+		}
+	} else {
+		checks = append(checks, PreflightCheckItem{
+			Name:     "Key过滤配置",
+			Status:   "passed",
+			Required: false,
+			Message:  "未配置Key过滤，将迁移所有Key",
+		})
+	}
+
+	// 汇总结果
+	canStart := !hasBlocker
 
 	jsonResponse(w, map[string]interface{}{
 		"code":    0,
 		"message": "success",
 		"data": map[string]interface{}{
-			"stats": stats,
-			"items": items,
+			"checks":     checks,
+			"all_passed": allPassed,
+			"can_start":  canStart, // 必须项全部通过才能启动
 		},
 	})
 }
 
-// downloadErrorKeysHandler 下载错误Key CSV
-func downloadErrorKeysHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
-	errorKeyMu.RLock()
-	keys := errorKeys[id]
-	errorKeyMu.RUnlock()
+// errorKeysHandler 获取错误Key列表（支持分页和筛选）
+// 【BUG-FIX】使用 getAllErrorKeys 合并内存 + 落盘文件数据
+// 之前只读内存 errorKeys[id]，内存满 10000 条落盘后列表为空，导致
+// 统计卡片显示有失败Key但列表却"无匹配数据"
+func errorKeysHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
+	tasksMu.RLock()
+	task, ok := tasks[id]
+	tasksMu.RUnlock()
 
-	// 生成CSV
-	var sb strings.Builder
-	sb.WriteString("Key,Type,Reason,Detail,Timestamp\n")
-	for _, k := range keys {
-		sb.WriteString(fmt.Sprintf("\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
-			strings.ReplaceAll(k.Key, "\"", "\"\""),
-			k.Type,
-			k.Reason,
-			strings.ReplaceAll(k.Detail, "\"", "\"\""),
-			k.Timestamp,
-		))
+	if !ok {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "Task not found"})
+		return
 	}
 
-	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"error-keys-%s.csv\"", id[:8]))
-	w.Write([]byte(sb.String()))
+	// 统计卡片使用 task 的原子计数器（始终准确）
+	taskFailed := atomic.LoadInt64(&task.KeysFailed)
+	taskSkipped := atomic.LoadInt64(&task.KeysSkipped)
 
-	log.Info("Error keys downloaded", map[string]interface{}{"task_id": id, "count": len(keys)})
+	// 解析筛选参数
+	q := r.URL.Query()
+	filterType := q.Get("filter") // failed, skipped, large_key, 空=全部
+
+	// 【BUG-FIX】从内存 + 落盘文件中合并获取所有 ErrorKey
+	// 页面最多展示 1000 条，所以限制加载量（避免大量文件IO）
+	const maxDisplayItems = 1000
+	allKeys := getAllErrorKeys(id, 0) // 加载全部（用于准确统计各类型数量）
+
+	// 统计各类型的数量
+	var listFailedCount, listSkippedCount, listLargeKeyCount int64
+	for _, k := range allKeys {
+		switch k.Reason {
+		case "failed", "timeout":
+			listFailedCount++
+		case "skipped", "conflict":
+			listSkippedCount++
+		case "large_key":
+			listLargeKeyCount++
+		default:
+			listFailedCount++
+		}
+	}
+
+	// 统计卡片：failed/skipped 使用 task 原子计数器（准确），large_keys 使用实际记录
+	stats := map[string]int64{
+		"total":      taskFailed + taskSkipped,
+		"failed":     taskFailed,
+		"skipped":    taskSkipped,
+		"large_keys": listLargeKeyCount,
+	}
+
+	// 按类型筛选
+	var filtered []ErrorKey
+	if filterType == "" {
+		filtered = allKeys
+	} else {
+		for _, k := range allKeys {
+			match := false
+			switch filterType {
+			case "failed":
+				match = k.Reason != "skipped" && k.Reason != "conflict" && k.Reason != "large_key"
+			case "skipped":
+				match = k.Reason == "skipped" || k.Reason == "conflict"
+			case "large_key":
+				match = k.Reason == "large_key"
+			}
+			if match {
+				filtered = append(filtered, k)
+			}
+		}
+	}
+
+	// 分页参数
+	page, _ := strconv.Atoi(q.Get("page"))
+	pageSize, _ := strconv.Atoi(q.Get("page_size"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 500 {
+		pageSize = 50
+	}
+
+	filteredTotal := len(filtered)
+
+	displayTotal := filteredTotal
+	truncated := false
+	if displayTotal > maxDisplayItems {
+		displayTotal = maxDisplayItems
+		truncated = true
+	}
+
+	start := (page - 1) * pageSize
+	end := start + pageSize
+	if start > displayTotal {
+		start = displayTotal
+	}
+	if end > displayTotal {
+		end = displayTotal
+	}
+	items := filtered[start:end]
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+		"data": map[string]interface{}{
+			"stats":          stats,
+			"items":          items,
+			"filtered_total": displayTotal,
+			"actual_total":   filteredTotal,
+			"truncated":      truncated,
+			"page":           page,
+			"page_size":      pageSize,
+		},
+	})
+}
+
+// csvSheetMaxRows 单个 CSV 文件最大行数（Excel 单 Sheet 上限 1,048,576 行，预留表头行）
+const csvSheetMaxRows = 1000000
+
+// downloadErrorKeysHandler 下载错误Key CSV
+// 【BUG-FIX】使用 getAllErrorKeys 合并内存 + 落盘文件数据
+// 之前只读内存 errorKeys[id]，落盘后下载的 CSV 不包含已落盘的记录
+// 当数据量超过 100 万行时，自动分成多个 CSV 文件，打包成 ZIP 下载
+func downloadErrorKeysHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
+	// 【BUG-FIX】从内存 + 落盘文件合并获取所有 ErrorKey
+	keys := getAllErrorKeys(id, 0)
+
+	shortID := id
+	if len(id) > 8 {
+		shortID = id[:8]
+	}
+
+	if len(keys) <= csvSheetMaxRows {
+		// 单文件 CSV（数据量未超限）
+		var buf bytes.Buffer
+		// UTF-8 BOM 头，解决 Excel 打开中文乱码
+		buf.Write([]byte{0xEF, 0xBB, 0xBF})
+		writer := csv.NewWriter(&buf)
+		writer.Write([]string{"Key", "Type", "Reason", "Detail", "Timestamp"})
+		for _, k := range keys {
+			writer.Write([]string{k.Key, k.Type, k.Reason, k.Detail, k.Timestamp})
+		}
+		writer.Flush()
+
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"error-keys-%s.csv\"", shortID))
+		w.Write(buf.Bytes())
+		log.Info("Error keys downloaded (single CSV)", map[string]interface{}{"task_id": id, "count": len(keys)})
+		return
+	}
+
+	// 超过 100 万行：分片打 ZIP
+	var zipBuf bytes.Buffer
+	zipWriter := zip.NewWriter(&zipBuf)
+
+	totalKeys := len(keys)
+	sheetIdx := 0
+	for offset := 0; offset < totalKeys; offset += csvSheetMaxRows {
+		sheetIdx++
+		end := offset + csvSheetMaxRows
+		if end > totalKeys {
+			end = totalKeys
+		}
+		chunk := keys[offset:end]
+
+		fileName := fmt.Sprintf("error-keys-%s-part%d.csv", shortID, sheetIdx)
+		fw, err := zipWriter.Create(fileName)
+		if err != nil {
+			log.Warn("Failed to create zip entry", map[string]interface{}{"error": err.Error()})
+			continue
+		}
+		// UTF-8 BOM
+		fw.Write([]byte{0xEF, 0xBB, 0xBF})
+		csvW := csv.NewWriter(fw)
+		csvW.Write([]string{"Key", "Type", "Reason", "Detail", "Timestamp"})
+		for _, k := range chunk {
+			csvW.Write([]string{k.Key, k.Type, k.Reason, k.Detail, k.Timestamp})
+		}
+		csvW.Flush()
+	}
+	zipWriter.Close()
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"error-keys-%s-%d-parts.zip\"", shortID, sheetIdx))
+	w.Write(zipBuf.Bytes())
+	log.Info("Error keys downloaded (ZIP with multiple CSVs)", map[string]interface{}{
+		"task_id": id, "count": totalKeys, "parts": sheetIdx,
+	})
 }
 
 func systemHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
@@ -9635,11 +10842,16 @@ func stopTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *log
 	// 设置任务状态为已停止
 	task.Status = "stopped"
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	task.Cleanup() // 统一清理运行时控制字段
+	phase := task.Phase
 	tasksMu.Unlock()
+
+	// 禁用自动恢复
+	disableAutoRecoveryForTask(id)
 
 	taskLog.Info("Task stopped", map[string]interface{}{
 		"task_id": id,
-		"phase":   task.Phase,
+		"phase":   phase,
 	})
 
 	jsonResponse(w, map[string]interface{}{
@@ -9673,6 +10885,7 @@ func stopIncrementalHandler(w http.ResponseWriter, r *http.Request, id string, l
 	// 设置任务状态为增量已停止
 	task.Status = "incremental_stopped"
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	task.Cleanup() // 统一清理运行时控制字段
 	tasksMu.Unlock()
 
 	taskLog.Info("Incremental sync stopped manually", map[string]interface{}{
@@ -9684,7 +10897,7 @@ func stopIncrementalHandler(w http.ResponseWriter, r *http.Request, id string, l
 		"message": "Incremental sync stopped",
 		"data": map[string]interface{}{
 			"task_id":      id,
-			"status":       task.Status,
+			"status":       "incremental_stopped",
 			"next_step":    "Execute verify or mark as complete",
 		},
 	})
@@ -9870,6 +11083,7 @@ func restartTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *
 		errorKeyMu.Unlock()
 	}
 
+	task.Init() // 统一初始化运行时控制字段
 	task.Status = "running"
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
 	if task.StartedAt == "" {
@@ -9929,14 +11143,13 @@ func retryFailedKeysHandler(w http.ResponseWriter, r *http.Request, id string, l
 		return
 	}
 
-	// 获取失败的 key 列表（只获取 reason 为 failed 的 key）
-	errorKeyMu.RLock()
-	allErrorKeys := errorKeys[id]
-	errorKeyMu.RUnlock()
+	// 【BUG-FIX】从内存 + 落盘文件合并获取所有 ErrorKey
+	// 之前只读内存 errorKeys[id]，落盘后的失败 Key 无法被重试
+	allErrorKeysForRetry := getAllErrorKeys(id, 0)
 
 	// 只筛选 failed 类型的 key 进行重试
 	var failedKeys []ErrorKey
-	for _, ek := range allErrorKeys {
+	for _, ek := range allErrorKeysForRetry {
 		if ek.Reason == "failed" || ek.Reason == "timeout" {
 			failedKeys = append(failedKeys, ek)
 		}
@@ -9986,6 +11199,11 @@ func retryFailedKeysHandler(w http.ResponseWriter, r *http.Request, id string, l
 	task.Status = "retrying"
 	tasksMu.Unlock()
 
+	// 【BUG-FIX】重试失败 Key 期间，禁用自动恢复
+	// 避免重试完成恢复为 "paused" 后被 autoRecoveryLoop 自动恢复为 running
+	// 用户暂停了任务去重试失败 Key，不希望任务因此被自动恢复
+	disableAutoRecoveryForTask(id)
+
 	// 通过 WebSocket 广播状态变更
 	broadcastTaskStatus(id, "retrying")
 
@@ -10027,7 +11245,8 @@ func retryFailedKeysHandler(w http.ResponseWriter, r *http.Request, id string, l
 func retryFailedKeysAsyncParallel(task *Task, keysToRetry []ErrorKey, maxRetries int, workerCount int, taskLog *logger.TaskLogger, previousStatus string) {
 	ctx := context.Background()
 
-	// 连接 Redis
+	// 连接 Redis（源端支持从 slave 读取）
+	readFromSlave := task.Options != nil && task.Options.ReadFromSlave
 	sourceAddrs := strings.Split(task.SourceCluster, ",")
 	targetAddrs := strings.Split(task.TargetCluster, ",")
 
@@ -10038,7 +11257,7 @@ func retryFailedKeysAsyncParallel(task *Task, keysToRetry []ErrorKey, maxRetries
 		targetAddrs[i] = strings.TrimSpace(targetAddrs[i])
 	}
 
-	sourceClient, _, err := connectRedis(ctx, sourceAddrs, task.SourcePassword)
+	sourceClient, _, err := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, 0, readFromSlave)
 	if err != nil {
 		taskLog.Error("Failed to connect source for retry", map[string]interface{}{"error": err.Error()})
 		// 恢复原状态
@@ -10097,10 +11316,9 @@ func retryFailedKeysAsyncParallel(task *Task, keysToRetry []ErrorKey, maxRetries
 					// 从错误列表中移除
 					removeErrorKey(task.ID, key)
 
-					tasksMu.Lock()
-					task.KeysMigrated++
-					task.KeysFailed--
-					tasksMu.Unlock()
+					// 直接原子操作 task 字段
+					atomic.AddInt64(&task.KeysMigrated, 1)
+					atomic.AddInt64(&task.KeysFailed, -1)
 				} else {
 					atomic.AddInt64(&failCount, 1)
 					// 更新错误原因
@@ -10186,7 +11404,8 @@ func updateErrorKeyReason(taskID, key, reason string) {
 func retryFailedKeysAsync(task *Task, keysToRetry []ErrorKey, maxRetries int, taskLog *logger.TaskLogger, previousStatus string) {
 	ctx := context.Background()
 
-	// 连接 Redis
+	// 连接 Redis（源端支持从 slave 读取）
+	readFromSlave := task.Options != nil && task.Options.ReadFromSlave
 	sourceAddrs := strings.Split(task.SourceCluster, ",")
 	targetAddrs := strings.Split(task.TargetCluster, ",")
 
@@ -10197,7 +11416,7 @@ func retryFailedKeysAsync(task *Task, keysToRetry []ErrorKey, maxRetries int, ta
 		targetAddrs[i] = strings.TrimSpace(targetAddrs[i])
 	}
 
-	sourceClient, _, err := connectRedis(ctx, sourceAddrs, task.SourcePassword)
+	sourceClient, _, err := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, 0, readFromSlave)
 	if err != nil {
 		taskLog.Error("Failed to connect source for retry", map[string]interface{}{"error": err.Error()})
 		// 恢复原状态
@@ -10245,10 +11464,9 @@ func retryFailedKeysAsync(task *Task, keysToRetry []ErrorKey, maxRetries int, ta
 			// 从错误列表中移除
 			removeErrorKey(task.ID, key)
 
-			tasksMu.Lock()
-			task.KeysMigrated++
-			task.KeysFailed--
-			tasksMu.Unlock()
+			// 直接原子操作 task 字段
+			atomic.AddInt64(&task.KeysMigrated, 1)
+			atomic.AddInt64(&task.KeysFailed, -1)
 		} else {
 			failCount++
 			taskLog.Warn("Retry failed", map[string]interface{}{
@@ -10288,7 +11506,8 @@ func retryFailedKeysAsync(task *Task, keysToRetry []ErrorKey, maxRetries int, ta
 func retryFailedKeysAsyncSilent(task *Task, keysToRetry []ErrorKey, maxRetries int, taskLog *logger.TaskLogger) {
 	ctx := context.Background()
 
-	// 连接 Redis
+	// 连接 Redis（源端支持从 slave 读取）
+	readFromSlave := task.Options != nil && task.Options.ReadFromSlave
 	sourceAddrs := strings.Split(task.SourceCluster, ",")
 	targetAddrs := strings.Split(task.TargetCluster, ",")
 
@@ -10299,7 +11518,7 @@ func retryFailedKeysAsyncSilent(task *Task, keysToRetry []ErrorKey, maxRetries i
 		targetAddrs[i] = strings.TrimSpace(targetAddrs[i])
 	}
 
-	sourceClient, _, err := connectRedis(ctx, sourceAddrs, task.SourcePassword)
+	sourceClient, _, err := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, 0, readFromSlave)
 	if err != nil {
 		taskLog.Error("Failed to connect source for retry", map[string]interface{}{"error": err.Error()})
 		return
@@ -10336,10 +11555,11 @@ func retryFailedKeysAsyncSilent(task *Task, keysToRetry []ErrorKey, maxRetries i
 			// 从错误列表中移除
 			removeErrorKey(task.ID, key)
 
-			tasksMu.Lock()
-			task.KeysMigrated++
-			task.KeysFailed--
-			tasksMu.Unlock()
+			// 【核心设计】自动重试成功：直接原子操作 task 字段
+			// worker 也是直接原子操作 task 字段，两者不冲突
+			// 不再需要 retryAdj 等额外机制
+			atomic.AddInt64(&task.KeysMigrated, 1)
+			atomic.AddInt64(&task.KeysFailed, -1)
 		} else {
 			failCount++
 		}
@@ -10355,10 +11575,10 @@ func retryFailedKeysAsyncSilent(task *Task, keysToRetry []ErrorKey, maxRetries i
 }
 
 // removeErrorKey 从错误列表中移除 key
+// 【BUG-FIX】同时记录到已移除集合，确保落盘文件中的 Key 也能被过滤
 func removeErrorKey(taskID, key string) {
+	// 从内存列表移除
 	errorKeyMu.Lock()
-	defer errorKeyMu.Unlock()
-
 	if keys, ok := errorKeys[taskID]; ok {
 		newKeys := make([]ErrorKey, 0, len(keys))
 		for _, k := range keys {
@@ -10368,6 +11588,15 @@ func removeErrorKey(taskID, key string) {
 		}
 		errorKeys[taskID] = newKeys
 	}
+	errorKeyMu.Unlock()
+
+	// 记录到已移除集合（用于过滤落盘文件中的 Key）
+	removedErrorKeysMu.Lock()
+	if removedErrorKeys[taskID] == nil {
+		removedErrorKeys[taskID] = make(map[string]bool)
+	}
+	removedErrorKeys[taskID][key] = true
+	removedErrorKeysMu.Unlock()
 }
 
 // taskHealthHandler 获取任务健康状态
@@ -10413,11 +11642,8 @@ func taskHealthHandler(w http.ResponseWriter, r *http.Request, id string, log *l
 		health["active_workers"] = 0
 	}
 
-	// 错误统计
-	errorKeyMu.RLock()
-	errorCount := len(errorKeys[id])
-	errorKeyMu.RUnlock()
-	health["error_keys_count"] = errorCount
+	// 错误统计（使用 task 计数器，准确值）
+	health["error_keys_count"] = atomic.LoadInt64(&task.KeysFailed)
 
 	// 重试状态
 	retryStateMu.RLock()
@@ -11600,6 +12826,7 @@ func createTaskFromTemplate(w http.ResponseWriter, r *http.Request, id string, l
 		Phase:          "full",
 		Options:        options,
 	}
+	task.Init() // 统一初始化运行时控制字段
 
 	tasksMu.Lock()
 	tasks[task.ID] = task
@@ -11800,26 +13027,63 @@ func getOrCreateAutoRecoveryState(taskID string) *AutoRecoveryState {
 	state := &AutoRecoveryState{
 		TaskID:            taskID,
 		PausedAt:          time.Now(),
-		AutoResumeEnabled: true, // 默认启用自动恢复
+		AutoResumeEnabled: false, // 默认不启用，只有 autoStopTask 才显式启用
 	}
 	autoRecoveryStates[taskID] = state
 	return state
 }
 
 // autoResumeTask 自动恢复任务
+// 【BUG-FIX】不再无条件启动新的 simulateProgress
+// 而是先检查是否有正在运行的迁移流程，如果有则只改变状态
+// 【死锁修复】先释放 tasksMu 再获取 fullMigrationMu，避免嵌套锁
 func autoResumeTask(task *Task) error {
 	tasksMu.Lock()
-	defer tasksMu.Unlock()
-
+	
 	if task.Status != "paused" {
+		tasksMu.Unlock()
 		return fmt.Errorf("task is not paused, current status: %s", task.Status)
 	}
 
+	taskLog := logger.WithTask(task.ID)
+	taskID := task.ID
+	tasksMu.Unlock()
+	
+	// 【死锁修复】在 tasksMu 之外检查 fullMigrationMu，消除嵌套锁
+	fullMigrationMu.Lock()
+	isFullRunning := fullMigrationRunning[taskID]
+	fullMigrationMu.Unlock()
+	
+	// 重新获取 tasksMu 更新状态
+	tasksMu.Lock()
+	// 二次检查：防止在释放锁期间状态被改变
+	if task.Status != "paused" {
+		tasksMu.Unlock()
+		return fmt.Errorf("task status changed during resume check, current status: %s", task.Status)
+	}
+	
+	if isFullRunning {
+		// 全量迁移仍在运行，只改变状态，不启动新流程
+		task.Status = "running"
+		task.UpdatedAt = time.Now().Format(time.RFC3339)
+		tasksMu.Unlock()
+		
+		taskLog.Warn("【BUG-FIX】Full migration goroutine still running, only changing status without starting new migration", map[string]interface{}{
+			"task_name": task.Name,
+			"phase":     task.Phase,
+			"progress":  task.Progress,
+		})
+		return nil
+	}
+	
+	// 没有正在运行的迁移，需要重新启动
+	task.Init() // 统一初始化运行时控制字段
 	task.Status = "running"
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
+	
+	tasksMu.Unlock()
 
-	taskLog := logger.WithTask(task.ID)
-	taskLog.Info("Task auto-resumed", map[string]interface{}{
+	taskLog.Info("Task auto-resumed, starting new migration goroutine", map[string]interface{}{
 		"task_name": task.Name,
 		"phase":     task.Phase,
 		"progress":  task.Progress,
@@ -11862,10 +13126,14 @@ func retryFailedKeysForRunningTasks() {
 	}
 
 	for _, task := range runningTasks {
-		// 获取失败的 Key 列表
-		errorKeyMu.RLock()
-		failedKeys := errorKeys[task.ID]
-		errorKeyMu.RUnlock()
+		// 【BUG-FIX】从内存 + 落盘文件合并获取失败 Key
+		allKeys := getAllErrorKeys(task.ID, 0)
+		var failedKeys []ErrorKey
+		for _, k := range allKeys {
+			if k.Reason == "failed" || k.Reason == "timeout" {
+				failedKeys = append(failedKeys, k)
+			}
+		}
 
 		if len(failedKeys) == 0 {
 			continue
@@ -12115,10 +13383,8 @@ func exportTaskReportHandler(w http.ResponseWriter, r *http.Request, id string, 
 		},
 	}
 
-	// 获取错误 Key 信息
-	errorKeyMu.RLock()
-	errorKeyList := errorKeys[id]
-	errorKeyMu.RUnlock()
+	// 获取错误 Key 信息（合并内存 + 落盘）
+	errorKeyList := getAllErrorKeys(id, 10)
 
 	if len(errorKeyList) > 0 {
 		sampleSize := len(errorKeyList)
@@ -12186,10 +13452,8 @@ func exportTaskReportCSV(w http.ResponseWriter, id string, task *Task, log *logg
 	sb.WriteString(fmt.Sprintf("总数据量,%s\n", formatBytesSize(task.BytesTotal)))
 	sb.WriteString("\n")
 
-	// 错误 Key 列表
-	errorKeyMu.RLock()
-	errorKeyList := errorKeys[id]
-	errorKeyMu.RUnlock()
+	// 错误 Key 列表（合并内存 + 落盘，最多 1000 条用于报告）
+	errorKeyList := getAllErrorKeys(id, 1000)
 
 	if len(errorKeyList) > 0 {
 		sb.WriteString("=== 错误 Key 列表 ===\n")
@@ -12503,6 +13767,7 @@ func importTaskConfigHandler(w http.ResponseWriter, r *http.Request, log *logger
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
+	task.Init() // 统一初始化运行时控制字段
 
 	tasksMu.Lock()
 	tasks[taskID] = task
@@ -13396,7 +14661,7 @@ func runVerifyTask(task *VerifyTask) {
 	sourceAddrs := strings.Split(task.SourceCluster, ",")
 	targetAddrs := strings.Split(task.TargetCluster, ",")
 
-	sourceClient, sourceIsCluster, err := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, concurrency)
+	sourceClient, sourceIsCluster, err := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, concurrency, false)
 	if err != nil {
 		taskLog.Error("Failed to connect source cluster", map[string]interface{}{"error": err.Error()})
 		task.Status = "failed"
@@ -13404,7 +14669,7 @@ func runVerifyTask(task *VerifyTask) {
 	}
 	defer sourceClient.Close()
 
-	targetClient, targetIsCluster, err := connectRedisWithPoolSize(ctx, targetAddrs, task.TargetPassword, concurrency)
+	targetClient, targetIsCluster, err := connectRedisWithPoolSize(ctx, targetAddrs, task.TargetPassword, concurrency, false)
 	if err != nil {
 		taskLog.Error("Failed to connect target cluster", map[string]interface{}{"error": err.Error()})
 		task.Status = "failed"

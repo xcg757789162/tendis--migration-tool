@@ -825,21 +825,34 @@ func (s *SQLiteDB) GetTaskProgressModel(taskID string) (*model.Progress, error) 
 }
 
 // SaveSlotAssignment 保存 Slot 分配
+// 重要修复：使用 INSERT OR IGNORE 避免覆盖已有的断点数据（last_cursor, keys_migrated 等）
+// 如果 slot 已存在（从断点恢复场景），只更新 worker_id，保留断点信息
 func (s *SQLiteDB) SaveSlotAssignment(assignment *model.SlotAssignment) error {
-	query := `INSERT OR REPLACE INTO slot_status (task_id, slot, worker_id, status, updated_at) VALUES`
-	
 	now := time.Now().Format(time.RFC3339)
 	for slot := assignment.SlotStart; slot <= assignment.SlotEnd; slot++ {
-		_, err := s.db.Exec(
-			`INSERT OR REPLACE INTO slot_status (task_id, slot, worker_id, status, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		// 先尝试插入新记录（如果不存在）
+		result, err := s.db.Exec(
+			`INSERT OR IGNORE INTO slot_status (task_id, slot, worker_id, status, last_cursor, keys_migrated, bytes_migrated, updated_at) 
+			 VALUES (?, ?, ?, ?, '0', 0, 0, ?)`,
 			assignment.TaskID, slot, assignment.WorkerID, assignment.Status, now,
 		)
 		if err != nil {
 			return err
 		}
+		
+		// 如果没有插入（记录已存在），只更新 worker_id，保留断点数据
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected == 0 {
+			_, err = s.db.Exec(
+				`UPDATE slot_status SET worker_id = ?, updated_at = ? WHERE task_id = ? AND slot = ?`,
+				assignment.WorkerID, now, assignment.TaskID, slot,
+			)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	
-	_ = query // 抑制 unused 警告
 	return nil
 }
 

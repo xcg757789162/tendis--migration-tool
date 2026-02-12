@@ -93,7 +93,8 @@ type FakeSlave struct {
 	// 运行状态
 	running atomic.Bool
 	// 停止信号
-	stopCh chan struct{}
+	stopCh   chan struct{}
+	stopOnce sync.Once // 【BUG-FIX】防止多次 close(stopCh) panic
 	// 错误信息
 	lastError atomic.Value
 
@@ -189,12 +190,18 @@ func (fs *FakeSlave) Start(ctx context.Context) error {
 	}
 }
 
-// Stop 停止伪 Slave
+// Stop 停止伪 Slave（安全：支持多次调用，不会 panic）
 func (fs *FakeSlave) Stop() {
-	close(fs.stopCh)
+	// 【BUG-FIX】使用 sync.Once 防止多次 close(stopCh) 导致 panic
+	// 场景：autoStopTask 关闭 task.stopCh → simulateProgress 退出时又调用 fs.Stop()
+	// 如果 panic，defer sourceClient.Close() 被跳过，导致连接泄漏
+	fs.stopOnce.Do(func() {
+		close(fs.stopCh)
+	})
 	fs.mu.Lock()
 	if fs.conn != nil {
 		fs.conn.Close()
+		fs.conn = nil
 	}
 	fs.mu.Unlock()
 }

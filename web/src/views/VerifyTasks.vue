@@ -9,14 +9,14 @@
     </div>
 
     <!-- 任务列表 -->
-    <el-table :data="tasks" v-loading="loading" style="width: 100%">
-      <el-table-column label="任务名称" min-width="180">
+    <el-table :data="tasks" v-loading="loading" style="width: 100%" :cell-style="{ padding: '8px 0' }">
+      <el-table-column label="任务名称" min-width="180" show-overflow-tooltip>
         <template #default="{ row }">
           <span class="task-name" @click="viewTask(row.id)">{{ row.name }}</span>
         </template>
       </el-table-column>
       
-      <el-table-column label="校验模式" width="120">
+      <el-table-column label="校验模式" min-width="100">
         <template #default="{ row }">
           <el-tag :type="getModeType(row.verify_mode)" size="small">
             {{ getModeText(row.verify_mode) }}
@@ -24,7 +24,7 @@
         </template>
       </el-table-column>
       
-      <el-table-column label="状态" width="100">
+      <el-table-column label="状态" min-width="90">
         <template #default="{ row }">
           <el-tag :type="getStatusType(row.status)" size="small">
             {{ getStatusText(row.status) }}
@@ -32,17 +32,17 @@
         </template>
       </el-table-column>
       
-      <el-table-column label="进度" width="150">
+      <el-table-column label="进度" min-width="140">
         <template #default="{ row }">
           <el-progress 
             :percentage="row.result?.progress || 0" 
             :status="getProgressStatus(row.status)"
-            :stroke-width="6"
+            :stroke-width="8"
           />
         </template>
       </el-table-column>
       
-      <el-table-column label="一致性" width="100">
+      <el-table-column label="一致性" min-width="90">
         <template #default="{ row }">
           <span 
             v-if="row.result?.sampled_keys > 0" 
@@ -54,64 +54,45 @@
         </template>
       </el-table-column>
       
-      <el-table-column label="源端Key数" width="120">
+      <el-table-column label="源端Key数" min-width="110">
         <template #default="{ row }">
           {{ formatNumber(row.result?.source_key_count) || '-' }}
         </template>
       </el-table-column>
       
-      <el-table-column label="目标端Key数" width="120">
+      <el-table-column label="目标端Key数" min-width="110">
         <template #default="{ row }">
           {{ formatNumber(row.result?.target_key_count) || '-' }}
         </template>
       </el-table-column>
       
-      <el-table-column label="创建时间" width="170">
+      <el-table-column label="创建时间" min-width="160">
         <template #default="{ row }">
           {{ formatTime(row.created_at) }}
         </template>
       </el-table-column>
       
-      <el-table-column label="操作" width="200" fixed="right">
+      <el-table-column label="操作" width="270">
         <template #default="{ row }">
-          <el-button 
-            v-if="row.status === 'pending'" 
-            type="primary" 
-            size="small" 
-            @click="startTask(row.id)"
-          >
-            启动
-          </el-button>
-          <el-button 
-            v-if="row.status === 'running'" 
-            type="warning" 
-            size="small" 
-            @click="stopTask(row.id)"
-          >
-            停止
-          </el-button>
-          <el-button 
-            size="small" 
-            @click="viewTask(row.id)"
-          >
-            详情
-          </el-button>
-          <el-button 
-            v-if="row.status !== 'running'"
-            type="danger" 
-            size="small" 
-            @click="deleteTask(row.id)"
-          >
-            删除
-          </el-button>
+          <div class="action-buttons">
+            <!-- 状态操作按钮 -->
+            <el-button v-if="row.status === 'pending'" type="primary" size="small" @click="startTask(row.id)">启动</el-button>
+            <el-button v-if="row.status === 'running'" type="warning" size="small" @click="stopTask(row.id)">停止</el-button>
+            <el-button v-if="row.status === 'completed' || row.status === 'failed' || row.status === 'cancelled'" type="success" size="small" @click="rerunTask(row)">重新执行</el-button>
+            <!-- 常用操作按钮 -->
+            <el-button type="primary" plain size="small" @click="viewTask(row.id)">详情</el-button>
+            <el-button type="primary" plain size="small" @click="editTask(row)" :disabled="row.status === 'running'">编辑</el-button>
+            <el-button type="primary" plain size="small" @click="copyTask(row)">复制</el-button>
+            <el-button type="danger" size="small" @click="deleteTask(row.id)" :disabled="row.status === 'running'">删除</el-button>
+          </div>
         </template>
       </el-table-column>
     </el-table>
 
-    <!-- 创建校验任务对话框 -->
+    <!-- 创建/编辑校验任务对话框 -->
     <el-dialog 
       v-model="showCreateDialog" 
-      title="创建校验任务" 
+      :title="isEditMode ? '编辑校验任务' : '创建校验任务'" 
       width="700px"
       destroy-on-close
     >
@@ -175,7 +156,7 @@
           <span class="hint">{{ createForm.sample_rate_percent }}%</span>
         </el-form-item>
         
-        <el-form-item label="最大Key数" v-if="createForm.verify_mode !== 'count_only'">
+        <el-form-item label="最大Key数" v-if="createForm.verify_mode === 'sample'">
           <el-input-number 
             v-model="createForm.max_keys" 
             :min="100" 
@@ -350,7 +331,9 @@
       
       <template #footer>
         <el-button @click="showCreateDialog = false">取消</el-button>
-        <el-button type="primary" @click="createTask" :loading="creating">创建</el-button>
+        <el-button type="primary" @click="submitTask" :loading="creating">
+          {{ isEditMode ? '保存' : '创建' }}
+        </el-button>
       </template>
     </el-dialog>
 
@@ -497,27 +480,75 @@
           
           <!-- 不匹配详情 -->
           <div v-if="currentTask.result.details?.length > 0" class="mismatch-details">
-            <h4>不匹配详情（最多显示100条）</h4>
-            <el-table :data="currentTask.result.details" max-height="300">
-              <el-table-column prop="key" label="Key" min-width="200" />
-              <el-table-column prop="type" label="类型" width="120">
+            <div class="mismatch-header">
+              <h4>不匹配详情（最多显示10000条）</h4>
+              <div class="mismatch-actions">
+                <span class="mismatch-count">共 {{ formatNumber(currentTask.result.total_mismatch_count || currentTask.result.details?.length || 0) }} 条</span>
+                <el-button 
+                  v-if="(currentTask.result.total_mismatch_count || 0) > 10000"
+                  type="primary" 
+                  size="small" 
+                  @click="downloadMismatchDetails"
+                >
+                  <el-icon><Download /></el-icon>
+                  下载完整数据
+                </el-button>
+              </div>
+            </div>
+            <el-table :data="currentTask.result.details.slice(0, 10000)" max-height="400">
+              <el-table-column prop="key" label="Key" min-width="200" show-overflow-tooltip />
+              <el-table-column prop="type" label="差异类型" width="130">
                 <template #default="{ row }">
                   <el-tag :type="getMismatchType(row.type)" size="small">
                     {{ getMismatchText(row.type) }}
                   </el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="源端" min-width="150">
+              <el-table-column label="源端值" min-width="200">
                 <template #default="{ row }">
-                  {{ row.source_value || (row.source_ttl !== undefined ? `TTL: ${row.source_ttl}s` : '-') }}
+                  <div v-if="row.type === 'missing' || row.type === 'lack_target'" class="value-cell">
+                    <span class="value-text">{{ truncateValue(row.source_value) || '-' }}</span>
+                    <span v-if="row.source_ttl !== undefined" class="ttl-info">TTL: {{ row.source_ttl }}s</span>
+                  </div>
+                  <div v-else-if="row.type === 'extra' || row.type === 'lack_source'" class="value-cell no-value">
+                    <span class="not-exist">不存在</span>
+                  </div>
+                  <div v-else class="value-cell">
+                    <span class="value-text">{{ truncateValue(row.source_value) || '-' }}</span>
+                    <span v-if="row.source_ttl !== undefined" class="ttl-info">TTL: {{ row.source_ttl }}s</span>
+                  </div>
                 </template>
               </el-table-column>
-              <el-table-column label="目标端" min-width="150">
+              <el-table-column label="目标端值" min-width="200">
                 <template #default="{ row }">
-                  {{ row.target_value || (row.target_ttl !== undefined ? `TTL: ${row.target_ttl}s` : '-') }}
+                  <div v-if="row.type === 'missing' || row.type === 'lack_target'" class="value-cell no-value">
+                    <span class="not-exist">不存在</span>
+                  </div>
+                  <div v-else-if="row.type === 'extra' || row.type === 'lack_source'" class="value-cell">
+                    <span class="value-text">{{ truncateValue(row.target_value) || '-' }}</span>
+                    <span v-if="row.target_ttl !== undefined" class="ttl-info">TTL: {{ row.target_ttl }}s</span>
+                  </div>
+                  <div v-else class="value-cell">
+                    <span class="value-text" :class="{ 'value-diff': row.source_value !== row.target_value }">
+                      {{ truncateValue(row.target_value) || '-' }}
+                    </span>
+                    <span v-if="row.target_ttl !== undefined" class="ttl-info">TTL: {{ row.target_ttl }}s</span>
+                  </div>
                 </template>
               </el-table-column>
             </el-table>
+            <div v-if="(currentTask.result.total_mismatch_count || 0) > 10000" class="mismatch-footer">
+              <el-alert 
+                type="warning" 
+                :closable="false"
+                show-icon
+              >
+                <template #title>
+                  仅显示前 10000 条，共 {{ formatNumber(currentTask.result.total_mismatch_count) }} 条不匹配记录。
+                  <el-link type="primary" @click="downloadMismatchDetails">点击下载完整数据</el-link>
+                </template>
+              </el-alert>
+            </div>
           </div>
           
           <!-- P2: 双向校验结果 - 目标端多余 Key -->
@@ -616,7 +647,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, TrendCharts, InfoFilled, WarningFilled, Document, DataLine } from '@element-plus/icons-vue'
+import { Plus, TrendCharts, InfoFilled, WarningFilled, Document, DataLine, Download } from '@element-plus/icons-vue'
 import api from '@/api'
 import dayjs from 'dayjs'
 
@@ -626,6 +657,8 @@ const tasks = ref([])
 const showCreateDialog = ref(false)
 const showDetailDialog = ref(false)
 const currentTask = ref(null)
+const isEditMode = ref(false)
+const editingTaskId = ref(null)
 
 const createForm = ref({
   name: '',
@@ -677,49 +710,7 @@ const createTask = async () => {
   
   creating.value = true
   try {
-    const data = {
-      name: createForm.value.name,
-      source_cluster: {
-        addrs: createForm.value.source_addrs.split(',').map(s => s.trim()).filter(Boolean),
-        password: createForm.value.source_password
-      },
-      target_cluster: {
-        addrs: createForm.value.target_addrs.split(',').map(s => s.trim()).filter(Boolean),
-        password: createForm.value.target_password
-      },
-      verify_mode: createForm.value.verify_mode,
-      sample_rate: createForm.value.sample_rate_percent / 100, // 转换为小数
-      max_keys: createForm.value.max_keys,
-      compare_mode: createForm.value.compare_mode,
-      compare_ttl: createForm.value.compare_ttl,
-      ttl_tolerance: createForm.value.ttl_tolerance,
-      skip_large_key: createForm.value.skip_large_key,
-      large_key_threshold: createForm.value.large_key_threshold_mb * 1024 * 1024, // 转换为字节
-      concurrency: createForm.value.concurrency,
-      qps: createForm.value.qps,
-      db_list: createForm.value.db_list,
-      compare_rounds: createForm.value.compare_rounds,
-      round_interval: createForm.value.round_interval,
-      // P1/P2 新增功能
-      direction: createForm.value.direction,
-      smart_compare: createForm.value.smart_compare,
-      field_level_compare: createForm.value.field_level_compare,
-      field_scan_threshold: createForm.value.field_scan_threshold,
-      enable_sqlite: createForm.value.enable_sqlite,
-      auto_start: createForm.value.auto_start
-    }
-    
-    // Key 过滤
-    if (createForm.value.key_prefixes || createForm.value.exclude_prefixes) {
-      data.key_filter = {}
-      if (createForm.value.key_prefixes) {
-        data.key_filter.prefixes = createForm.value.key_prefixes.split(',').map(s => s.trim()).filter(Boolean)
-      }
-      if (createForm.value.exclude_prefixes) {
-        data.key_filter.exclude_prefixes = createForm.value.exclude_prefixes.split(',').map(s => s.trim()).filter(Boolean)
-      }
-    }
-    
+    const data = buildTaskData()
     await api.createVerifyTask(data)
     ElMessage.success('校验任务创建成功')
     showCreateDialog.value = false
@@ -733,6 +724,8 @@ const createTask = async () => {
 }
 
 const resetCreateForm = () => {
+  isEditMode.value = false
+  editingTaskId.value = null
   createForm.value = {
     name: '',
     source_addrs: '',
@@ -761,6 +754,178 @@ const resetCreateForm = () => {
     exclude_prefixes: '',
     auto_start: true
   }
+}
+
+// 填充表单数据（用于编辑和复制）
+const fillFormFromTask = (task) => {
+  createForm.value = {
+    name: task.name || '',
+    source_addrs: task.source_cluster?.addrs?.join(',') || task.source_cluster || '',
+    source_password: task.source_cluster?.password || '',
+    target_addrs: task.target_cluster?.addrs?.join(',') || task.target_cluster || '',
+    target_password: task.target_cluster?.password || '',
+    verify_mode: task.verify_mode || 'sample',
+    sample_rate_percent: (task.sample_rate || 0.01) * 100,
+    max_keys: task.max_keys || 100000,
+    compare_mode: task.compare_mode || 'full_value',
+    compare_ttl: task.compare_ttl || false,
+    ttl_tolerance: task.ttl_tolerance || 5,
+    skip_large_key: task.skip_large_key !== false,
+    large_key_threshold_mb: (task.large_key_threshold || 10485760) / (1024 * 1024),
+    concurrency: task.concurrency || 10,
+    qps: task.qps || 0,
+    db_list: task.db_list || '',
+    compare_rounds: task.compare_rounds || 3,
+    round_interval: task.round_interval || 5,
+    direction: task.direction || 'source_to_target',
+    smart_compare: task.smart_compare || false,
+    field_level_compare: task.field_level_compare || false,
+    field_scan_threshold: task.field_scan_threshold || 5000,
+    enable_sqlite: task.enable_sqlite || false,
+    key_prefixes: task.key_filter?.prefixes?.join(',') || '',
+    exclude_prefixes: task.key_filter?.exclude_prefixes?.join(',') || '',
+    auto_start: true
+  }
+}
+
+// 编辑任务
+const editTask = async (task) => {
+  isEditMode.value = true
+  editingTaskId.value = task.id
+  fillFormFromTask(task)
+  showCreateDialog.value = true
+}
+
+// 复制任务
+const copyTask = (task) => {
+  isEditMode.value = false
+  editingTaskId.value = null
+  fillFormFromTask(task)
+  createForm.value.name = task.name + ' (副本)'
+  showCreateDialog.value = true
+}
+
+// 重新执行任务
+const rerunTask = async (task) => {
+  try {
+    await ElMessageBox.confirm(
+      '确定要重新执行此校验任务吗？这将清除之前的校验结果。',
+      '确认重新执行',
+      { type: 'warning' }
+    )
+    await api.rerunVerifyTask(task.id)
+    ElMessage.success('校验任务已重新启动')
+    fetchTasks()
+  } catch (err) {
+    if (err !== 'cancel') {
+      ElMessage.error('重新执行失败: ' + (err.message || '未知错误'))
+    }
+  }
+}
+
+// 提交任务（创建或更新）
+const submitTask = async () => {
+  if (isEditMode.value) {
+    await updateTask()
+  } else {
+    await createTask()
+  }
+}
+
+// 更新任务
+const updateTask = async () => {
+  if (!createForm.value.source_addrs || !createForm.value.target_addrs) {
+    ElMessage.warning('请填写源端和目标端地址')
+    return
+  }
+  
+  creating.value = true
+  try {
+    const data = buildTaskData()
+    await api.updateVerifyTask(editingTaskId.value, data)
+    ElMessage.success('校验任务更新成功')
+    showCreateDialog.value = false
+    resetCreateForm()
+    fetchTasks()
+  } catch (err) {
+    ElMessage.error('更新失败: ' + (err.message || '未知错误'))
+  } finally {
+    creating.value = false
+  }
+}
+
+// 构建任务数据
+const buildTaskData = () => {
+  const data = {
+    name: createForm.value.name,
+    source_cluster: {
+      addrs: createForm.value.source_addrs.split(',').map(s => s.trim()).filter(Boolean),
+      password: createForm.value.source_password
+    },
+    target_cluster: {
+      addrs: createForm.value.target_addrs.split(',').map(s => s.trim()).filter(Boolean),
+      password: createForm.value.target_password
+    },
+    verify_mode: createForm.value.verify_mode,
+    sample_rate: createForm.value.sample_rate_percent / 100,
+    max_keys: createForm.value.max_keys,
+    compare_mode: createForm.value.compare_mode,
+    compare_ttl: createForm.value.compare_ttl,
+    ttl_tolerance: createForm.value.ttl_tolerance,
+    skip_large_key: createForm.value.skip_large_key,
+    large_key_threshold: createForm.value.large_key_threshold_mb * 1024 * 1024,
+    concurrency: createForm.value.concurrency,
+    qps: createForm.value.qps,
+    db_list: createForm.value.db_list,
+    compare_rounds: createForm.value.compare_rounds,
+    round_interval: createForm.value.round_interval,
+    direction: createForm.value.direction,
+    smart_compare: createForm.value.smart_compare,
+    field_level_compare: createForm.value.field_level_compare,
+    field_scan_threshold: createForm.value.field_scan_threshold,
+    enable_sqlite: createForm.value.enable_sqlite,
+    auto_start: createForm.value.auto_start
+  }
+  
+  if (createForm.value.key_prefixes || createForm.value.exclude_prefixes) {
+    data.key_filter = {}
+    if (createForm.value.key_prefixes) {
+      data.key_filter.prefixes = createForm.value.key_prefixes.split(',').map(s => s.trim()).filter(Boolean)
+    }
+    if (createForm.value.exclude_prefixes) {
+      data.key_filter.exclude_prefixes = createForm.value.exclude_prefixes.split(',').map(s => s.trim()).filter(Boolean)
+    }
+  }
+  
+  return data
+}
+
+// 下载不匹配详情
+const downloadMismatchDetails = async () => {
+  try {
+    const blob = await api.downloadVerifyMismatchDetails(currentTask.value.id)
+    const url = window.URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `verify_mismatch_${currentTask.value.id}.csv`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    window.URL.revokeObjectURL(url)
+    ElMessage.success('下载成功')
+  } catch (err) {
+    ElMessage.error('下载失败: ' + (err.message || '未知错误'))
+  }
+}
+
+// 截断过长的值
+const truncateValue = (value, maxLen = 100) => {
+  if (!value) return null
+  if (typeof value !== 'string') value = String(value)
+  if (value.length > maxLen) {
+    return value.substring(0, maxLen) + '...'
+  }
+  return value
 }
 
 const startTask = async (id) => {
@@ -968,11 +1133,12 @@ onUnmounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 20px;
+  margin-bottom: 16px;
   
   h1 {
     margin: 0;
     font-size: 24px;
+    line-height: 1;
   }
 }
 
@@ -982,6 +1148,49 @@ onUnmounted(() => {
   
   &:hover {
     text-decoration: underline;
+  }
+}
+
+// 操作按钮布局
+.action-buttons {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+  
+  .el-button {
+    margin: 0 !important;
+    padding: 5px 8px !important;
+    min-width: auto !important;
+  }
+  
+  .el-button + .el-button {
+    margin-left: 0 !important;
+  }
+  
+  // 蓝色 plain 按钮使用白色文字
+  .el-button--primary.is-plain {
+    color: #ffffff !important;
+    background-color: var(--el-color-primary) !important;
+    border-color: var(--el-color-primary) !important;
+    
+    &:hover {
+      background-color: var(--el-color-primary-light-3) !important;
+      border-color: var(--el-color-primary-light-3) !important;
+      color: #ffffff !important;
+    }
+    
+    &:active {
+      background-color: var(--el-color-primary-dark-2) !important;
+      border-color: var(--el-color-primary-dark-2) !important;
+      color: #ffffff !important;
+    }
+    
+    &.is-disabled {
+      color: #ffffff !important;
+      background-color: var(--el-color-primary-light-5) !important;
+      border-color: var(--el-color-primary-light-5) !important;
+    }
   }
 }
 
@@ -1024,12 +1233,77 @@ onUnmounted(() => {
   .mismatch-details {
     margin-top: 20px;
     
-    h4 {
-      margin-bottom: 10px;
-      font-size: 14px;
-      color: var(--el-text-color-secondary);
+    .mismatch-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      
+      h4 {
+        margin: 0;
+        font-size: 14px;
+        color: var(--el-text-color-secondary);
+      }
+      
+      .mismatch-actions {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        
+        .mismatch-count {
+          font-size: 13px;
+          color: var(--el-text-color-secondary);
+        }
+      }
+    }
+    
+    .mismatch-footer {
+      margin-top: 12px;
     }
   }
+}
+
+// 不匹配详情表格样式
+.value-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  
+  .value-text {
+    word-break: break-all;
+    font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+    font-size: 12px;
+    
+    &.value-diff {
+      color: var(--el-color-danger);
+      font-weight: 500;
+    }
+  }
+  
+  .ttl-info {
+    font-size: 11px;
+    color: var(--el-text-color-placeholder);
+  }
+  
+  &.no-value {
+    .not-exist {
+      color: var(--el-color-danger);
+      font-style: italic;
+      font-size: 12px;
+    }
+  }
+}
+
+.lack-target {
+  color: var(--el-color-danger);
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.lack-source {
+  color: var(--el-color-warning);
+  font-weight: 500;
+  font-size: 12px;
 }
 
 .consistency-large {

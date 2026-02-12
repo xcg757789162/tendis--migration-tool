@@ -31,6 +31,7 @@
         <el-option label="运行中" value="running" />
         <el-option label="已暂停" value="paused" />
         <el-option label="已完成" value="completed" />
+        <el-option label="已停止" value="stopped" />
         <el-option label="失败" value="failed" />
       </el-select>
       
@@ -98,7 +99,7 @@
           </template>
         </el-table-column>
         
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" width="260" fixed="right">
           <template #default="{ row }">
             <div class="actions" @click.stop>
               <template v-if="row.status === 'pending'">
@@ -106,9 +107,29 @@
               </template>
               <template v-else-if="row.status === 'running'">
                 <el-button size="small" @click="pauseTask(row.id)">暂停</el-button>
+                <el-popconfirm 
+                  title="确定要停止该任务吗？停止后任务将标记为已停止状态。"
+                  confirm-button-text="确认停止"
+                  cancel-button-text="取消"
+                  @confirm="stopTask(row.id)"
+                >
+                  <template #reference>
+                    <el-button size="small" type="warning">停止</el-button>
+                  </template>
+                </el-popconfirm>
               </template>
               <template v-else-if="row.status === 'paused'">
                 <el-button size="small" type="primary" @click="resumeTask(row.id)">恢复</el-button>
+                <el-popconfirm 
+                  title="确定要停止该任务吗？停止后任务将标记为已停止状态。"
+                  confirm-button-text="确认停止"
+                  cancel-button-text="取消"
+                  @confirm="stopTask(row.id)"
+                >
+                  <template #reference>
+                    <el-button size="small" type="warning">停止</el-button>
+                  </template>
+                </el-popconfirm>
               </template>
               <el-button size="small" type="danger" @click="deleteTask(row)">删除</el-button>
             </div>
@@ -284,6 +305,17 @@ const resumeTask = async (id) => {
   }
 }
 
+// 【新增】停止任务
+const stopTask = async (id) => {
+  try {
+    await api.stopTask(id)
+    ElMessage.success('任务已停止')
+    fetchTasks()
+  } catch (err) {
+    ElMessage.error('停止失败: ' + (err.message || '未知错误'))
+  }
+}
+
 const deleteTask = async (task) => {
   try {
     await ElMessageBox.confirm(
@@ -310,8 +342,12 @@ const getStatusText = (status) => {
     pending: '待启动',
     running: '运行中',
     paused: '已暂停',
+    stopped: '已停止',
     completed: '已完成',
-    failed: '失败'
+    failed: '失败',
+    incremental: '增量同步',
+    incremental_stopped: '增量已停止',
+    retrying: '重试中'
   }
   return map[status] || status
 }

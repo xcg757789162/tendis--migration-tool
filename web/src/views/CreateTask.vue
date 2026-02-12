@@ -522,6 +522,33 @@
               </el-col>
             </el-row>
             
+            <!-- 第二行：从Slave读取 -->
+            <el-row :gutter="16" style="margin-top: 8px">
+              <el-col :span="8">
+                <el-form-item>
+                  <template #label>
+                    <span>从 Slave 读取</span>
+                    <el-tooltip placement="top" effect="dark">
+                      <template #content>
+                        <div style="max-width: 300px; line-height: 1.5;">
+                          <p><strong>生产环境推荐开启</strong></p>
+                          <p style="margin-top: 6px;">开启后，SCAN 和 DUMP 操作从 Slave 节点执行，避免影响 Master 的正常读写服务。</p>
+                          <p style="margin-top: 6px; color: #e6a23c;">⚠️ 要求源集群有可用的 Slave 节点</p>
+                        </div>
+                      </template>
+                      <el-icon style="margin-left: 4px; cursor: pointer;"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </template>
+                  <el-switch 
+                    v-model="form.options.read_from_slave" 
+                    active-text="从 Slave 读取"
+                    inactive-text="从 Master 读取"
+                    size="small"
+                  />
+                </el-form-item>
+              </el-col>
+            </el-row>
+            
             <!-- 限速配置：4个参数一行 -->
             <div class="rate-limit-section">
               <h4>限速配置</h4>
@@ -672,11 +699,76 @@
           </div>
         </div>
         
+        <!-- 迁移前校验（始终显示） -->
+        <div class="form-section preflight-section">
+          <h3>
+            <el-icon><CircleCheck /></el-icon> 迁移前校验
+            <el-button 
+              type="primary" 
+              size="small" 
+              @click="runPreflightCheck" 
+              :loading="preflightLoading"
+              style="margin-left: auto;"
+            >
+              <el-icon><Refresh /></el-icon> {{ preflightChecked ? '重新校验' : '开始校验' }}
+            </el-button>
+          </h3>
+          
+          <div v-if="!preflightChecked && !preflightLoading" class="preflight-hint">
+            <el-alert type="info" :closable="false" show-icon>
+              <template #title>建议在创建任务前执行依赖校验，确认源端/目标端连接、集群拓扑、增量同步等环境是否就绪。</template>
+            </el-alert>
+          </div>
+          
+          <div v-if="preflightChecks.length > 0" class="preflight-results">
+            <div v-if="preflightResult" class="preflight-summary">
+              <el-alert 
+                :type="preflightResult.can_start ? (preflightResult.all_passed ? 'success' : 'warning') : 'error'" 
+                :closable="false"
+                show-icon
+              >
+                <template #title>
+                  <span v-if="preflightResult.can_start && preflightResult.all_passed">✅ 所有校验项通过，可以创建任务</span>
+                  <span v-else-if="preflightResult.can_start">⚠️ 存在警告项，但可以创建任务（建议关注警告内容）</span>
+                  <span v-else>❌ 存在必须通过的校验项未通过，无法创建任务</span>
+                </template>
+              </el-alert>
+            </div>
+            
+            <div class="check-list">
+              <div v-for="(check, index) in preflightChecks" :key="index" 
+                   class="check-item" :class="check.status">
+                <div class="check-icon">
+                  <el-icon v-if="check.status === 'passed'" color="#67c23a"><SuccessFilled /></el-icon>
+                  <el-icon v-else-if="check.status === 'failed'" color="#f56c6c"><CircleCloseFilled /></el-icon>
+                  <el-icon v-else color="#e6a23c"><WarningFilled /></el-icon>
+                </div>
+                <div class="check-content">
+                  <div class="check-title">
+                    <span class="check-name">{{ check.name }}</span>
+                    <el-tag v-if="check.required" size="small" type="danger" effect="plain">必须</el-tag>
+                    <el-tag v-else size="small" type="info" effect="plain">可选</el-tag>
+                  </div>
+                  <div class="check-message">{{ check.message }}</div>
+                  <div class="check-detail" v-if="check.detail">{{ check.detail }}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
         <!-- 提交按钮 -->
         <div class="form-actions">
           <div class="right-actions">
-            <el-button @click="$router.push('/tasks')">取消</el-button>
-            <el-button type="primary" @click="submitForm" :loading="submitting">
+            <el-button @click="handleCancel">取消</el-button>
+            
+            <!-- 创建任务按钮：只有校验通过后才可点击 -->
+            <el-button 
+              type="primary" 
+              @click="submitForm" 
+              :loading="submitting"
+              :disabled="!preflightChecked || !preflightResult || !preflightResult.can_start"
+            >
               创建任务
             </el-button>
           </div>
@@ -829,6 +921,13 @@ const formRef = ref()
 const showAdvanced = ref(false)
 const submitting = ref(false)
 const newPrefix = ref('')
+
+// 迁移前校验相关
+const createdTaskId = ref(null)
+const preflightChecks = ref([])
+const preflightLoading = ref(false)
+const preflightResult = ref(null) // { all_passed, can_start }
+const preflightChecked = ref(false) // 是否已执行过校验
 const newExcludePrefix = ref('')
 const newPattern = ref('')
 
@@ -885,6 +984,7 @@ const form = reactive({
     large_key_threshold: 10485760,
     conflict_policy: 'skip_full_only',
     shadow_mode: false,
+    read_from_slave: false,
     key_filter: {
       mode: 'all',
       prefixes: [],
@@ -1411,9 +1511,35 @@ const parseKeyListText = () => {
 }
 
 const submitForm = async () => {
+  if (!createdTaskId.value) {
+    ElMessage.error('请先执行迁移前校验')
+    return
+  }
+  
+  if (!preflightChecked.value || !preflightResult.value || !preflightResult.value.can_start) {
+    ElMessage.error('请先执行迁移前校验并确保通过')
+    return
+  }
+  
+  submitting.value = true
+  try {
+    await api.startTask(createdTaskId.value)
+    ElMessage.success('任务已启动')
+    router.push(`/tasks/${createdTaskId.value}`)
+  } catch (err) {
+    ElMessage.error('启动失败: ' + (err.message || '未知错误'))
+  } finally {
+    submitting.value = false
+  }
+}
+
+// 执行迁移前校验（创建临时任务用于校验）
+const runPreflightCheck = async () => {
+  // 先校验表单
   try {
     await formRef.value.validate()
   } catch {
+    ElMessage.error('请先完善任务配置')
     return
   }
 
@@ -1429,43 +1555,96 @@ const submitForm = async () => {
     ElMessage.error('请输入目标集群地址')
     return
   }
-
-  submitting.value = true
-
+  
+  preflightLoading.value = true
+  
   try {
-    const data = {
-      name: form.name,
-      migration_mode: form.migration_mode,
-      source_cluster: {
-        addrs: sourceAddrs,
-        password: form.source_password
-      },
-      target_cluster: {
-        addrs: targetAddrs,
-        password: form.target_password
-      },
-      options: {
-        ...form.options,
-        skip_full_sync: form.migration_mode === 'incremental_only',
-        skip_incremental: form.migration_mode === 'full_only'
+    // 如果还没有创建任务，先创建一个 pending 状态的任务
+    if (!createdTaskId.value) {
+      // 根据 key_filter.mode 构建正确的 key_filter 配置
+      let keyFilter = {}
+      if (form.options.key_filter.mode === 'all') {
+        keyFilter = { mode: 'all' }
+      } else if (form.options.key_filter.mode === 'prefix') {
+        keyFilter = { mode: 'prefix' }
+        if (form.options.key_filter.prefixes && form.options.key_filter.prefixes.length > 0) {
+          keyFilter.prefixes = form.options.key_filter.prefixes
+        }
+        if (form.options.key_filter.exclude_prefixes && form.options.key_filter.exclude_prefixes.length > 0) {
+          keyFilter.exclude_prefixes = form.options.key_filter.exclude_prefixes
+        }
+      } else if (form.options.key_filter.mode === 'pattern') {
+        keyFilter = { 
+          mode: 'pattern',
+          patterns: form.options.key_filter.patterns || []
+        }
+      } else if (form.options.key_filter.mode === 'keylist') {
+        keyFilter = { 
+          mode: 'keylist',
+          key_list: form.options.key_list || []
+        }
       }
-    }
 
-    const result = await api.createTask(data)
-    ElMessage.success('任务创建成功')
+      const data = {
+        name: form.name,
+        migration_mode: form.migration_mode,
+        source_cluster: {
+          addrs: sourceAddrs,
+          password: form.source_password
+        },
+        target_cluster: {
+          addrs: targetAddrs,
+          password: form.target_password
+        },
+        options: {
+          ...form.options,
+          key_filter: keyFilter,
+          skip_full_sync: form.migration_mode === 'incremental_only',
+          skip_incremental: form.migration_mode === 'full_only'
+        }
+      }
+
+      const result = await api.createTask(data)
+      const taskId = result.task_id || result.id
+      if (!taskId) {
+        throw new Error('创建任务失败，未返回任务ID')
+      }
+      createdTaskId.value = taskId
+    }
     
-    // 获取任务ID，支持 task_id 或 id 两种格式
-    const taskId = result.task_id || result.id
-    if (taskId) {
-      router.push(`/tasks/${taskId}`)
+    // 执行校验
+    const result = await api.preflightCheck(createdTaskId.value)
+    preflightChecks.value = result?.checks || []
+    preflightResult.value = {
+      all_passed: result?.all_passed || false,
+      can_start: result?.can_start || false,
+    }
+    
+    preflightChecked.value = true
+    
+    if (preflightResult.value.can_start) {
+      ElMessage.success('校验通过，可以创建任务')
     } else {
-      // 如果没有返回ID，跳转到任务列表
-      router.push('/tasks')
+      ElMessage.warning('存在必须通过的校验项未通过')
     }
   } catch (err) {
-    ElMessage.error('创建失败: ' + (err.message || '未知错误'))
+    ElMessage.error('依赖校验失败: ' + (err.message || '未知错误'))
+    preflightChecks.value = []
+    preflightResult.value = null
+    preflightChecked.value = false
   } finally {
-    submitting.value = false
+    preflightLoading.value = false
+  }
+}
+
+// 取消按钮
+const handleCancel = () => {
+  if (createdTaskId.value) {
+    // 已创建任务，跳转到任务详情页
+    router.push(`/tasks/${createdTaskId.value}`)
+  } else {
+    // 未创建任务，返回任务列表
+    router.push('/tasks')
   }
 }
 </script>
@@ -1934,6 +2113,104 @@ const submitForm = async () => {
         font-family: 'Consolas', 'Monaco', monospace;
         font-size: 12px;
         color: var(--text-primary);
+        word-break: break-all;
+      }
+    }
+  }
+}
+
+// 迁移前校验区域样式
+.preflight-section {
+  margin-top: 32px;
+  padding-top: 24px;
+  border-top: 2px solid var(--border-light);
+  
+  h3 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 20px 0;
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  
+  .preflight-hint {
+    margin-bottom: 20px;
+  }
+  
+  .preflight-summary {
+    margin-bottom: 16px;
+  }
+  
+  .check-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  
+  .check-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 14px 18px;
+    border-radius: 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-light);
+    transition: all 0.2s;
+    
+    &.passed {
+      background: rgba(103, 194, 58, 0.04);
+      border-color: rgba(103, 194, 58, 0.3);
+    }
+    
+    &.failed {
+      background: rgba(245, 108, 108, 0.04);
+      border-color: rgba(245, 108, 108, 0.3);
+    }
+    
+    &.warning {
+      background: rgba(230, 162, 60, 0.04);
+      border-color: rgba(230, 162, 60, 0.3);
+    }
+    
+    .check-icon {
+      margin-top: 2px;
+      font-size: 18px;
+    }
+    
+    .check-content {
+      flex: 1;
+      
+      .check-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 6px;
+        
+        .check-name {
+          font-weight: 500;
+          font-size: 14px;
+          color: var(--text-primary);
+        }
+      }
+      
+      .check-message {
+        font-size: 13px;
+        color: var(--text-secondary);
+        line-height: 1.6;
+      }
+      
+      .check-detail {
+        margin-top: 6px;
+        padding: 8px 12px;
+        background: var(--bg-hover);
+        border-radius: 6px;
+        font-size: 12px;
+        font-family: 'Consolas', 'Monaco', monospace;
+        color: var(--text-tertiary);
+        line-height: 1.5;
+        white-space: pre-wrap;
         word-break: break-all;
       }
     }

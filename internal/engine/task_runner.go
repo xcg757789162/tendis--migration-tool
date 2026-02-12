@@ -291,6 +291,7 @@ func (r *TaskRunner) estimateTotalKeys() (int64, error) {
 }
 
 // runFullMigration 全量迁移
+// 支持断点恢复：如果 slot_status 表中已有该任务的记录，则从断点继续
 func (r *TaskRunner) runFullMigration() error {
 	// 分配Slots
 	workerCount := r.options.WorkerCount
@@ -298,6 +299,18 @@ func (r *TaskRunner) runFullMigration() error {
 		workerCount = 4
 	}
 
+	// 检查是否有已存在的 slot 分配（断点恢复场景）
+	existingSlots, _ := r.master.store.CountSlotsByStatus(r.task.ID, "assigned")
+	migratingSlots, _ := r.master.store.CountSlotsByStatus(r.task.ID, "migrating")
+	completedSlots, _ := r.master.store.CountSlotsByStatus(r.task.ID, "completed")
+	totalExisting := existingSlots + migratingSlots + completedSlots
+	
+	if totalExisting > 0 {
+		log.Printf("Resuming full migration: found %d existing slots (assigned=%d, migrating=%d, completed=%d)", 
+			totalExisting, existingSlots, migratingSlots, completedSlots)
+	}
+
+	// AssignSlots 现在是安全的（INSERT OR IGNORE），不会覆盖已有的断点数据
 	slots, err := r.master.scheduler.AssignSlots(r.task.ID, workerCount)
 	if err != nil {
 		return err
@@ -1480,6 +1493,12 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 	source := m.runner.sourceClient
 	target := m.runner.targetClient
 
+	// 检查 slot 是否已完成（断点恢复时跳过已完成的 slot）
+	slotStatus, statusErr := m.runner.master.store.GetSlotStatus(m.runner.task.ID, slot)
+	if statusErr == nil && slotStatus != nil && slotStatus.Status == "completed" {
+		return nil // 已完成，跳过
+	}
+
 	// 尝试从断点恢复
 	var cursor uint64
 	var keysMigrated int64
@@ -1489,6 +1508,14 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 		// 解析 cursor
 		fmt.Sscanf(checkpoint, "%d", &cursor)
 		log.Printf("Slot %d: Resuming from checkpoint cursor=%d", slot, cursor)
+	}
+	
+	// 从断点恢复已迁移的 key 数量
+	if statusErr == nil && slotStatus != nil {
+		keysMigrated = slotStatus.KeysMigrated
+		if keysMigrated > 0 {
+			log.Printf("Slot %d: Resuming with %d keys already migrated", slot, keysMigrated)
+		}
 	}
 	
 	batchSize := int64(m.runner.options.ScanBatchSize)
@@ -1542,6 +1569,7 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 	}
 
 	// Slot 完成，标记完成状态
+	m.runner.master.store.UpdateSlotStatus(m.runner.task.ID, slot, "completed")
 	log.Printf("Slot %d: Migration completed, keys=%d", slot, keysMigrated)
 	return nil
 }

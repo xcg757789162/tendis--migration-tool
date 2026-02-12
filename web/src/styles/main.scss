@@ -154,6 +154,39 @@ body {
     background: #fee2e2;
     color: var(--error-color);
   }
+  
+  &.stopped {
+    background: #f1f5f9;
+    color: #64748b;
+  }
+  
+  &.incremental {
+    background: #e0f2fe;
+    color: #0284c7;
+    animation: pulse 2s infinite;
+  }
+  
+  &.incremental_stopped {
+    background: #f3e8ff;
+    color: #7c3aed;
+  }
+  
+  &.retrying {
+    background: #fef3c7;
+    color: #d97706;
+    animation: retrying-pulse 1s infinite;
+  }
+}
+
+@keyframes retrying-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.8;
+    transform: scale(1.02);
+  }
 }
 
 @keyframes pulse {

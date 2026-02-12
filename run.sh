@@ -39,6 +39,12 @@ if [ ! -f "$SCRIPT_DIR/tendis-migrate" ]; then
     exit 1
 fi
 
+# macOS: 修复代码签名（防止因 com.apple.provenance 导致进程 UNE 僵死）
+if [ "$(uname)" = "Darwin" ]; then
+    codesign --force --sign - "$SCRIPT_DIR/tendis-migrate" 2>/dev/null && \
+        echo -e "  ${GREEN}Code signature fixed (macOS)${NC}" || true
+fi
+
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}   Tendis Migration Tool${NC}"
 echo -e "${BLUE}========================================${NC}"

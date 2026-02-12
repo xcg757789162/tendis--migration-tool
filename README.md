@@ -3,7 +3,7 @@
 [![Go Version](https://img.shields.io/badge/Go-1.20+-blue.svg)](https://golang.org/)
 [![Vue Version](https://img.shields.io/badge/Vue-3.x-green.svg)](https://vuejs.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-2.3.0-brightgreen.svg)](https://github.com/xcg757789162/tendis--migration-tool/releases)
+[![Version](https://img.shields.io/badge/Version-2.4.0-brightgreen.svg)](https://github.com/xcg757789162/tendis--migration-tool/releases)
 
 基于 Go + Vue3 + ElementPlus 的 **Tendis/Redis 集群数据迁移管理工具**。
 
@@ -180,7 +180,10 @@ ssh user@server "cd /path/to/deploy && tar -xzvf tendis-migrate-linux-*.tar.gz"
 | POST | /api/v1/tasks/:id/pause | 暂停任务 |
 | POST | /api/v1/tasks/:id/resume | 恢复任务 |
 | POST | /api/v1/tasks/:id/stop | 停止任务 |
+| POST | /api/v1/tasks/:id/complete | 完成任务 |
+| POST | /api/v1/tasks/:id/preflight-check | 迁移前校验 |
 | GET | /api/v1/tasks/:id/progress | 获取迁移进度 |
+| GET | /api/v1/tasks/:id/error-keys | 查看失败 Key |
 | PUT | /api/v1/tasks/:id/config | 动态更新配置 |
 
 ### 动态配置调整
@@ -246,6 +249,50 @@ tendis-migrate/
 | V2.1 | FakeSlave 增量、Binlog 解析 |
 | V2.2 | 性能优化、UI 完善 |
 | **V2.3** | **BUG 修复：Key 过滤、RocksDB Key 解析、错误记录** |
+| **V2.4** | **迁移前校验、集群拓扑刷新、UI 全面升级** |
+
+### V2.4.0 更新内容（2026-02-12）
+
+#### 🚀 新功能
+
+1. **迁移前 Preflight Check**
+   - 启动任务前自动校验：源端/目标端连通性、集群状态、Binlog 配置、版本兼容性
+   - Web UI 可视化校验结果，通过后才允许启动任务
+   - API: `POST /api/v1/tasks/:id/preflight-check`
+
+2. **集群拓扑自动刷新**
+   - 迁移过程中定期刷新集群拓扑，自动适应节点变化
+   - 修复集群拓扑变更导致迁移中断的问题
+
+3. **Error Keys 查询接口**
+   - 支持查看迁移失败的 Key 列表，便于排查和重试
+   - API: `GET /api/v1/tasks/:id/error-keys`
+
+4. **FakeSlave 本地 IP 自动探测**
+   - `getOutboundIP()` 自动探测本机到源端的出口 IP
+   - 不再需要手动配置 FakeSlave 绑定地址
+
+#### 🎨 Web UI 升级
+
+1. **任务详情页全面重构**
+   - 拓扑告警展示、Preflight Check 面板
+   - 实时进度展示优化
+   
+2. **创建任务页增强**
+   - 表单校验优化，必填字段提示
+   
+3. **数据校验页升级**
+   - 校验结果展示优化
+
+4. **任务列表页优化**
+   - 状态展示、操作按钮优化
+
+#### 🐛 BUG 修复
+
+1. 修复集群拓扑变更后连接失效的问题
+2. 修复 FakeSlave 连接时 IP 绑定错误
+3. 修复 SQLite 并发写入冲突
+4. 修复 `connectRedisWithPoolSize` 参数优化（超时、连接池）
 
 ### V2.3.0 更新内容（2026-02-09）
 
@@ -302,4 +349,4 @@ MIT License
 
 ---
 
-*Version: 2.3.0 | 最后更新：2026-02-09*
+*Version: 2.4.0 | 最后更新：2026-02-12*

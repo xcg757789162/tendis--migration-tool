@@ -5,12 +5,18 @@
 # 编译产物
 tendis-migrate
 tendis-migrate-test
+tendis-migrate-test2
 tendis-migrate-darwin
 tendis-migrate-darwin-test
+tendis-migrate-darwin-amd64
 tendis-migrate-linux
 tendis-migrate-master
 tendis-migrate-new
 tendis-migrate-worker
+tendis-migrate-bugfix
+tendis-migrate-bugfix-test
+tendis-migrate-cgo
+tendis-migrate-nocgo
 tendis-migrate-package/
 simple
 simple-server
@@ -39,5 +45,10 @@ web/node_modules/
 *.so
 *.dylib
 
+# Python
+__pycache__/
+*.pyc
+
 # Test files
 snake-game/
+test_cluster_slots.go

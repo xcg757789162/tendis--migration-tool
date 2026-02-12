@@ -3,7 +3,7 @@ import { ElMessage } from 'element-plus'
 
 const api = axios.create({
   baseURL: '/api/v1',
-  timeout: 30000
+  timeout: 60000
 })
 
 api.interceptors.response.use(
@@ -51,6 +51,11 @@ export default {
   
   resumeTask(id) {
     return api.post(`/tasks/${id}/resume`)
+  },
+  
+  // 【新增】停止任务（终止迁移，任务标记为失败）
+  stopTask(id) {
+    return api.post(`/tasks/${id}/stop`)
   },
   
   // 停止增量同步（手动停止，任务进入完成前准备状态）
@@ -136,15 +141,20 @@ export default {
     return api.post('/recommend-config', data)
   },
   
-  // 异常Key
-  getErrorKeys(taskId) {
-    return api.get(`/tasks/${taskId}/error-keys`)
+  // 异常Key（支持分页和筛选）
+  getErrorKeys(taskId, params = {}) {
+    return api.get(`/tasks/${taskId}/error-keys`, { params })
   },
   
   downloadErrorKeys(taskId) {
     return axios.get(`/api/v1/tasks/${taskId}/error-keys/download`, {
       responseType: 'blob'
-    }).then(res => res.data)
+    }).then(res => res)
+  },
+
+  // 迁移前依赖校验
+  preflightCheck(taskId) {
+    return api.post(`/tasks/${taskId}/preflight-check`)
   },
 
   // 模板相关
@@ -273,6 +283,11 @@ export default {
     return api.post('/verify-tasks', data)
   },
 
+  // 更新校验任务
+  updateVerifyTask(id, data) {
+    return api.put(`/verify-tasks/${id}`, data)
+  },
+
   // 删除校验任务
   deleteVerifyTask(id) {
     return api.delete(`/verify-tasks/${id}`)
@@ -286,5 +301,17 @@ export default {
   // 停止校验任务
   stopVerifyTask(id) {
     return api.post(`/verify-tasks/${id}/stop`)
+  },
+
+  // 重新执行校验任务
+  rerunVerifyTask(id) {
+    return api.post(`/verify-tasks/${id}/rerun`)
+  },
+
+  // 下载不匹配详情
+  downloadVerifyMismatchDetails(id) {
+    return axios.get(`/api/v1/verify-tasks/${id}/mismatch-details/download`, {
+      responseType: 'blob'
+    }).then(res => res.data)
   }
 }

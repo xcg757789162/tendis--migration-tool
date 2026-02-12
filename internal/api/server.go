@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -68,6 +70,7 @@ func (s *Server) setupRoutes() {
 			tasks.POST("/:id/resume", s.resumeTask)
 			tasks.POST("/:id/stop", s.stopTask)      // 停止任务（也是停止增量同步）
 			tasks.POST("/:id/complete", s.completeTask) // 完成任务（停止+可选校验+标记完成）
+			tasks.POST("/:id/preflight-check", s.preflightCheck) // 迁移前校验
 			tasks.GET("/:id/progress", s.getProgress)
 			tasks.GET("/:id/metrics", s.getMetrics)
 			tasks.POST("/:id/verify", s.triggerVerify)
@@ -367,6 +370,271 @@ func (s *Server) completeTask(c *gin.Context) {
 	success(c, map[string]interface{}{
 		"message": "Task completed successfully",
 	})
+}
+
+// PreflightCheckResult 迁移前校验结果
+type PreflightCheckResult struct {
+	CanStart bool                  `json:"can_start"`
+	Checks   []PreflightCheckItem  `json:"checks"`
+	Summary  string                `json:"summary"`
+}
+
+// PreflightCheckItem 单个校验项
+type PreflightCheckItem struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"` // passed, failed, warning
+	Message string `json:"message"`
+	Details string `json:"details,omitempty"`
+}
+
+// preflightCheck 迁移前依赖校验
+func (s *Server) preflightCheck(c *gin.Context) {
+	taskID := c.Param("id")
+
+	// 获取任务配置
+	task, err := s.master.GetTask(taskID)
+	if err != nil {
+		fail(c, 500, "Get task failed: "+err.Error())
+		return
+	}
+	if task == nil {
+		fail(c, 404, "Task not found")
+		return
+	}
+
+	// 解析集群配置
+	var sourceCluster, targetCluster model.ClusterConfig
+	if err := json.Unmarshal([]byte(task.SourceCluster), &sourceCluster); err != nil {
+		fail(c, 500, "Parse source cluster config failed: "+err.Error())
+		return
+	}
+	if err := json.Unmarshal([]byte(task.TargetCluster), &targetCluster); err != nil {
+		fail(c, 500, "Parse target cluster config failed: "+err.Error())
+		return
+	}
+
+	// 解析任务配置
+	var migrationOpts model.MigrationOptions
+	if task.Config != "" {
+		if err := json.Unmarshal([]byte(task.Config), &migrationOpts); err != nil {
+			fail(c, 500, "Parse migration options failed: "+err.Error())
+			return
+		}
+	}
+
+	// 执行校验
+	result := &PreflightCheckResult{
+		CanStart: true,
+		Checks:   make([]PreflightCheckItem, 0),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second) // 留5秒buffer
+	defer cancel()
+
+	// 1. 校验源集群连接
+	sourceCheck := s.checkClusterConnection(ctx, "源集群", &sourceCluster)
+	result.Checks = append(result.Checks, sourceCheck)
+	if sourceCheck.Status == "failed" {
+		result.CanStart = false
+	}
+
+	// 2. 校验目标集群连接
+	targetCheck := s.checkClusterConnection(ctx, "目标集群", &targetCluster)
+	result.Checks = append(result.Checks, targetCheck)
+	if targetCheck.Status == "failed" {
+		result.CanStart = false
+	}
+
+	// 3. 校验源集群是否支持增量同步（如果需要）
+	if !migrationOpts.SkipIncremental {
+		incrCheck := s.checkIncrementalSupport(ctx, &sourceCluster)
+		result.Checks = append(result.Checks, incrCheck)
+		if incrCheck.Status == "failed" {
+			result.CanStart = false
+		}
+	}
+
+	// 4. 校验网络延迟
+	latencyCheck := s.checkNetworkLatency(ctx, &sourceCluster, &targetCluster)
+	result.Checks = append(result.Checks, latencyCheck)
+	// 延迟过高只是警告，不阻止任务启动
+
+	// 生成摘要
+	if result.CanStart {
+		result.Summary = "所有校验通过，可以开始迁移"
+	} else {
+		result.Summary = "部分校验未通过，请解决问题后再启动任务"
+	}
+
+	success(c, result)
+}
+
+// checkClusterConnection 检查集群连接
+func (s *Server) checkClusterConnection(ctx context.Context, name string, config *model.ClusterConfig) PreflightCheckItem {
+	item := PreflightCheckItem{
+		Name: name + "连接",
+	}
+
+	if config == nil || len(config.Addrs) == 0 {
+		item.Status = "failed"
+		item.Message = "集群配置为空"
+		return item
+	}
+
+	// 尝试连接
+	client := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:    config.Addrs,
+		Password: config.Password,
+	})
+	defer client.Close()
+
+	if err := client.Ping(ctx).Err(); err != nil {
+		// 尝试单机模式
+		standaloneClient := redis.NewClient(&redis.Options{
+			Addr:     config.Addrs[0],
+			Password: config.Password,
+		})
+		defer standaloneClient.Close()
+
+		if err := standaloneClient.Ping(ctx).Err(); err != nil {
+			item.Status = "failed"
+			item.Message = "连接失败: " + err.Error()
+			return item
+		}
+
+		item.Status = "passed"
+		item.Message = "单机模式连接成功"
+		return item
+	}
+
+	// 获取集群信息
+	var nodeCount int
+	var totalKeys int64
+	err := client.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+		nodeCount++
+		if dbsize, err := node.DBSize(ctx).Result(); err == nil {
+			totalKeys += dbsize
+		}
+		return nil
+	})
+
+	if err != nil {
+		item.Status = "warning"
+		item.Message = "连接成功，但获取集群信息失败"
+		item.Details = err.Error()
+	} else {
+		item.Status = "passed"
+		item.Message = "连接成功"
+		item.Details = fmt.Sprintf("节点数: %d, 总Key数: %d", nodeCount, totalKeys)
+	}
+
+	return item
+}
+
+// checkIncrementalSupport 检查增量同步支持
+func (s *Server) checkIncrementalSupport(ctx context.Context, config *model.ClusterConfig) PreflightCheckItem {
+	item := PreflightCheckItem{
+		Name: "增量同步支持",
+	}
+
+	if config == nil || len(config.Addrs) == 0 {
+		item.Status = "failed"
+		item.Message = "集群配置为空"
+		return item
+	}
+
+	// 连接到第一个节点检查
+	client := redis.NewClient(&redis.Options{
+		Addr:     config.Addrs[0],
+		Password: config.Password,
+	})
+	defer client.Close()
+
+	// 检查是否支持 binlogpos 命令（Tendis）
+	if _, err := client.Do(ctx, "binlogpos", 0).Result(); err == nil {
+		item.Status = "passed"
+		item.Message = "支持Tendis Binlog增量同步"
+		return item
+	}
+
+	// 检查是否支持 PSYNC（标准Redis）
+	if info, err := client.Info(ctx, "replication").Result(); err == nil {
+		if len(info) > 0 {
+			item.Status = "passed"
+			item.Message = "支持Redis PSYNC增量同步"
+			return item
+		}
+	}
+
+	item.Status = "warning"
+	item.Message = "未检测到增量同步支持，将使用定时扫描模式"
+	item.Details = "建议使用支持Binlog或PSYNC的Redis版本以获得更好的增量同步性能"
+	return item
+}
+
+// checkNetworkLatency 检查网络延迟
+func (s *Server) checkNetworkLatency(ctx context.Context, sourceConfig, targetConfig *model.ClusterConfig) PreflightCheckItem {
+	item := PreflightCheckItem{
+		Name: "网络延迟",
+	}
+
+	if sourceConfig == nil || targetConfig == nil || len(sourceConfig.Addrs) == 0 || len(targetConfig.Addrs) == 0 {
+		item.Status = "warning"
+		item.Message = "无法检测延迟"
+		return item
+	}
+
+	// 测试源集群延迟
+	sourceClient := redis.NewClient(&redis.Options{
+		Addr:     sourceConfig.Addrs[0],
+		Password: sourceConfig.Password,
+	})
+	defer sourceClient.Close()
+
+	sourceStart := time.Now()
+	if err := sourceClient.Ping(ctx).Err(); err != nil {
+		item.Status = "warning"
+		item.Message = "无法测试源集群延迟: " + err.Error()
+		return item
+	}
+	sourceLatency := time.Since(sourceStart).Milliseconds()
+
+	// 测试目标集群延迟
+	targetClient := redis.NewClient(&redis.Options{
+		Addr:     targetConfig.Addrs[0],
+		Password: targetConfig.Password,
+	})
+	defer targetClient.Close()
+
+	targetStart := time.Now()
+	if err := targetClient.Ping(ctx).Err(); err != nil {
+		item.Status = "warning"
+		item.Message = "无法测试目标集群延迟: " + err.Error()
+		return item
+	}
+	targetLatency := time.Since(targetStart).Milliseconds()
+
+	maxLatency := sourceLatency
+	if targetLatency > maxLatency {
+		maxLatency = targetLatency
+	}
+
+	if maxLatency < 10 {
+		item.Status = "passed"
+		item.Message = "网络延迟低"
+	} else if maxLatency < 50 {
+		item.Status = "passed"
+		item.Message = "网络延迟正常"
+	} else if maxLatency < 100 {
+		item.Status = "warning"
+		item.Message = "网络延迟较高，可能影响迁移性能"
+	} else {
+		item.Status = "warning"
+		item.Message = "网络延迟很高，建议优化网络环境"
+	}
+
+	item.Details = fmt.Sprintf("源集群: %dms, 目标集群: %dms", sourceLatency, targetLatency)
+	return item
 }
 
 func (s *Server) getProgress(c *gin.Context) {

@@ -654,11 +654,6 @@
                     <el-switch v-model="form.options.shadow_mode" />
                   </el-form-item>
                 </el-col>
-                <el-col :span="4">
-                  <el-form-item label="启用压缩">
-                    <el-switch v-model="form.options.enable_compression" />
-                  </el-form-item>
-                </el-col>
                 <el-col :span="5">
                   <el-form-item label="最大重试次数">
                     <el-input-number 
@@ -750,7 +745,7 @@
                     <el-tag v-else size="small" type="info" effect="plain">可选</el-tag>
                   </div>
                   <div class="check-message">{{ check.message }}</div>
-                  <div class="check-detail" v-if="check.detail">{{ check.detail }}</div>
+                  <div class="check-detail" v-if="check.details">{{ check.details }}</div>
                 </div>
               </div>
             </div>
@@ -980,7 +975,7 @@ const form = reactive({
   options: {
     worker_count: 4,
     scan_batch_size: 1000,
-    enable_compression: true,
+    enable_compression: false,
     large_key_threshold: 10485760,
     conflict_policy: 'skip_full_only',
     shadow_mode: false,

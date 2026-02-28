@@ -38,16 +38,27 @@
       <el-button @click="fetchTasks">
         <el-icon><Refresh /></el-icon> 刷新
       </el-button>
+      
+      <!-- 批量操作 -->
+      <el-divider direction="vertical" />
+      <span class="batch-info" v-if="selectedTasks.length > 0">已选 {{ selectedTasks.length }} 项</span>
+      <el-button type="danger" :disabled="selectedTasks.length === 0" @click="batchDelete">
+        <el-icon><Delete /></el-icon> 批量删除
+      </el-button>
+      <el-button v-if="selectedTasks.length > 0" @click="clearSelection">取消选择</el-button>
     </div>
     
     <!-- 任务列表 -->
     <div class="tasks-list">
       <el-table 
+        ref="tableRef"
         :data="filteredTasks" 
         style="width: 100%"
         :row-class-name="getRowClass"
         @row-click="goToDetail"
+        @selection-change="handleSelectionChange"
       >
+        <el-table-column type="selection" width="45" @click.stop />
         <el-table-column label="任务名称" min-width="200">
           <template #default="{ row }">
             <div class="task-name-cell">
@@ -236,6 +247,8 @@ const page = ref(1)
 const pageSize = ref(20)
 const searchText = ref('')
 const statusFilter = ref('')
+const selectedTasks = ref([])
+const tableRef = ref(null)
 let refreshTimer = null
 
 // 配置导入相关
@@ -329,6 +342,40 @@ const deleteTask = async (task) => {
   } catch (err) {
     if (err !== 'cancel') {
       ElMessage.error('删除失败')
+    }
+  }
+}
+
+const handleSelectionChange = (rows) => {
+  selectedTasks.value = rows
+}
+
+const clearSelection = () => {
+  tableRef.value?.clearSelection()
+}
+
+const batchDelete = async () => {
+  const count = selectedTasks.value.length
+  const runningCount = selectedTasks.value.filter(t => t.status === 'running' || t.status === 'paused').length
+  let msg = `确定要删除选中的 ${count} 个任务吗？此操作不可恢复。`
+  if (runningCount > 0) {
+    msg += `\n\n其中 ${runningCount} 个任务正在运行/暂停中，将被强制停止后删除。`
+  }
+  try {
+    await ElMessageBox.confirm(msg, '批量删除确认', {
+      confirmButtonText: `删除 ${count} 个任务`,
+      cancelButtonText: '取消',
+      type: 'warning',
+      dangerouslyUseHTMLString: false
+    })
+    const ids = selectedTasks.value.map(t => t.id)
+    await api.batchDeleteTasks(ids)
+    ElMessage.success(`已删除 ${count} 个任务`)
+    selectedTasks.value = []
+    fetchTasks()
+  } catch (err) {
+    if (err !== 'cancel') {
+      ElMessage.error('批量删除失败: ' + (err.message || '未知错误'))
     }
   }
 }
@@ -502,12 +549,20 @@ onUnmounted(() => {
 .filter-bar {
   display: flex;
   gap: 16px;
+  align-items: center;
   margin-bottom: 24px;
   padding: 20px;
   background: var(--bg-card);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
   border: 1px solid var(--border-light);
+  
+  .batch-info {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--primary-color);
+    white-space: nowrap;
+  }
 }
 
 .tasks-list {

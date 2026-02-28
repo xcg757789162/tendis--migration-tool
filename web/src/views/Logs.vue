@@ -26,7 +26,7 @@
           </template>
         </el-popconfirm>
         <el-popconfirm
-          title="确定要清理过期日志文件吗？将删除超过保留期限的日志文件。"
+          title="确定要清理旧日志吗？将仅保留最近 7 天的日志文件。"
           confirm-button-text="确定清理"
           cancel-button-text="取消"
           @confirm="cleanupOldLogs"
@@ -348,7 +348,7 @@ const fetchStats = async () => {
 
 const fetchTasks = async () => {
   try {
-    const data = await api.getTasks()
+    const data = await api.getTasks({ size: 10000 })
     taskList.value = data.items || []
   } catch (error) {
     console.error('Failed to fetch tasks:', error)

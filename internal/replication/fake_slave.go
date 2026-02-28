@@ -57,6 +57,13 @@ type FakeSlaveConfig struct {
 	CacheManager *BinlogCacheManager
 }
 
+// errorWrapper 包装 error 用于 atomic.Value 存储
+// atomic.Value 要求每次 Store 的值类型完全一致，
+// 但 error 是接口，不同实现类型（*net.OpError, *errors.errorString 等）会导致 panic
+type errorWrapper struct {
+	err error
+}
+
 // BinlogEntry 表示一个 binlog 条目
 type BinlogEntry struct {
 	// Binlog ID
@@ -173,7 +180,7 @@ func (fs *FakeSlave) Start(ctx context.Context) error {
 
 		// 建立连接并运行
 		if err := fs.connectAndRun(ctx); err != nil {
-			fs.lastError.Store(err)
+			fs.lastError.Store(&errorWrapper{err: err})
 			fs.stats.errors.Add(1)
 			log.Printf("[FakeSlave] Connection error: %v, will retry in 3 seconds...", err)
 
@@ -230,8 +237,8 @@ func (fs *FakeSlave) WaitConnected(timeout time.Duration) error {
 	select {
 	case <-fs.connectedCh:
 		// 检查是否有连接错误
-		if err := fs.connectionError.Load(); err != nil {
-			return err.(error)
+		if v := fs.connectionError.Load(); v != nil {
+			return v.(*errorWrapper).err
 		}
 		return nil
 	case <-time.After(timeout):
@@ -254,7 +261,7 @@ func (fs *FakeSlave) connectAndRun(ctx context.Context) error {
 		// 连接失败，记录错误并通知等待者
 		connErr := fmt.Errorf("connect to %s failed: %w", fs.config.SourceAddr, err)
 		if !fs.connected.Load() {
-			fs.connectionError.Store(connErr)
+			fs.connectionError.Store(&errorWrapper{err: connErr})
 			close(fs.connectedCh) // 通知等待者连接失败
 		}
 		return connErr
@@ -282,7 +289,7 @@ func (fs *FakeSlave) connectAndRun(ctx context.Context) error {
 		if err := fs.authenticate(); err != nil {
 			authErr := fmt.Errorf("auth failed: %w", err)
 			if !fs.connected.Load() {
-				fs.connectionError.Store(authErr)
+				fs.connectionError.Store(&errorWrapper{err: authErr})
 				close(fs.connectedCh)
 			}
 			return authErr
@@ -294,7 +301,7 @@ func (fs *FakeSlave) connectAndRun(ctx context.Context) error {
 	if err := fs.sendIncrSync(); err != nil {
 		syncErr := fmt.Errorf("INCRSYNC failed: %w", err)
 		if !fs.connected.Load() {
-			fs.connectionError.Store(syncErr)
+			fs.connectionError.Store(&errorWrapper{err: syncErr})
 			close(fs.connectedCh)
 		}
 		return syncErr
@@ -780,6 +787,18 @@ func (fs *FakeSlave) applyBinlogsToTarget(ctx context.Context, entries []BinlogE
 			// 暂时跳过，优先使用 CMD 模式
 			log.Printf("[FakeSlave] SET entry (RocksDB format) - key=%q, valueLen=%d, skipping (use CMD mode)",
 				entry.Key, len(entry.Value))
+		case "TTL":
+			// 【BUG-FIX TTL 一致性】TTL 设置操作（EXPIRE/PEXPIRE 等）
+			// Tendis binlog 中 EXPIRE 等命令产生 ReplOpTTL(4) 类型的 entry
+			// 需要由 handler（processBinlogEntries）从源端获取 PTTL 并设置
+			log.Printf("[FakeSlave] TTL entry - key=%q, skipping (handled by binlog handler)", entry.Key)
+		case "TTLDEL":
+			// 【BUG-FIX TTL 一致性】TTL 删除操作（PERSIST 命令）
+			// Tendis binlog 中 PERSIST 命令产生 ReplOpTTLDel(5) 类型的 entry
+			if entry.Key != "" {
+				pipe.Persist(ctx, entry.Key)
+				cmdCount++
+			}
 		default:
 			// 未知操作类型
 			log.Printf("[FakeSlave] Unknown OpType: %q, key=%q", entry.OpType, entry.Key)

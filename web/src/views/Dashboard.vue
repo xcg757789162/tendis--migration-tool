@@ -49,21 +49,21 @@
       </div>
     </div>
     
-    <!-- 运行中的任务 -->
+    <!-- 进行中和暂停的任务 -->
     <div class="section">
       <div class="section-header">
         <h2>
           <el-icon><VideoPlay /></el-icon>
-          运行中的任务
+          进行中的任务
         </h2>
         <router-link to="/tasks" class="view-all">查看全部 <el-icon><ArrowRight /></el-icon></router-link>
       </div>
       
-      <div class="running-tasks" v-if="runningTasks.length">
-        <div class="task-card" v-for="task in runningTasks" :key="task.id">
+      <div class="running-tasks" v-if="activeTasks.length">
+        <div class="task-card" v-for="task in activeTasks" :key="task.id">
           <div class="task-header">
             <div class="task-name">{{ task.name }}</div>
-            <span class="status-tag running">运行中</span>
+            <span :class="['status-tag', task.status]">{{ task.status === 'running' ? '运行中' : '已暂停' }}</span>
           </div>
           
           <div class="task-progress">
@@ -96,8 +96,11 @@
           </div>
           
           <div class="task-actions">
-            <el-button size="small" @click="pauseTask(task.id)">
+            <el-button v-if="task.status === 'running'" size="small" @click="pauseTask(task.id)">
               <el-icon><VideoPause /></el-icon> 暂停
+            </el-button>
+            <el-button v-if="task.status === 'paused'" size="small" type="success" @click="resumeTask(task.id)">
+              <el-icon><VideoPlay /></el-icon> 恢复
             </el-button>
             <el-button size="small" type="primary" @click="$router.push(`/tasks/${task.id}`)">
               <el-icon><View /></el-icon> 详情
@@ -106,7 +109,7 @@
         </div>
       </div>
       
-      <el-empty v-else description="暂无运行中的任务">
+      <el-empty v-else description="暂无进行中的任务">
         <el-button type="primary" @click="$router.push('/create')">创建任务</el-button>
       </el-empty>
     </div>
@@ -129,6 +132,9 @@
               </el-button>
             </template>
           </el-popconfirm>
+          <el-button size="small" @click="showBackupDialog">
+            <el-icon><Folder /></el-icon> 管理备份
+          </el-button>
         </div>
       </div>
       
@@ -208,6 +214,59 @@
         </div>
       </div>
     </div>
+
+    <!-- 备份管理对话框 -->
+    <el-dialog v-model="backupDialogVisible" title="备份管理" width="700px" :close-on-click-modal="false">
+      <div style="margin-bottom: 12px; display: flex; justify-content: flex-end;">
+        <el-upload
+          :show-file-list="false"
+          accept=".json"
+          :before-upload="handleBackupUpload"
+        >
+          <el-button size="small" type="success" :loading="uploading">
+            <el-icon><Upload /></el-icon> 导入备份
+          </el-button>
+        </el-upload>
+      </div>
+      <div v-if="backupList.length === 0" style="text-align: center; padding: 30px 0; color: #999;">
+        暂无备份记录，请先创建系统备份或导入备份文件
+      </div>
+      <el-table v-else :data="backupList" stripe style="width: 100%" size="small">
+        <el-table-column prop="file_name" label="备份文件" min-width="240">
+          <template #default="{ row }">
+            <span style="font-family: monospace; font-size: 12px;">{{ row.file_name }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="tasks_count" label="任务数" width="80" align="center" />
+        <el-table-column prop="size" label="大小" width="90" align="center">
+          <template #default="{ row }">{{ formatBytes(row.size) }}</template>
+        </el-table-column>
+        <el-table-column prop="created_at" label="创建时间" width="170">
+          <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="200" align="center" fixed="right">
+          <template #default="{ row }">
+            <el-popconfirm
+              title="恢复备份会导入任务数据（已有任务不受影响），确定？"
+              @confirm="restoreBackup(row.file_name)"
+            >
+              <template #reference>
+                <el-button size="small" type="primary" :loading="row._restoring">恢复</el-button>
+              </template>
+            </el-popconfirm>
+            <el-button size="small" @click="downloadBackup(row.file_name)">下载</el-button>
+            <el-popconfirm
+              title="确定要删除此备份？"
+              @confirm="deleteBackup(row.file_name)"
+            >
+              <template #reference>
+                <el-button size="small" type="danger">删除</el-button>
+              </template>
+            </el-popconfirm>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-dialog>
   </div>
 </template>
 
@@ -226,10 +285,13 @@ const stats = ref({
   completedTasks: 0
 })
 
-const runningTasks = ref([])
+const activeTasks = ref([])
 const systemStatus = ref({})
 const smartRetryStatus = ref(null)
 const backingUp = ref(false)
+const backupDialogVisible = ref(false)
+const backupList = ref([])
+const uploading = ref(false)
 let refreshTimer = null
 
 const fetchData = async () => {
@@ -243,10 +305,14 @@ const fetchData = async () => {
     stats.value.pausedTasks = tasks.filter(t => t.status === 'paused').length
     stats.value.completedTasks = tasks.filter(t => t.status === 'completed').length
     
-    runningTasks.value = tasks
-      .filter(t => t.status === 'running')
-      .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
-      .slice(0, 3)
+    activeTasks.value = tasks
+      .filter(t => t.status === 'running' || t.status === 'paused')
+      .sort((a, b) => {
+        // running 排在 paused 前面
+        if (a.status !== b.status) return a.status === 'running' ? -1 : 1
+        return (b.created_at || '').localeCompare(a.created_at || '')
+      })
+      .slice(0, 5)
     
     // 获取系统状态
     systemStatus.value = await api.getSystemStatus()
@@ -270,6 +336,16 @@ const pauseTask = async (id) => {
     fetchData()
   } catch (err) {
     ElMessage.error('暂停失败')
+  }
+}
+
+const resumeTask = async (id) => {
+  try {
+    await api.resumeTask(id)
+    ElMessage.success('任务已恢复')
+    fetchData()
+  } catch (err) {
+    ElMessage.error('恢复失败')
   }
 }
 
@@ -308,6 +384,76 @@ const createBackup = async () => {
   } finally {
     backingUp.value = false
   }
+}
+
+const showBackupDialog = async () => {
+  backupDialogVisible.value = true
+  try {
+    const data = await api.getBackups()
+    backupList.value = (data?.backups || []).map(b => ({ ...b, _restoring: false }))
+  } catch (err) {
+    ElMessage.error('获取备份列表失败')
+  }
+}
+
+const restoreBackup = async (filename) => {
+  const item = backupList.value.find(b => b.file_name === filename)
+  if (item) item._restoring = true
+  try {
+    const result = await api.restoreBackup(filename)
+    ElMessage.success(`恢复成功：导入 ${result?.restored_tasks || 0} 个任务，跳过 ${result?.skipped_tasks || 0} 个已存在任务`)
+    fetchData()
+  } catch (err) {
+    ElMessage.error('恢复失败: ' + (err.message || '未知错误'))
+  } finally {
+    if (item) item._restoring = false
+  }
+}
+
+const downloadBackup = async (filename) => {
+  try {
+    const blob = await api.downloadBackup(filename)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (err) {
+    ElMessage.error('下载失败')
+  }
+}
+
+const deleteBackup = async (filename) => {
+  try {
+    await api.deleteBackup(filename)
+    ElMessage.success('备份已删除')
+    backupList.value = backupList.value.filter(b => b.file_name !== filename)
+  } catch (err) {
+    ElMessage.error('删除失败')
+  }
+}
+
+const handleBackupUpload = async (file) => {
+  uploading.value = true
+  try {
+    const result = await api.uploadBackup(file)
+    ElMessage.success(`导入成功：${result?.file_name || ''}，包含 ${result?.tasks_count || 0} 个任务`)
+    // 刷新备份列表
+    const data = await api.getBackups()
+    backupList.value = (data?.backups || []).map(b => ({ ...b, _restoring: false }))
+  } catch (err) {
+    ElMessage.error('导入失败: ' + (err.message || '未知错误'))
+  } finally {
+    uploading.value = false
+  }
+  return false // 阻止 el-upload 默认上传
+}
+
+const formatTime = (str) => {
+  if (!str) return '-'
+  const d = new Date(str)
+  return d.toLocaleString('zh-CN')
 }
 
 onMounted(() => {
@@ -461,6 +607,23 @@ onUnmounted(() => {
     .task-name {
       font-weight: 600;
       color: var(--text-primary);
+    }
+    
+    .status-tag {
+      font-size: 12px;
+      padding: 2px 10px;
+      border-radius: 10px;
+      font-weight: 500;
+      
+      &.running {
+        background: #ecfdf5;
+        color: #059669;
+      }
+      
+      &.paused {
+        background: #fff7ed;
+        color: #ea580c;
+      }
     }
   }
   

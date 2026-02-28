@@ -795,6 +795,13 @@ func (s *SQLiteDB) IncrementStats(taskID string, keys, bytes int64) error {
 	return err
 }
 
+// IncrementSkippedAndFiltered 增量更新跳过和过滤的 key 计数
+func (s *SQLiteDB) IncrementSkippedAndFiltered(taskID string, skipped, filtered int64) error {
+	query := `UPDATE tasks SET keys_skipped = keys_skipped + ?, keys_filtered = keys_filtered + ?, updated_at = ? WHERE id = ?`
+	_, err := s.db.Exec(query, skipped, filtered, time.Now().Format(time.RFC3339), taskID)
+	return err
+}
+
 // GetTaskProgressModel 获取任务进度（返回 model.Progress）
 func (s *SQLiteDB) GetTaskProgressModel(taskID string) (*model.Progress, error) {
 	query := `SELECT keys_total, keys_migrated, bytes_total, bytes_migrated, phase FROM tasks WHERE id = ?`

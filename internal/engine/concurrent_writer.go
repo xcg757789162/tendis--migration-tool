@@ -260,16 +260,32 @@ func (w *ConcurrentWriter) addCommand(ctx context.Context, pipe redis.Pipeliner,
 	case "HSET":
 		if len(cmd.Args) >= 2 {
 			pipe.HSet(ctx, cmd.Key, cmd.Args...)
+			// 【BUG-FIX TTL 一致性】非 string 类型也必须设置 TTL
+			if cmd.TTL > 0 {
+				pipe.PExpire(ctx, cmd.Key, cmd.TTL)
+			}
 		}
 		
 	case "LPUSH":
 		pipe.LPush(ctx, cmd.Key, cmd.Args...)
+		// 【BUG-FIX TTL 一致性】
+		if cmd.TTL > 0 {
+			pipe.PExpire(ctx, cmd.Key, cmd.TTL)
+		}
 		
 	case "RPUSH":
 		pipe.RPush(ctx, cmd.Key, cmd.Args...)
+		// 【BUG-FIX TTL 一致性】
+		if cmd.TTL > 0 {
+			pipe.PExpire(ctx, cmd.Key, cmd.TTL)
+		}
 		
 	case "SADD":
 		pipe.SAdd(ctx, cmd.Key, cmd.Args...)
+		// 【BUG-FIX TTL 一致性】
+		if cmd.TTL > 0 {
+			pipe.PExpire(ctx, cmd.Key, cmd.TTL)
+		}
 		
 	case "ZADD":
 		// 需要转换为 Z 结构
@@ -285,6 +301,10 @@ func (w *ConcurrentWriter) addCommand(ctx context.Context, pipe redis.Pipeliner,
 		}
 		if len(members) > 0 {
 			pipe.ZAdd(ctx, cmd.Key, members...)
+			// 【BUG-FIX TTL 一致性】
+			if cmd.TTL > 0 {
+				pipe.PExpire(ctx, cmd.Key, cmd.TTL)
+			}
 		}
 		
 	case "DEL":

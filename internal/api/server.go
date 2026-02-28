@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -381,10 +382,11 @@ type PreflightCheckResult struct {
 
 // PreflightCheckItem 单个校验项
 type PreflightCheckItem struct {
-	Name    string `json:"name"`
-	Status  string `json:"status"` // passed, failed, warning
-	Message string `json:"message"`
-	Details string `json:"details,omitempty"`
+	Name     string `json:"name"`
+	Status   string `json:"status"` // passed, failed, warning
+	Message  string `json:"message"`
+	Details  string `json:"details,omitempty"`
+	Required bool   `json:"required"` // 是否为必须通过的校验项
 }
 
 // preflightCheck 迁移前依赖校验
@@ -431,33 +433,93 @@ func (s *Server) preflightCheck(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second) // 留5秒buffer
 	defer cancel()
 
-	// 1. 校验源集群连接
+	// 1. 校验源集群连接（必须）
 	sourceCheck := s.checkClusterConnection(ctx, "源集群", &sourceCluster)
+	sourceCheck.Required = true
 	result.Checks = append(result.Checks, sourceCheck)
 	if sourceCheck.Status == "failed" {
 		result.CanStart = false
 	}
 
-	// 2. 校验目标集群连接
+	// 2. 校验目标集群连接（必须）
 	targetCheck := s.checkClusterConnection(ctx, "目标集群", &targetCluster)
+	targetCheck.Required = true
 	result.Checks = append(result.Checks, targetCheck)
 	if targetCheck.Status == "failed" {
 		result.CanStart = false
 	}
 
-	// 3. 校验源集群是否支持增量同步（如果需要）
+	// 3. 校验源集群增量同步相关配置（如果需要增量同步）
 	if !migrationOpts.SkipIncremental {
+		// 3a. 校验增量同步支持（必须）
 		incrCheck := s.checkIncrementalSupport(ctx, &sourceCluster)
+		incrCheck.Required = true
 		result.Checks = append(result.Checks, incrCheck)
 		if incrCheck.Status == "failed" {
 			result.CanStart = false
 		}
+
+		// 3b. 校验 binlog-enabled 配置（必须 - Tendis 特有）
+		binlogCheck := s.checkBinlogEnabled(ctx, &sourceCluster)
+		if binlogCheck != nil {
+			binlogCheck.Required = true
+			result.Checks = append(result.Checks, *binlogCheck)
+			if binlogCheck.Status == "failed" {
+				result.CanStart = false
+			}
+		}
+
+		// 3c. 校验 aof-enabled 配置（必须 - Tendis 特有）
+		aofCheck := s.checkAofEnabled(ctx, &sourceCluster)
+		if aofCheck != nil {
+			aofCheck.Required = true
+			result.Checks = append(result.Checks, *aofCheck)
+			if aofCheck.Status == "failed" {
+				result.CanStart = false
+			}
+		}
 	}
 
-	// 4. 校验网络延迟
+	// 4. 校验网络延迟（非必须，仅警告）
 	latencyCheck := s.checkNetworkLatency(ctx, &sourceCluster, &targetCluster)
+	latencyCheck.Required = false
 	result.Checks = append(result.Checks, latencyCheck)
-	// 延迟过高只是警告，不阻止任务启动
+
+	// 5. 校验目标端数据覆盖风险（非必须，仅警告）
+	overwriteCheck := s.checkTargetDataOverwrite(ctx, &targetCluster)
+	overwriteCheck.Required = false
+	result.Checks = append(result.Checks, overwriteCheck)
+
+	// 6. 校验集群 Slot 完整性（必须）
+	if sourceCheck.Status == "passed" {
+		slotCheck := s.checkSlotCoverage(ctx, "源集群", &sourceCluster)
+		if slotCheck != nil {
+			slotCheck.Required = true
+			result.Checks = append(result.Checks, *slotCheck)
+			if slotCheck.Status == "failed" {
+				result.CanStart = false
+			}
+		}
+	}
+	if targetCheck.Status == "passed" {
+		slotCheck := s.checkSlotCoverage(ctx, "目标集群", &targetCluster)
+		if slotCheck != nil {
+			slotCheck.Required = true
+			result.Checks = append(result.Checks, *slotCheck)
+			if slotCheck.Status == "failed" {
+				result.CanStart = false
+			}
+		}
+	}
+
+	// 7. 校验 Tendis kvstorecount 配置（如果需要增量同步且为 Tendis）
+	if !migrationOpts.SkipIncremental {
+		kvCheck := s.checkKvstorecount(ctx, &sourceCluster)
+		if kvCheck != nil {
+			kvCheck.Required = false // 仅作信息展示和警告
+			result.Checks = append(result.Checks, *kvCheck)
+		}
+	}
 
 	// 生成摘要
 	if result.CanStart {
@@ -566,9 +628,9 @@ func (s *Server) checkIncrementalSupport(ctx context.Context, config *model.Clus
 		}
 	}
 
-	item.Status = "warning"
-	item.Message = "未检测到增量同步支持，将使用定时扫描模式"
-	item.Details = "建议使用支持Binlog或PSYNC的Redis版本以获得更好的增量同步性能"
+	item.Status = "failed"
+	item.Message = "源端不支持 Binlog 或 PSYNC 增量同步"
+	item.Details = "增量同步需要源端支持 Tendis Binlog（binlogpos 命令）或 Redis PSYNC。请确认源端版本是否支持增量同步"
 	return item
 }
 
@@ -635,6 +697,290 @@ func (s *Server) checkNetworkLatency(ctx context.Context, sourceConfig, targetCo
 
 	item.Details = fmt.Sprintf("源集群: %dms, 目标集群: %dms", sourceLatency, targetLatency)
 	return item
+}
+
+// checkBinlogEnabled 检查源端 Tendis 是否启用了 binlog
+// 返回 nil 表示非 Tendis（不需要此检测）
+func (s *Server) checkBinlogEnabled(ctx context.Context, config *model.ClusterConfig) *PreflightCheckItem {
+	if config == nil || len(config.Addrs) == 0 {
+		return nil
+	}
+
+	client := redis.NewClient(&redis.Options{
+		Addr:     config.Addrs[0],
+		Password: config.Password,
+	})
+	defer client.Close()
+
+	// 先检测是否是 Tendis（通过 binlogpos 命令判断）
+	if _, err := client.Do(ctx, "binlogpos", 0).Result(); err != nil {
+		return nil // 非 Tendis，不需要检测 binlog-enabled
+	}
+
+	// 是 Tendis，检查 binlog-enabled 配置
+	result, err := client.Do(ctx, "CONFIG", "GET", "binlog-enabled").Result()
+	if err != nil {
+		item := &PreflightCheckItem{
+			Name:    "Binlog 配置",
+			Status:  "warning",
+			Message: "无法读取 binlog-enabled 配置: " + err.Error(),
+			Details: "请手动确认源端 Tendis 已设置 binlog-enabled=yes",
+		}
+		return item
+	}
+
+	// CONFIG GET 返回 []interface{}{"binlog-enabled", "yes/no"}
+	if vals, ok := result.([]interface{}); ok && len(vals) >= 2 {
+		val := fmt.Sprintf("%v", vals[1])
+		if val == "yes" || val == "true" || val == "1" {
+			item := &PreflightCheckItem{
+				Name:    "Binlog 配置",
+				Status:  "passed",
+				Message: "binlog-enabled=yes，增量同步数据源就绪",
+			}
+			return item
+		}
+		item := &PreflightCheckItem{
+			Name:    "Binlog 配置",
+			Status:  "failed",
+			Message: "源端 Tendis 未开启 binlog（binlog-enabled=" + val + "）",
+			Details: "增量同步依赖 binlog 数据，请在源端执行: CONFIG SET binlog-enabled yes，并确认持久化到配置文件",
+		}
+		return item
+	}
+
+	item := &PreflightCheckItem{
+		Name:    "Binlog 配置",
+		Status:  "warning",
+		Message: "binlog-enabled 配置返回格式异常",
+		Details: fmt.Sprintf("返回值: %v，请手动确认源端 binlog 已启用", result),
+	}
+	return item
+}
+
+// checkAofEnabled 检查源端 Tendis 是否启用了 aof-enabled
+// aof-enabled=yes 时 binlog cmdStr 包含完整 RESP 命令，增量同步才能正确回放 EXPIRE/TTL 等命令
+// 返回 nil 表示非 Tendis（不需要此检测）
+func (s *Server) checkAofEnabled(ctx context.Context, config *model.ClusterConfig) *PreflightCheckItem {
+	if config == nil || len(config.Addrs) == 0 {
+		return nil
+	}
+
+	client := redis.NewClient(&redis.Options{
+		Addr:     config.Addrs[0],
+		Password: config.Password,
+	})
+	defer client.Close()
+
+	// 先检测是否是 Tendis（通过 binlogpos 命令判断）
+	if _, err := client.Do(ctx, "binlogpos", 0).Result(); err != nil {
+		return nil // 非 Tendis，不需要检测 aof-enabled
+	}
+
+	// 是 Tendis，检查 aof-enabled 配置
+	result, err := client.Do(ctx, "CONFIG", "GET", "aof-enabled").Result()
+	if err != nil {
+		item := &PreflightCheckItem{
+			Name:    "AOF 配置",
+			Status:  "warning",
+			Message: "无法读取 aof-enabled 配置: " + err.Error(),
+			Details: "请手动确认源端 Tendis 已设置 aof-enabled=yes",
+		}
+		return item
+	}
+
+	// CONFIG GET 返回 []interface{}{"aof-enabled", "yes/no"}
+	if vals, ok := result.([]interface{}); ok && len(vals) >= 2 {
+		val := fmt.Sprintf("%v", vals[1])
+		if val == "yes" || val == "true" || val == "1" {
+			item := &PreflightCheckItem{
+				Name:    "AOF 配置",
+				Status:  "passed",
+				Message: "aof-enabled=yes，binlog 将包含完整 RESP 命令",
+			}
+			return item
+		}
+		item := &PreflightCheckItem{
+			Name:    "AOF 配置",
+			Status:  "failed",
+			Message: "源端 Tendis 未开启 AOF（aof-enabled=" + val + "）",
+			Details: "aof-enabled=no 时 binlog 只记录命令名，不包含参数，EXPIRE/TTL 等命令无法在增量同步中正确回放。请在源端执行: CONFIG SET aof-enabled yes，并确认持久化到配置文件",
+		}
+		return item
+	}
+
+	item := &PreflightCheckItem{
+		Name:    "AOF 配置",
+		Status:  "warning",
+		Message: "aof-enabled 配置返回格式异常",
+		Details: fmt.Sprintf("返回值: %v，请手动确认源端 aof-enabled=yes", result),
+	}
+	return item
+}
+
+// checkTargetDataOverwrite 检查目标端是否已有数据（覆盖风险提醒）
+func (s *Server) checkTargetDataOverwrite(ctx context.Context, config *model.ClusterConfig) PreflightCheckItem {
+	item := PreflightCheckItem{
+		Name: "目标端数据检查",
+	}
+
+	if config == nil || len(config.Addrs) == 0 {
+		item.Status = "warning"
+		item.Message = "无法检查目标端数据"
+		return item
+	}
+
+	// 尝试集群模式
+	client := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:    config.Addrs,
+		Password: config.Password,
+	})
+	defer client.Close()
+
+	var totalKeys int64
+	err := client.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+		if dbsize, err := node.DBSize(ctx).Result(); err == nil {
+			totalKeys += dbsize
+		}
+		return nil
+	})
+
+	if err != nil {
+		// 降级为单机模式
+		standaloneClient := redis.NewClient(&redis.Options{
+			Addr:     config.Addrs[0],
+			Password: config.Password,
+		})
+		defer standaloneClient.Close()
+		if dbsize, err := standaloneClient.DBSize(ctx).Result(); err == nil {
+			totalKeys = dbsize
+		}
+	}
+
+	if totalKeys == 0 {
+		item.Status = "passed"
+		item.Message = "目标端为空，可安全写入"
+	} else {
+		item.Status = "warning"
+		item.Message = fmt.Sprintf("目标端已有 %d 个 Key，迁移可能覆盖已有数据", totalKeys)
+		item.Details = "如果使用 RESTORE REPLACE 模式，同名 Key 将被覆盖。请确认目标端数据是否可以被覆盖"
+	}
+
+	return item
+}
+
+// checkSlotCoverage 检查集群 Slot 是否完整覆盖 0-16383
+// 返回 nil 表示非集群模式（不需要此检测）
+func (s *Server) checkSlotCoverage(ctx context.Context, name string, config *model.ClusterConfig) *PreflightCheckItem {
+	if config == nil || len(config.Addrs) == 0 {
+		return nil
+	}
+
+	client := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:    config.Addrs,
+		Password: config.Password,
+	})
+	defer client.Close()
+
+	slots, err := client.ClusterSlots(ctx).Result()
+	if err != nil {
+		// 非集群模式，不需要检查 slot
+		return nil
+	}
+
+	// 统计已覆盖的 slot 范围
+	covered := make([]bool, 16384)
+	for _, slot := range slots {
+		for i := int(slot.Start); i <= int(slot.End) && i < 16384; i++ {
+			covered[i] = true
+		}
+	}
+
+	// 统计未覆盖的 slot
+	var uncoveredCount int
+	var uncoveredRanges []string
+	rangeStart := -1
+	for i := 0; i <= 16384; i++ {
+		if i < 16384 && !covered[i] {
+			if rangeStart == -1 {
+				rangeStart = i
+			}
+			uncoveredCount++
+		} else {
+			if rangeStart != -1 {
+				if rangeStart == i-1 {
+					uncoveredRanges = append(uncoveredRanges, fmt.Sprintf("%d", rangeStart))
+				} else {
+					uncoveredRanges = append(uncoveredRanges, fmt.Sprintf("%d-%d", rangeStart, i-1))
+				}
+				rangeStart = -1
+			}
+		}
+	}
+
+	item := &PreflightCheckItem{
+		Name: name + " Slot 覆盖",
+	}
+
+	if uncoveredCount == 0 {
+		item.Status = "passed"
+		item.Message = fmt.Sprintf("Slot 完整覆盖 (0-16383), %d 个 Master 节点", len(slots))
+	} else {
+		item.Status = "failed"
+		item.Message = fmt.Sprintf("Slot 不完整，缺少 %d 个 Slot", uncoveredCount)
+		details := "未覆盖的 Slot 范围: "
+		if len(uncoveredRanges) > 10 {
+			details += fmt.Sprintf("%v ... (共 %d 个范围)", uncoveredRanges[:10], len(uncoveredRanges))
+		} else {
+			details += fmt.Sprintf("%v", uncoveredRanges)
+		}
+		item.Details = details
+	}
+
+	return item
+}
+
+// checkKvstorecount 检查 Tendis kvstorecount 配置
+// 返回 nil 表示非 Tendis
+func (s *Server) checkKvstorecount(ctx context.Context, config *model.ClusterConfig) *PreflightCheckItem {
+	if config == nil || len(config.Addrs) == 0 {
+		return nil
+	}
+
+	client := redis.NewClient(&redis.Options{
+		Addr:     config.Addrs[0],
+		Password: config.Password,
+	})
+	defer client.Close()
+
+	// 先检测是否是 Tendis
+	if _, err := client.Do(ctx, "binlogpos", 0).Result(); err != nil {
+		return nil // 非 Tendis
+	}
+
+	// 读取 kvstorecount
+	result, err := client.Do(ctx, "CONFIG", "GET", "kvstorecount").Result()
+	if err != nil {
+		item := &PreflightCheckItem{
+			Name:    "KvStoreCount 配置",
+			Status:  "warning",
+			Message: "无法读取 kvstorecount 配置: " + err.Error(),
+		}
+		return item
+	}
+
+	if vals, ok := result.([]interface{}); ok && len(vals) >= 2 {
+		val := fmt.Sprintf("%v", vals[1])
+		item := &PreflightCheckItem{
+			Name:    "KvStoreCount 配置",
+			Status:  "passed",
+			Message: fmt.Sprintf("kvstorecount=%s", val),
+			Details: "每个 Tendis 节点有 " + val + " 个 Store，增量同步将为每个 Store 注册独立的 Binlog 通道",
+		}
+		return item
+	}
+
+	return nil
 }
 
 func (s *Server) getProgress(c *gin.Context) {
@@ -821,7 +1167,8 @@ func (s *Server) testConnection(c *gin.Context) {
 	})
 	defer clusterClient.Close()
 
-	if err := clusterClient.Ping(ctx).Err(); err == nil {
+	clusterErr := clusterClient.Ping(ctx).Err()
+	if clusterErr == nil {
 		// 集群模式连接成功
 		info := s.getClusterInfo(ctx, clusterClient)
 		info.Mode = "cluster"
@@ -834,20 +1181,21 @@ func (s *Server) testConnection(c *gin.Context) {
 		})
 		return
 	}
+	log.Printf("[TestConnection] Cluster ping failed: %v (elapsed: %v)", clusterErr, time.Since(startTime))
 
-	// 尝试单机模式连接
+	// 尝试单机模式连接（使用独立的 context 避免被集群连接耗尽）
+	standaloneCtx, standaloneCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer standaloneCancel()
+
 	standaloneClient := redis.NewClient(&redis.Options{
 		Addr:     addrs[0],
 		Password: req.Password,
 	})
 	defer standaloneClient.Close()
 
-	if err := standaloneClient.Ping(ctx).Err(); err != nil {
-		success(c, &TestConnectionResponse{
-			Success: false,
-			Message: "连接失败: " + err.Error(),
-			Latency: time.Since(startTime).Milliseconds(),
-		})
+	if err := standaloneClient.Ping(standaloneCtx).Err(); err != nil {
+		log.Printf("[TestConnection] Standalone ping also failed: %v", err)
+		fail(c, 400, "连接失败: "+err.Error())
 		return
 	}
 

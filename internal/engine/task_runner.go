@@ -977,8 +977,13 @@ func (r *TaskRunner) migrateKeyByDumpRestore(ctx context.Context, sourceNode *re
 
 // shouldMigrateKey 判断 Key 是否应该被迁移（TaskRunner 级别）
 func (r *TaskRunner) shouldMigrateKey(key string) bool {
+	// 内置排除：系统内部 key 始终跳过
+	if isSystemInternalKey(key) {
+		return false
+	}
+
 	filter := r.options.KeyFilter
-	if filter == nil || filter.Mode == model.KeyFilterModeAll {
+	if filter == nil {
 		return true
 	}
 	
@@ -1474,6 +1479,11 @@ type SlotMigrator struct {
 	// 断点保存相关
 	lastCheckpointTime time.Time
 	keysInBatch        int64
+	
+	// 崩溃恢复重试窗口：恢复后尚未追上上次进度前，冲突跳过不计入统计
+	resuming         bool  // 是否处于恢复重试窗口
+	resumeKeyTarget  int64 // 上次 checkpoint 中已迁移的 key 数（需要追上的目标）
+	resumeKeysCurrent int64 // 恢复后当前已处理的 key 数（migrated + skipped + filtered）
 }
 
 // NewSlotMigrator 创建Slot迁移器
@@ -1518,6 +1528,18 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 		}
 	}
 	
+	// 崩溃恢复重试窗口：如果有 checkpoint 且有已迁移的 key，说明是恢复场景
+	// 在重试窗口内遇到的冲突跳过是"假冲突"（崩溃前已迁移的），不计入统计
+	m.resuming = false
+	m.resumeKeysCurrent = 0
+	if cursor > 0 && keysMigrated > 0 {
+		m.resuming = true
+		m.resumeKeyTarget = keysMigrated
+		m.conflictHandler.SetRetryWindow(true)
+		log.Printf("Slot %d: Retry window opened, will not count conflicts until catching up to %d keys",
+			slot, keysMigrated)
+	}
+	
 	batchSize := int64(m.runner.options.ScanBatchSize)
 	if batchSize <= 0 {
 		batchSize = 1000
@@ -1532,7 +1554,11 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 	for {
 		select {
 		case <-ctx.Done():
-			// 被中断时保存当前断点
+			// 被中断时保存当前断点，关闭重试窗口
+			if m.resuming {
+				m.conflictHandler.SetRetryWindow(false)
+				m.resuming = false
+			}
 			m.saveSlotCheckpoint(slot, cursor, keysMigrated)
 			return ctx.Err()
 		default:
@@ -1546,11 +1572,31 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 
 		// 批量迁移
 		if len(keys) > 0 {
-			if err := m.migrateKeys(ctx, source, target, keys); err != nil {
+			result, err := m.migrateKeys(ctx, source, target, keys)
+			if err != nil {
 				log.Printf("Migrate keys failed: %v", err)
-			} else {
-				keysMigrated += int64(len(keys))
-				m.keysInBatch += int64(len(keys))
+			}
+			if result != nil {
+				// 只统计实际迁移的 key 数量
+				keysMigrated += result.Migrated
+				m.keysInBatch += result.Migrated
+				// 更新过滤和跳过计数到数据库（只统计真正的冲突，不统计重试跳过）
+				if result.Filtered > 0 || result.Skipped > 0 {
+					m.runner.master.store.IncrementSkippedAndFiltered(
+						m.runner.task.ID, result.Skipped, result.Filtered)
+				}
+				
+				// 检查是否应该关闭重试窗口
+				if m.resuming {
+					// 累加本批次处理的所有 key（migrated + skipped + filtered + retrySkipped）
+					m.resumeKeysCurrent += result.Migrated + result.Skipped + result.Filtered + result.RetrySkipped
+					if m.resumeKeysCurrent >= m.resumeKeyTarget {
+						m.conflictHandler.SetRetryWindow(false)
+						m.resuming = false
+						log.Printf("Slot %d: Retry window closed, caught up to previous progress (%d keys)",
+							slot, m.resumeKeyTarget)
+					}
+				}
 			}
 		}
 
@@ -1566,6 +1612,12 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 		if cursor == 0 {
 			break
 		}
+	}
+
+	// 关闭可能仍开启的重试窗口
+	if m.resuming {
+		m.conflictHandler.SetRetryWindow(false)
+		m.resuming = false
 	}
 
 	// Slot 完成，标记完成状态
@@ -1613,30 +1665,53 @@ func (m *SlotMigrator) scanSlot(ctx context.Context, client *redis.ClusterClient
 	return slotKeys, nextCursor, nil
 }
 
-// migrateKeys 迁移Key
-func (m *SlotMigrator) migrateKeys(ctx context.Context, source, target *redis.ClusterClient, keys []string) error {
+// MigrateKeysResult 迁移结果统计
+type MigrateKeysResult struct {
+	Migrated     int64 // 实际成功迁移的 key 数
+	Filtered     int64 // 被过滤器过滤掉的 key 数
+	Skipped      int64 // 因冲突跳过的 key 数（真正的冲突）
+	RetrySkipped int64 // 崩溃恢复重试导致的冲突跳过（不计入统计）
+	Bytes        int64 // 迁移的字节数
+}
+
+// migrateKeys 迁移Key，返回详细的迁移结果统计
+func (m *SlotMigrator) migrateKeys(ctx context.Context, source, target *redis.ClusterClient, keys []string) (*MigrateKeysResult, error) {
+	result := &MigrateKeysResult{}
+	originalCount := int64(len(keys))
+
 	// Key过滤
 	keys = m.filterKeys(keys)
+	result.Filtered = originalCount - int64(len(keys))
 	if len(keys) == 0 {
-		return nil
+		return result, nil
 	}
 
 	// 设置当前阶段
 	m.conflictHandler.SetPhase(m.runner.GetPhase())
 
+	// 记录 HandleBatchKeys 之前的 retrySkipped，以便区分本批次新增的
+	retrySkippedBefore := m.conflictHandler.GetRetrySkippedCount()
+
 	// 批量检查冲突
 	keysToMigrate, err := m.conflictHandler.HandleBatchKeys(ctx, keys)
 	if err != nil {
-		return err
+		return result, err
 	}
+
+	// 计算本批次的重试跳过和真正跳过
+	totalSkipped := int64(len(keys)) - int64(len(keysToMigrate))
+	retrySkippedAfter := m.conflictHandler.GetRetrySkippedCount()
+	retrySkippedInBatch := retrySkippedAfter - retrySkippedBefore
+	result.RetrySkipped = retrySkippedInBatch
+	result.Skipped = totalSkipped - retrySkippedInBatch // 真正的冲突跳过
 
 	if len(keysToMigrate) == 0 {
-		return nil
+		return result, nil
 	}
 
-	// 应用限流
+	// 应用源端限流（按实际 key 数量消耗令牌）
 	if m.rateLimiter != nil {
-		m.rateLimiter.AcquireSource()
+		m.rateLimiter.AcquireSourceN(int64(len(keysToMigrate)))
 	}
 
 	// Pipeline迁移
@@ -1656,35 +1731,62 @@ func (m *SlotMigrator) migrateKeys(ctx context.Context, source, target *redis.Cl
 		}
 
 		totalBytes += int64(len(dump))
-		
-		// 应用目标端限流
-		if m.rateLimiter != nil {
-			m.rateLimiter.AcquireTarget()
-		}
-
 		pipe.RestoreReplace(ctx, key, ttl, dump)
+	}
+
+	// 应用目标端限流（按实际 key 数量消耗令牌，在 pipeline exec 之前）
+	if m.rateLimiter != nil {
+		m.rateLimiter.AcquireTargetN(int64(len(keysToMigrate)))
 	}
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {
-		return err
+		return result, err
 	}
 
-	// 报告进度
-	m.worker.ReportProgress(int64(len(keysToMigrate)), totalBytes)
+	result.Migrated = int64(len(keysToMigrate))
+	result.Bytes = totalBytes
 
-	return nil
+	// 报告进度（只统计实际迁移的 key）
+	m.worker.ReportProgress(result.Migrated, totalBytes)
+
+	return result, nil
+}
+
+// 内置排除的系统内部 key 前缀（这些 key 不包含业务数据，不应被迁移）
+// - stat:total:*  Tendis 内部统计（总计）
+// - stat:daily:*  Tendis 内部统计（每日）
+// - stat:hourly:* Tendis 内部统计（每小时）
+var systemInternalKeyPrefixes = []string{
+	"stat:total:",
+	"stat:daily:",
+	"stat:hourly:",
+}
+
+// isSystemInternalKey 判断是否为系统内部 key（不应被迁移）
+func isSystemInternalKey(key string) bool {
+	for _, prefix := range systemInternalKeyPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // filterKeys 根据配置过滤Key
 func (m *SlotMigrator) filterKeys(keys []string) []string {
 	filter := m.runner.options.KeyFilter
-	if filter == nil || filter.Mode == model.KeyFilterModeAll {
-		return keys
-	}
 
 	var result []string
 	for _, key := range keys {
+		// 内置排除：系统内部 key 始终跳过
+		if isSystemInternalKey(key) {
+			continue
+		}
+		if filter == nil {
+			result = append(result, key)
+			continue
+		}
 		if m.shouldMigrateKey(key, filter) {
 			result = append(result, key)
 		}
@@ -1790,6 +1892,10 @@ type ConflictHandler struct {
 	taskID         string
 	skippedKeys    []string     // 记录跳过的冲突Key
 	skippedKeysMu  sync.Mutex
+	
+	// 崩溃恢复重试窗口
+	inRetryWindow  bool   // 是否处于重试窗口内
+	retrySkipped   int64  // 重试窗口内跳过的 key 数（不计入真正冲突）
 }
 
 // NewConflictHandler 创建冲突处理器
@@ -1832,9 +1938,43 @@ func (h *ConflictHandler) GetEffectivePolicy() model.ConflictPolicy {
 func (h *ConflictHandler) RecordSkippedKey(key string) {
 	h.skippedKeysMu.Lock()
 	defer h.skippedKeysMu.Unlock()
+	if h.inRetryWindow {
+		// 重试窗口内：这是崩溃恢复导致的假冲突，只计数不记录
+		h.retrySkipped++
+		log.Printf("[RETRY_SKIP] TaskID=%s Key=%s (crash recovery retry, not a real conflict)", h.taskID, key)
+		return
+	}
 	h.skippedKeys = append(h.skippedKeys, key)
-	// 同时写入日志
 	log.Printf("[CONFLICT_SKIP] TaskID=%s Key=%s", h.taskID, key)
+}
+
+// SetRetryWindow 设置/关闭重试窗口
+func (h *ConflictHandler) SetRetryWindow(enabled bool) {
+	h.skippedKeysMu.Lock()
+	defer h.skippedKeysMu.Unlock()
+	if h.inRetryWindow && !enabled {
+		log.Printf("[RETRY_WINDOW] TaskID=%s closed, retry_skipped=%d keys were from crash recovery",
+			h.taskID, h.retrySkipped)
+	}
+	if !h.inRetryWindow && enabled {
+		h.retrySkipped = 0
+		log.Printf("[RETRY_WINDOW] TaskID=%s opened, conflicts in this window will not be counted as real", h.taskID)
+	}
+	h.inRetryWindow = enabled
+}
+
+// GetRetrySkippedCount 获取重试窗口内跳过的 key 数
+func (h *ConflictHandler) GetRetrySkippedCount() int64 {
+	h.skippedKeysMu.Lock()
+	defer h.skippedKeysMu.Unlock()
+	return h.retrySkipped
+}
+
+// IsInRetryWindow 是否处于重试窗口
+func (h *ConflictHandler) IsInRetryWindow() bool {
+	h.skippedKeysMu.Lock()
+	defer h.skippedKeysMu.Unlock()
+	return h.inRetryWindow
 }
 
 // GetSkippedKeys 获取所有跳过的冲突Key
@@ -1877,7 +2017,8 @@ func (h *ConflictHandler) HandleBatchKeys(ctx context.Context, keys []string) ([
 			if exists[i] {
 				switch policy {
 				case model.ConflictPolicySkipFullOnly:
-					// 跳过已存在的Key（全量阶段）
+					// 跳过已存在的Key（全量阶段），同样记录
+					h.RecordSkippedKey(key)
 					continue
 				case model.ConflictPolicySkip:
 					// 跳过并记录

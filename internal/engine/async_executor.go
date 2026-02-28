@@ -336,6 +336,10 @@ func (e *AsyncCommandExecutor) addToPipeline(ctx context.Context, pipe redis.Pip
 	case "HSET":
 		if len(cmd.Args) >= 3 {
 			pipe.HSet(ctx, cmd.Args[0].(string), cmd.Args[1:]...)
+			// 【BUG-FIX TTL 一致性】非 string 类型也必须设置 TTL
+			if cmd.TTL > 0 {
+				pipe.PExpire(ctx, cmd.Args[0].(string), cmd.TTL)
+			}
 		}
 		
 	case "HDEL":
@@ -351,6 +355,10 @@ func (e *AsyncCommandExecutor) addToPipeline(ctx context.Context, pipe redis.Pip
 	case "SADD":
 		if len(cmd.Args) >= 2 {
 			pipe.SAdd(ctx, cmd.Args[0].(string), cmd.Args[1:]...)
+			// 【BUG-FIX TTL 一致性】
+			if cmd.TTL > 0 {
+				pipe.PExpire(ctx, cmd.Args[0].(string), cmd.TTL)
+			}
 		}
 		
 	case "SREM":
@@ -373,6 +381,10 @@ func (e *AsyncCommandExecutor) addToPipeline(ctx context.Context, pipe redis.Pip
 			}
 			if len(members) > 0 {
 				pipe.ZAdd(ctx, key, members...)
+				// 【BUG-FIX TTL 一致性】
+				if cmd.TTL > 0 {
+					pipe.PExpire(ctx, key, cmd.TTL)
+				}
 			}
 		}
 		
@@ -384,11 +396,19 @@ func (e *AsyncCommandExecutor) addToPipeline(ctx context.Context, pipe redis.Pip
 	case "LPUSH":
 		if len(cmd.Args) >= 2 {
 			pipe.LPush(ctx, cmd.Args[0].(string), cmd.Args[1:]...)
+			// 【BUG-FIX TTL 一致性】
+			if cmd.TTL > 0 {
+				pipe.PExpire(ctx, cmd.Args[0].(string), cmd.TTL)
+			}
 		}
 		
 	case "RPUSH":
 		if len(cmd.Args) >= 2 {
 			pipe.RPush(ctx, cmd.Args[0].(string), cmd.Args[1:]...)
+			// 【BUG-FIX TTL 一致性】
+			if cmd.TTL > 0 {
+				pipe.PExpire(ctx, cmd.Args[0].(string), cmd.TTL)
+			}
 		}
 		
 	case "LPOP":

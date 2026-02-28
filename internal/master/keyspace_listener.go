@@ -155,15 +155,21 @@ func (kl *KeyspaceListener) listenNode(nodeAddr string) {
 		return
 	}
 
-	// 配置 Keyspace Notifications (如果需要)
-	// CONFIG SET notify-keyspace-events KEA
-	// 注意：生产环境可能已经配置，这里只是确保
-	_, err := nodeClient.ConfigSet(kl.ctx, "notify-keyspace-events", "KEA").Result()
-	if err != nil {
-		kl.logger.Warn("Failed to set notify-keyspace-events", map[string]interface{}{
-			"node":  nodeAddr,
-			"error": err.Error(),
-		})
+	// 注意：不再自动修改源端 notify-keyspace-events 配置
+	// 如果需要 keyspace 通知，请在迁移前手动配置: CONFIG SET notify-keyspace-events KEA
+	// 检查当前配置
+	if vals, err := nodeClient.ConfigGet(kl.ctx, "notify-keyspace-events").Result(); err == nil {
+		if val, ok := vals["notify-keyspace-events"]; ok && val != "" {
+			kl.logger.Info("notify-keyspace-events is configured", map[string]interface{}{
+				"node":  nodeAddr,
+				"value": val,
+			})
+		} else {
+			kl.logger.Warn("notify-keyspace-events is not configured, keyspace events may not work", map[string]interface{}{
+				"node": nodeAddr,
+			})
+			kl.logger.Warn("Please configure it manually: CONFIG SET notify-keyspace-events KEA", nil)
+		}
 	}
 
 	// 订阅所有 keyspace 事件

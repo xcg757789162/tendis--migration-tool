@@ -272,7 +272,7 @@
                 <el-tag v-else size="small" type="info" effect="plain">可选</el-tag>
               </div>
               <div class="check-message">{{ check.message }}</div>
-              <div class="check-detail" v-if="check.detail">{{ check.detail }}</div>
+              <div class="check-detail" v-if="check.details">{{ check.details }}</div>
             </div>
           </div>
         </div>
@@ -320,6 +320,14 @@
         <div class="config-info compact">
           <div class="config-grid">
             <div class="config-item">
+              <span class="label">迁移模式</span>
+              <span class="value">
+                <el-tag :type="task.migration_mode === 'full' ? 'info' : 'success'" size="small">
+                  {{ getMigrationModeText(task.migration_mode) }}
+                </el-tag>
+              </span>
+            </div>
+            <div class="config-item">
               <span class="label">Worker配置</span>
               <span class="value highlight">{{ config?.worker_count || 4 }}</span>
             </div>
@@ -364,6 +372,18 @@
                 <el-tag v-if="config?.read_from_slave" type="success" size="small">是</el-tag>
                 <el-tag v-else type="info" size="small">否</el-tag>
               </span>
+            </div>
+            <div class="config-item">
+              <span class="label">最大重试</span>
+              <span class="value">{{ config?.retry_config?.max_retries ?? 3 }} 次</span>
+            </div>
+            <div class="config-item">
+              <span class="label">全量重试间隔</span>
+              <span class="value">{{ config?.retry_config?.full_retry_interval_ms ?? 100 }} ms</span>
+            </div>
+            <div class="config-item">
+              <span class="label">增量重试间隔</span>
+              <span class="value">{{ config?.retry_config?.incr_retry_interval_ms ?? 1000 }} ms</span>
             </div>
           </div>
           <!-- Key过滤配置 -->
@@ -555,24 +575,46 @@
     <div class="verify-section card" v-if="verifyResults.length || verifying">
       <h3><el-icon><Checked /></el-icon> 校验结果</h3>
       
-      <!-- 【修复】校验进行中状态 -->
-      <div v-if="verifying" class="verify-loading">
+      <!-- 校验进行中状态 -->
+      <div v-if="verifying && computedVerifyResults.length === 0" class="verify-loading">
         <el-icon class="is-loading"><Loading /></el-icon>
         <span>正在进行数据校验，请稍候...</span>
       </div>
       
-      <el-table v-else :data="computedVerifyResults" style="width: 100%">
-        <el-table-column label="批次ID" width="200">
+      <el-table :data="computedVerifyResults" style="width: 100%">
+        <el-table-column label="校验名称" min-width="180">
           <template #default="{ row }">
-            <span class="mono">{{ row.batch_id.slice(0, 8) }}...</span>
+            <router-link :to="`/verify`" class="verify-link">
+              {{ row.name }}
+            </router-link>
           </template>
         </el-table-column>
-        <el-table-column label="采样Key数" prop="sampled_keys" width="120" />
-        <el-table-column label="匹配数" prop="matched_keys" width="100" />
-        <el-table-column label="不一致" width="100">
+        <el-table-column label="状态" width="100">
           <template #default="{ row }">
-            <span :class="{ 'error-text': row.mismatch_keys > 0 }">
-              {{ row.mismatch_keys }}
+            <el-tag :type="row.status === 'completed' ? 'success' : row.status === 'failed' ? 'danger' : row.status === 'running' ? '' : 'info'" size="small">
+              {{ row.status === 'running' ? `${row.progress?.toFixed(0) || 0}%` : row.status }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="模式" width="90">
+          <template #default="{ row }">
+            <span>{{ row.verify_mode === 'full' ? '全量' : row.verify_mode === 'sample' ? '采样' : row.verify_mode }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="已检查Key" width="120">
+          <template #default="{ row }">
+            {{ formatNumber(row.sampled_keys) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="匹配数" width="100">
+          <template #default="{ row }">
+            {{ formatNumber(row.matched_keys) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="值不一致" width="100">
+          <template #default="{ row }">
+            <span :class="{ 'error-text': row.value_mismatch > 0 }">
+              {{ row.value_mismatch }}
             </span>
           </template>
         </el-table-column>
@@ -585,7 +627,10 @@
         </el-table-column>
         <el-table-column label="一致性">
           <template #default="{ row }">
-            <span :class="['consistency-rate', { high: row.consistency_rate >= 99.9 }]">
+            <span v-if="row.consistency_rate < 0" class="consistency-rate">
+              <el-icon class="is-loading"><Loading /></el-icon> 校验中...
+            </span>
+            <span v-else :class="['consistency-rate', { high: row.consistency_rate >= 99.9 }]">
               {{ row.consistency_rate?.toFixed(2) || 0 }}%
             </span>
           </template>
@@ -593,8 +638,8 @@
       </el-table>
     </div>
     
-    <!-- 异常/跳过Key统计 -->
-    <div class="error-keys-section card" v-if="task.status === 'completed' || task.status === 'failed' || errorKeys.total > 0 || task.status === 'running' || task.status === 'incremental'">
+    <!-- 异常/跳过Key统计（始终显示，无论任务状态） -->
+    <div class="error-keys-section card">
       <div class="section-header">
         <h3><el-icon><Warning /></el-icon> 异常/跳过Key统计</h3>
         <div class="header-actions">
@@ -981,15 +1026,29 @@ const retryProgressColor = computed(() => {
   return '#67c23a'                        // 绿色：大部分成功
 })
 
-// 计算属性：为校验结果添加一致性计算
+// 计算属性：将 VerifyTask 结构映射为表格展示数据
 const computedVerifyResults = computed(() => {
-  return verifyResults.value.map(row => ({
-    ...row,
-    // 一致性 = 匹配数 / 采样数 * 100
-    consistency_rate: row.sampled_keys > 0 
-      ? (row.matched_keys / row.sampled_keys) * 100 
-      : 0
-  }))
+  return verifyResults.value.map(vt => {
+    const r = vt.result || {}
+    const sampled = r.sampled_keys || r.scanned_keys || 0
+    const matched = r.matched_keys || 0
+    return {
+      id: vt.id,
+      name: vt.name,
+      status: vt.status,
+      verify_mode: vt.verify_mode,
+      compare_mode: vt.compare_mode,
+      created_at: vt.created_at,
+      sampled_keys: sampled,
+      matched_keys: matched,
+      missing_keys: r.missing_keys || 0,
+      value_mismatch: r.value_mismatch || 0,
+      extra_keys: r.extra_keys || r.target_extra_keys || 0,
+      consistency_rate: sampled > 0 ? (matched / sampled) * 100 : (vt.status === 'running' ? -1 : 0),
+      progress: r.progress || 0,
+      current_speed: r.current_speed || 0,
+    }
+  })
 })
 const taskLogs = ref([])
 const logLevel = ref('')
@@ -1116,7 +1175,8 @@ const showIncrementalStats = computed(() => {
   // 检查迁移模式是否包含增量
   const hasIncrMode = migrationMode === 'full_and_incremental' ||
                       migrationMode === 'incremental_only'
-  return isIncrPhase || hasIncrData || (hasIncrMode && task.value?.status === 'running')
+  // 只要迁移模式包含增量就显示（不限制任务状态）
+  return isIncrPhase || hasIncrData || hasIncrMode
 })
 
 // 获取增量同步模式
@@ -1280,12 +1340,12 @@ const changeRefreshInterval = () => {
   if (refreshInterval.value > 0) {
     wsRealtimeEnabled.value = false
     refreshTimer = setInterval(() => {
-      // 【修复】不仅在 running 状态，也在增量同步和暂停状态时刷新日志
+      // 任务数据仅在活跃状态刷新，日志始终刷新
       const activeStatus = ['running', 'incremental', 'sync_incremental', 'paused']
       if (task.value?.status && activeStatus.includes(task.value.status)) {
         fetchTask()
-        fetchTaskLogs()
       }
+      fetchTaskLogs()
     }, refreshInterval.value)
   } else {
     // 选择实时模式，启用 WebSocket
@@ -1336,10 +1396,8 @@ const initWebSocket = () => {
   // 每 5 秒刷新一次日志，确保用户能看到最新日志
   if (!refreshTimer) {
     refreshTimer = setInterval(() => {
-      const activeStatus = ['running', 'incremental', 'sync_incremental', 'paused']
-      if (task.value?.status && activeStatus.includes(task.value.status)) {
-        fetchTaskLogs()
-      }
+      // 日志始终刷新，不受任务状态限制
+      fetchTaskLogs()
     }, 5000) // 5 秒轮询一次日志
   }
 }
@@ -1876,11 +1934,12 @@ const resumeTask = async () => {
 
 const triggerVerify = async () => {
   try {
-    verifying.value = true  // 【修复】设置校验进行中状态
-    await api.triggerVerify(taskId.value)
-    ElMessage.success('校验任务已触发')
+    verifying.value = true
+    const resp = await api.triggerVerify(taskId.value)
+    const verifyTaskId = resp?.verify_task_id
+    ElMessage.success('校验任务已创建并启动')
     
-    // 【修复】定时检查校验结果，完成后自动更新
+    // 定时检查校验结果（从独立校验任务系统获取）
     if (verifyCheckTimer) {
       clearInterval(verifyCheckTimer)
     }
@@ -1888,22 +1947,22 @@ const triggerVerify = async () => {
       try {
         const result = await api.getVerifyResults(taskId.value)
         if (result && result.length > 0) {
-          const latestResult = result[result.length - 1]
-          // 检查是否有新的校验结果（采样数大于0表示已完成）
-          if (latestResult.sampled_keys > 0) {
-            verifyResults.value = result
+          verifyResults.value = result
+          // 检查最新的校验任务是否完成
+          const latest = result[0] // 按创建时间倒序，第一个是最新的
+          if (latest.status === 'completed' || latest.status === 'failed') {
             verifying.value = false
             clearInterval(verifyCheckTimer)
             verifyCheckTimer = null
-            ElMessage.success('校验完成')
+            ElMessage.success(latest.status === 'completed' ? '校验完成' : '校验失败')
           }
         }
       } catch (e) {
         // 忽略错误
       }
-    }, 2000)  // 每2秒检查一次
+    }, 3000)  // 每3秒检查一次
     
-    // 30秒超时自动停止检查
+    // 10分钟超时自动停止检查（全量校验可能耗时较长）
     setTimeout(() => {
       if (verifyCheckTimer) {
         clearInterval(verifyCheckTimer)
@@ -1911,7 +1970,7 @@ const triggerVerify = async () => {
         verifying.value = false
         fetchVerifyResults()
       }
-    }, 30000)
+    }, 600000)
   } catch (err) {
     verifying.value = false
     ElMessage.error('触发校验失败')
@@ -1994,6 +2053,16 @@ const getStatusText = (status) => {
     retrying: '重试中'
   }
   return map[status] || status
+}
+
+const getMigrationModeText = (mode) => {
+  const map = {
+    full: '仅全量',
+    full_only: '仅全量',
+    full_and_incremental: '全量+增量',
+    incremental: '仅增量'
+  }
+  return map[mode] || mode || '全量+增量'
 }
 
 const getConflictPolicyText = (policy) => {
@@ -2152,13 +2221,13 @@ onMounted(() => {
   } else if (refreshInterval.value > 0) {
     // 使用轮询模式
     refreshTimer = setInterval(() => {
-      // 【修复】不仅在 running 状态，也在增量同步(incremental/sync_incremental)、暂停(paused)和重试中(retrying)状态时刷新
+      // 任务数据和错误Key仅在活跃状态刷新，日志始终刷新
       const activeStatus = ['running', 'incremental', 'sync_incremental', 'paused', 'retrying']
       if (task.value?.status && activeStatus.includes(task.value.status)) {
         fetchTask()
-        fetchTaskLogs()
         fetchErrorKeys()
       }
+      fetchTaskLogs()
     }, refreshInterval.value)
   }
   

@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -29,6 +30,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/time/rate"
 	"tendis-migrate/internal/replication"
 	"tendis-migrate/pkg/logger"
 )
@@ -109,6 +111,10 @@ type Task struct {
 	// 【死锁修复】任务级互斥锁，用于保护统计字段的高频更新
 	// 替代全局 tasksMu 的写锁，避免高频 ticker 与 HTTP handler 争抢全局锁导致死锁
 	statsMu sync.Mutex `json:"-"`
+	
+	// 升级重启标记：如果任务是因为程序升级/重启被自动暂停的，此标记为 true
+	// 重启后会自动恢复这些任务；手动暂停的任务（ShutdownPaused=false）不会被自动恢复
+	ShutdownPaused bool `json:"shutdown_paused,omitempty"`
 }
 
 // Init 初始化/重置 Task 的运行时控制字段（stopCh、stopOnce、startedTime）。
@@ -262,12 +268,13 @@ type TaskOptions struct {
 	SkipFullSync         bool                  `json:"skip_full_sync"`        // 跳过全量同步阶段
 	SkipIncremental      bool                  `json:"skip_incremental"`      // 跳过增量同步阶段
 	ShadowMode           bool                  `json:"shadow_mode"`           // 影子模式：只读取源端数据，不写入目标端
+	EnableCompression    bool                  `json:"enable_compression"`    // 已废弃：压缩传输功能未实现，保留字段兼容旧数据
 	KeyFilter            *KeyFilter            `json:"key_filter,omitempty"`
 	RateLimit            *RateLimit            `json:"rate_limit,omitempty"`
 	RetryConfig          *RetryConfig          `json:"retry_config,omitempty"`
 	FaultTolerance       *FaultToleranceConfig `json:"fault_tolerance,omitempty"`  // 问题5修复：容错配置
 	SmartRetry           *SmartRetryConfig     `json:"smart_retry,omitempty"`      // 问题5修复：智能重试配置
-	VerifyConfig         *VerifyConfig         `json:"verify_config,omitempty"`    // 数据校验配置
+	VerifyConfig         *VerifyConfig         `json:"verify_config,omitempty"`    // 已废弃：校验功能由独立 VerifyTask 模块实现
 	KeyListFile          string                `json:"key_list_file,omitempty"`    // Key 清单文件路径（支持 CSV/JSON/TXT）
 	ReadFromSlave        bool                  `json:"read_from_slave"`            // 从 slave 节点读取数据（生产环境推荐，避免影响 master）
 }
@@ -393,6 +400,7 @@ type KeyFilter struct {
 	Mode            string   `json:"mode"` // all, prefix, pattern, keys, keylist
 	Prefixes        []string `json:"prefixes,omitempty"`
 	ExcludePrefixes []string `json:"exclude_prefixes,omitempty"`
+	ExcludePatterns []string `json:"exclude_patterns,omitempty"`
 	Patterns        []string `json:"patterns,omitempty"`
 	Keys            []string `json:"keys,omitempty"` // keylist/keys 模式使用
 }
@@ -789,6 +797,13 @@ type FullSyncCheckpoint struct {
 	StartTime        string            `json:"start_time"`
 	UpdatedAt        string            `json:"updated_at"`
 	IsComplete       bool              `json:"is_complete"`        // 全量是否完成
+	// 【崩溃恢复修复】计数器快照：断点保存时同步记录，恢复时用于修正 tasks-state.json 中的过时值
+	KeysMigrated     int64             `json:"keys_migrated,omitempty"`
+	KeysFailed       int64             `json:"keys_failed,omitempty"`
+	KeysSkipped      int64             `json:"keys_skipped,omitempty"`
+	KeysFiltered     int64             `json:"keys_filtered,omitempty"`
+	KeysToMigrate    int64             `json:"keys_to_migrate,omitempty"`
+	BytesMigrated    int64             `json:"bytes_migrated,omitempty"`
 	mu               sync.RWMutex      `json:"-"`                  // 【BUG-FIX】保护 NodeCursors 的并发访问
 }
 
@@ -923,9 +938,10 @@ func pauseAllRunningTasks() {
 			task.Status = "paused"
 			task.PausedAt = now.Format(time.RFC3339)
 			task.UpdatedAt = now.Format(time.RFC3339)
+			task.ShutdownPaused = true // 标记为升级/重启自动暂停，重启后自动恢复
 			task.Cleanup() // 统一清理运行时控制字段
 			pausedCount++
-			logger.Info("Task paused for shutdown", map[string]interface{}{
+			logger.Info("Task paused for shutdown (will auto-resume on restart)", map[string]interface{}{
 				"task_id":   task.ID,
 				"name":      task.Name,
 				"paused_at": task.PausedAt,
@@ -950,6 +966,17 @@ func saveAllFullSyncCheckpoints() {
 		if checkpoint != nil {
 			checkpoint.mu.RLock()
 			checkpoint.UpdatedAt = time.Now().Format(time.RFC3339)
+			// 【崩溃恢复修复】同步更新计数器快照（距上次 saveFullSyncCheckpoint 可能又有变化）
+			tasksMu.RLock()
+			if task, ok := tasks[taskID]; ok {
+				checkpoint.KeysMigrated = atomic.LoadInt64(&task.KeysMigrated)
+				checkpoint.KeysFailed = atomic.LoadInt64(&task.KeysFailed)
+				checkpoint.KeysSkipped = atomic.LoadInt64(&task.KeysSkipped)
+				checkpoint.KeysFiltered = atomic.LoadInt64(&task.KeysFiltered)
+				checkpoint.KeysToMigrate = task.KeysToMigrate
+				checkpoint.BytesMigrated = atomic.LoadInt64(&task.BytesMigrated)
+			}
+			tasksMu.RUnlock()
 			data, _ := json.MarshalIndent(checkpoint, "", "  ")
 			checkpoint.mu.RUnlock()
 			os.WriteFile(fmt.Sprintf("%s/full-%s.json", checkpointDir, taskID), data, 0644)
@@ -1072,6 +1099,7 @@ func recoverUnfinishedTasks() {
 			IncrReconnects:   savedTask.IncrReconnects,
 			IncrSyncMode:     savedTask.IncrSyncMode,
 			Options:        savedTask.Options,
+			ShutdownPaused: savedTask.ShutdownPaused,
 		}
 		task.Init() // 统一初始化运行时控制字段
 
@@ -1089,11 +1117,41 @@ func recoverUnfinishedTasks() {
 			}
 
 			if checkpoint := loadFullSyncCheckpoint(id); checkpoint != nil {
+				// 【崩溃恢复修复】用断点中的计数器快照修正 tasks-state.json 中的过时值
+				// kill -9 时 tasks-state.json（30秒周期）可能比断点（每1000 key）更旧
+				countersFixed := false
+				if checkpoint.KeysMigrated > task.KeysMigrated {
+					task.KeysMigrated = checkpoint.KeysMigrated
+					countersFixed = true
+				}
+				if checkpoint.KeysFailed > task.KeysFailed {
+					task.KeysFailed = checkpoint.KeysFailed
+					countersFixed = true
+				}
+				if checkpoint.KeysSkipped > task.KeysSkipped {
+					task.KeysSkipped = checkpoint.KeysSkipped
+					countersFixed = true
+				}
+				if checkpoint.KeysFiltered > task.KeysFiltered {
+					task.KeysFiltered = checkpoint.KeysFiltered
+					countersFixed = true
+				}
+				if checkpoint.KeysToMigrate > task.KeysToMigrate {
+					task.KeysToMigrate = checkpoint.KeysToMigrate
+					countersFixed = true
+				}
+				if checkpoint.BytesMigrated > task.BytesMigrated {
+					task.BytesMigrated = checkpoint.BytesMigrated
+					countersFixed = true
+				}
 				logger.Info("Full sync checkpoint loaded", map[string]interface{}{
-					"task_id":        id,
-					"processed_keys": checkpoint.ProcessedKeys,
-					"is_complete":    checkpoint.IsComplete,
-					"nodes":          len(checkpoint.NodeCursors),
+					"task_id":         id,
+					"processed_keys":  checkpoint.ProcessedKeys,
+					"is_complete":     checkpoint.IsComplete,
+					"nodes":           len(checkpoint.NodeCursors),
+					"counters_fixed":  countersFixed,
+					"cp_migrated":     checkpoint.KeysMigrated,
+					"task_migrated":   task.KeysMigrated,
 				})
 			}
 
@@ -1124,6 +1182,58 @@ func recoverUnfinishedTasks() {
 			"total_recovered":  recoveredCount,
 			"resumable_count":  resumableCount,
 			"message":          "Previously running tasks are paused. Use resume API to continue.",
+		})
+	}
+	
+	// 自动恢复因升级/重启被暂停的任务（ShutdownPaused=true）
+	// 注意：手动暂停的任务（ShutdownPaused=false）不会被自动恢复
+	autoResumeShutdownPausedTasks()
+}
+
+// autoResumeShutdownPausedTasks 自动恢复因升级/重启被暂停的任务
+// 只恢复 ShutdownPaused=true 的任务（程序升级时自动暂停的）
+// 手动暂停的任务（ShutdownPaused=false）保持暂停状态，需用户手动恢复
+func autoResumeShutdownPausedTasks() {
+	var tasksToResume []*Task
+	
+	tasksMu.RLock()
+	for _, task := range tasks {
+		if task.Status == "paused" && task.ShutdownPaused {
+			tasksToResume = append(tasksToResume, task)
+		}
+	}
+	tasksMu.RUnlock()
+	
+	if len(tasksToResume) == 0 {
+		return
+	}
+	
+	logger.Info("Auto-resuming shutdown-paused tasks", map[string]interface{}{
+		"count": len(tasksToResume),
+	})
+	
+	for _, task := range tasksToResume {
+		tasksMu.Lock()
+		// 计算暂停时长
+		if task.PausedAt != "" {
+			pausedTime, err := time.Parse(time.RFC3339, task.PausedAt)
+			if err == nil && !pausedTime.IsZero() {
+				task.PausedDuration += int64(time.Since(pausedTime).Seconds())
+			}
+		}
+		task.Init()
+		task.Status = "running"
+		task.PausedAt = ""
+		task.ShutdownPaused = false // 清除标记
+		task.UpdatedAt = time.Now().Format(time.RFC3339)
+		tasksMu.Unlock()
+		
+		go simulateProgress(task)
+		
+		logger.Info("Task auto-resumed after upgrade/restart", map[string]interface{}{
+			"task_id":   task.ID,
+			"task_name": task.Name,
+			"phase":     task.Phase,
 		})
 	}
 }
@@ -1259,6 +1369,11 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		healthDetailedHandler(rw, r, log)
 	case path == "/api/v1/tasks":
 		tasksHandler(rw, r, log)
+	// 精确匹配的 tasks 子路径必须在 HasPrefix 之前
+	case path == "/api/v1/tasks/batch-delete":
+		batchDeleteTasksHandler(rw, r, log)
+	case path == "/api/v1/tasks/import":
+		importTaskConfigHandler(rw, r, log)
 	case strings.HasPrefix(path, "/api/v1/tasks/"):
 		taskHandler(rw, r, log)
 	case path == "/api/v1/system/status":
@@ -1267,6 +1382,12 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		systemWorkersHandler(rw, r, log)
 	case path == "/api/v1/system/backup":
 		systemBackupHandler(rw, r, log)
+	case path == "/api/v1/system/backups":
+		systemBackupListHandler(rw, r, log)
+	case path == "/api/v1/system/backup-upload":
+		systemBackupUploadHandler(rw, r, log)
+	case strings.HasPrefix(path, "/api/v1/system/backup/"):
+		systemBackupActionHandler(rw, r, log)
 	case path == "/api/v1/test-connection":
 		testConnectionHandler(rw, r, log)
 	case path == "/api/v1/analyze-cluster":
@@ -1281,6 +1402,8 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 	// 独立校验任务 API
 	case path == "/api/v1/verify-tasks":
 		verifyTasksHandler(rw, r, log)
+	case path == "/api/v1/verify-tasks/batch-delete":
+		batchDeleteVerifyTasksHandler(rw, r, log)
 	case strings.HasPrefix(path, "/api/v1/verify-tasks/"):
 		verifyTaskHandler(rw, r, log)
 	
@@ -1294,9 +1417,6 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/v1/parse-keylist":
 		parseKeyListHandler(rw, r, log)
 		
-	// 任务配置导入 API
-	case path == "/api/v1/tasks/import":
-		importTaskConfigHandler(rw, r, log)
 		
 	// 静态资源
 	case strings.HasPrefix(path, "/assets/"):
@@ -1466,6 +1586,41 @@ func initDemoData() {
 			RetryConfig: &RetryConfig{
 				MaxRetries:          3,
 				FullRetryIntervalMs: 100,
+				IncrRetryIntervalMs: 1000,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	// 华为云测试环境 - 15GB 内存，3GB 数据（17654 keys，含大 Key），kvstorecount=10
+	// 智能推荐参数：Key 大小混合（80% String 100B-10KB + 5% 大 Key 1-5MB），按 medium-large 估算
+	// Workers=16（连接数约束：无业务负载，保守配置），ScanBatchSize=1000（含大 Key）
+	// QPS=0（测试环境无业务），连接数=48（16×3）
+	templates["template-huawei-cloud"] = &TaskTemplate{
+		ID:            "template-huawei-cloud",
+		Name:          "华为云测试环境",
+		Description:   "华为云 15GB 内存服务器，源端 3GB 数据（17654 keys，含 5MB 大 String/50000 元素 List 等），kvstorecount=10，全量+增量迁移",
+		SourceCluster: "192.168.0.142:7001,192.168.0.142:7002",
+		TargetCluster: "192.168.0.142:8001,192.168.0.142:8002",
+		MigrationMode: "full_and_incremental",
+		Options: &TaskOptions{
+			WorkerCount:       16,
+			ScanBatchSize:     1000,
+			ConflictPolicy:    "skip",
+			LargeKeyThreshold: 5242880, // 5MB（源端有 5MB 大 String，设低一点以便追踪）
+			KeyFilter: &KeyFilter{
+				Mode: "all",
+			},
+			RateLimit: &RateLimit{
+				SourceQPS:         0,
+				TargetQPS:         0,
+				SourceConnections: 48,
+				TargetConnections: 48,
+			},
+			RetryConfig: &RetryConfig{
+				MaxRetries:          3,
+				FullRetryIntervalMs: 200,
 				IncrRetryIntervalMs: 1000,
 			},
 		},
@@ -1677,13 +1832,15 @@ func logsCleanupHandler(w http.ResponseWriter, r *http.Request, log *logger.Requ
 	// 获取清理前的统计
 	beforeStats := logger.Default().GetLogStats()
 
-	// 执行清理
-	logger.Default().CleanupNow()
+	// 手动清理：仅保留最近 7 天的日志
+	removed := logger.Default().CleanupKeepDays(7)
 
 	// 获取清理后的统计
 	afterStats := logger.Default().GetLogStats()
 
 	log.Info("Manual log cleanup executed", map[string]interface{}{
+		"keep_days":    7,
+		"removed":      removed,
 		"before_files": beforeStats["total_files"],
 		"after_files":  afterStats["total_files"],
 	})
@@ -1917,7 +2074,7 @@ func (c *WSClient) sendTaskMetrics(task *Task) {
 			"progress":        task.Progress,
 			"processed_keys":  task.KeysMigrated,
 			"total_keys":      task.KeysTotal,
-			"keys_to_migrate": task.KeysToMigrate,  // 待迁移Key数
+			"keys_to_migrate": consistentKeysToMigrate(task),  // 一致性读取
 			"current_qps":     speed,
 			"bytes_written":   task.BytesMigrated,
 			"total_bytes":     task.BytesTotal,     // 总字节数
@@ -2097,12 +2254,24 @@ func listTasksHandler(w http.ResponseWriter, r *http.Request, log *logger.Reques
 			"progress": map[string]interface{}{
 				"percentage":      t.Progress,
 				"keys_total":      t.KeysTotal,
-				"keys_to_migrate": t.KeysToMigrate,  // 待迁移 Key 数
+				"keys_to_migrate": consistentKeysToMigrate(t),  // 一致性读取
 				"keys_migrated":   t.KeysMigrated,
 				"keys_filtered":   t.KeysFiltered,   // 被过滤的 Key 数
 				"speed":           t.Speed,
 			},
 		})
+	}
+
+	// 状态过滤
+	statusFilter := r.URL.Query().Get("status")
+	if statusFilter != "" {
+		var filtered []map[string]interface{}
+		for _, item := range items {
+			if s, _ := item["status"].(string); s == statusFilter {
+				filtered = append(filtered, item)
+			}
+		}
+		items = filtered
 	}
 
 	// 按创建时间倒序排序（最新的在前面）
@@ -2112,14 +2281,37 @@ func listTasksHandler(w http.ResponseWriter, r *http.Request, log *logger.Reques
 		return timeI > timeJ
 	})
 
-	log.Debug("Tasks listed", map[string]interface{}{"count": len(items)})
+	totalCount := len(items)
+
+	// 分页
+	pageStr := r.URL.Query().Get("page")
+	sizeStr := r.URL.Query().Get("size")
+	pageNum := 1
+	pageSize := 20
+	if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+		pageNum = p
+	}
+	if s, err := strconv.Atoi(sizeStr); err == nil && s > 0 {
+		pageSize = s
+	}
+	start := (pageNum - 1) * pageSize
+	if start > len(items) {
+		start = len(items)
+	}
+	end := start + pageSize
+	if end > len(items) {
+		end = len(items)
+	}
+	pagedItems := items[start:end]
+
+	log.Debug("Tasks listed", map[string]interface{}{"total": totalCount, "page": pageNum, "size": pageSize, "returned": len(pagedItems)})
 
 	jsonResponse(w, map[string]interface{}{
 		"code":    0,
 		"message": "success",
 		"data": map[string]interface{}{
-			"items": items,
-			"total": len(items),
+			"items": pagedItems,
+			"total": totalCount,
 		},
 	})
 }
@@ -2187,11 +2379,12 @@ func createTaskHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 		} else if options.KeyFilter.Mode == "" {
 			// 【BUG-1 修复】如果设置了 prefixes 或 exclude_prefixes，自动设置 mode 为 "prefix"
 			// 这样用户只需要设置 prefixes，不需要同时设置 mode
-			if len(options.KeyFilter.Prefixes) > 0 || len(options.KeyFilter.ExcludePrefixes) > 0 {
+			if len(options.KeyFilter.Prefixes) > 0 || len(options.KeyFilter.ExcludePrefixes) > 0 || len(options.KeyFilter.ExcludePatterns) > 0 {
 				options.KeyFilter.Mode = "prefix"
-				log.Info("【BUG-1 FIX】Auto-set key_filter.mode to 'prefix' based on prefixes config", map[string]interface{}{
+				log.Info("【BUG-1 FIX】Auto-set key_filter.mode to 'prefix' based on prefixes/exclude config", map[string]interface{}{
 					"prefixes":         options.KeyFilter.Prefixes,
 					"exclude_prefixes": options.KeyFilter.ExcludePrefixes,
+					"exclude_patterns": options.KeyFilter.ExcludePatterns,
 				})
 			} else if len(options.KeyFilter.Patterns) > 0 {
 				options.KeyFilter.Mode = "pattern"
@@ -2278,6 +2471,9 @@ func createTaskHandler(w http.ResponseWriter, r *http.Request, log *logger.Reque
 	tasksMu.Lock()
 	tasks[task.ID] = task
 	tasksMu.Unlock()
+
+	// 【崩溃恢复修复】创建任务后立即持久化，防止 kill-9 在首次定期保存前丢失任务
+	saveTasksState()
 
 	log.Info("Task created", map[string]interface{}{
 		"task_id":        task.ID,
@@ -2418,6 +2614,7 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 		configData["scan_batch_size"] = task.Options.ScanBatchSize
 		configData["conflict_policy"] = task.Options.ConflictPolicy
 		configData["large_key_threshold"] = task.Options.LargeKeyThreshold
+		configData["enable_compression"] = task.Options.EnableCompression
 		if task.Options.RateLimit != nil {
 			configData["rate_limit"] = map[string]interface{}{
 				"source_qps":         task.Options.RateLimit.SourceQPS,
@@ -2426,6 +2623,24 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 				"target_connections": task.Options.RateLimit.TargetConnections,
 			}
 		}
+		// 添加 retry_config 信息
+		retryConfig := map[string]interface{}{
+			"max_retries":            3,
+			"full_retry_interval_ms": 100,
+			"incr_retry_interval_ms": 1000,
+		}
+		if task.Options.RetryConfig != nil {
+			if task.Options.RetryConfig.MaxRetries > 0 {
+				retryConfig["max_retries"] = task.Options.RetryConfig.MaxRetries
+			}
+			if task.Options.RetryConfig.FullRetryIntervalMs > 0 {
+				retryConfig["full_retry_interval_ms"] = task.Options.RetryConfig.FullRetryIntervalMs
+			}
+			if task.Options.RetryConfig.IncrRetryIntervalMs > 0 {
+				retryConfig["incr_retry_interval_ms"] = task.Options.RetryConfig.IncrRetryIntervalMs
+			}
+		}
+		configData["retry_config"] = retryConfig
 		// 添加 key_filter 信息
 		if task.Options.KeyFilter != nil {
 			configData["key_filter"] = map[string]interface{}{
@@ -2433,6 +2648,7 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 				"prefixes":         task.Options.KeyFilter.Prefixes,
 				"exclude_prefixes": task.Options.KeyFilter.ExcludePrefixes,
 				"patterns":         task.Options.KeyFilter.Patterns,
+				"keys":             task.Options.KeyFilter.Keys,
 			}
 		}
 	}
@@ -2444,13 +2660,14 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 	var optionsData map[string]interface{}
 	if task.Options != nil {
 		optionsData = map[string]interface{}{
-			"worker_count":        task.Options.WorkerCount,
-			"scan_batch_size":     task.Options.ScanBatchSize,
-			"conflict_policy":     task.Options.ConflictPolicy,
-			"large_key_threshold": task.Options.LargeKeyThreshold,
-			"skip_full_sync":      task.Options.SkipFullSync,
-			"skip_incremental":    task.Options.SkipIncremental,
-			"shadow_mode":         task.Options.ShadowMode,
+			"worker_count":         task.Options.WorkerCount,
+			"scan_batch_size":      task.Options.ScanBatchSize,
+			"conflict_policy":      task.Options.ConflictPolicy,
+			"large_key_threshold":  task.Options.LargeKeyThreshold,
+			"skip_full_sync":       task.Options.SkipFullSync,
+			"skip_incremental":     task.Options.SkipIncremental,
+			"shadow_mode":          task.Options.ShadowMode,
+			"enable_compression":   task.Options.EnableCompression,
 		}
 		if task.Options.KeyFilter != nil {
 			optionsData["key_filter"] = map[string]interface{}{
@@ -2458,6 +2675,7 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 				"prefixes":         task.Options.KeyFilter.Prefixes,
 				"exclude_prefixes": task.Options.KeyFilter.ExcludePrefixes,
 				"patterns":         task.Options.KeyFilter.Patterns,
+				"keys":             task.Options.KeyFilter.Keys,
 			}
 		}
 	}
@@ -2483,7 +2701,7 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 			"progress": map[string]interface{}{
 				"percentage":      task.Progress,
 				"total_keys":      task.KeysTotal,
-				"keys_to_migrate": task.KeysToMigrate,  // 【新增】符合条件待迁移的Key数
+				"keys_to_migrate": consistentKeysToMigrate(task),  // 一致性读取，保证 >= migrated+failed+skipped+filtered
 				"migrated_keys":   task.KeysMigrated,
 				"total_bytes":     task.BytesTotal,
 				"migrated_bytes":  task.BytesMigrated,
@@ -2494,7 +2712,7 @@ func getTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logg
 			},
 			"stats": map[string]interface{}{
 				"total_keys":         task.KeysTotal,
-				"keys_to_migrate":    task.KeysToMigrate,
+				"keys_to_migrate":    consistentKeysToMigrate(task),
 				"migrated_keys":      task.KeysMigrated,
 				"failed_keys":        task.KeysFailed,
 				"skipped_keys":       task.KeysSkipped,
@@ -2613,6 +2831,23 @@ func loadFullSyncCheckpointFromFile(taskID string) *FullSyncCheckpoint {
 	return &checkpoint
 }
 
+// consistentKeysToMigrate 返回一致性的 KeysToMigrate 值
+// 问题：KeysMigrated 通过 atomic 实时递增，而 KeysToMigrate 在 ticker 中周期更新
+// 在两次 ticker 之间 API 读取时，可能出现 KeysMigrated > KeysToMigrate
+// 修复：读取时保证 KeysToMigrate >= 各分项之和（不改变语义，只是补偿读取时序差）
+func consistentKeysToMigrate(task *Task) int64 {
+	toMigrate := atomic.LoadInt64(&task.KeysToMigrate)
+	migrated := atomic.LoadInt64(&task.KeysMigrated)
+	failed := atomic.LoadInt64(&task.KeysFailed)
+	skipped := atomic.LoadInt64(&task.KeysSkipped)
+	filtered := atomic.LoadInt64(&task.KeysFiltered)
+	totalProcessed := migrated + failed + skipped + filtered
+	if totalProcessed > toMigrate {
+		return totalProcessed
+	}
+	return toMigrate
+}
+
 func calculateETA(task *Task) string {
 	if task.Speed <= 0 || task.KeysTotal <= task.KeysMigrated {
 		return "-"
@@ -2713,6 +2948,66 @@ func deleteTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *l
 	taskLog.Info("Task deleted")
 	
 	jsonResponse(w, map[string]interface{}{"code": 0, "message": "success"})
+}
+
+// batchDeleteTasksHandler 批量删除任务
+func batchDeleteTasksHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "Invalid request body"})
+		return
+	}
+	if len(req.IDs) == 0 {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "No task IDs provided"})
+		return
+	}
+
+	var deleted, notFound int
+	tasksMu.Lock()
+	for _, id := range req.IDs {
+		task, ok := tasks[id]
+		if !ok {
+			notFound++
+			continue
+		}
+		if task.Status == "running" || task.Status == "paused" {
+			task.Cleanup()
+			task.Status = "stopped"
+		}
+		delete(tasks, id)
+		deleted++
+	}
+	tasksMu.Unlock()
+
+	// 锁外清理日志
+	for _, id := range req.IDs {
+		logger.Default().ClearTaskLogs(id)
+	}
+
+	// 持久化
+	saveTasksState()
+
+	log.Info("Batch delete tasks", map[string]interface{}{
+		"requested": len(req.IDs),
+		"deleted":   deleted,
+		"not_found": notFound,
+	})
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": fmt.Sprintf("已删除 %d 个任务", deleted),
+		"data": map[string]interface{}{
+			"deleted":   deleted,
+			"not_found": notFound,
+		},
+	})
 }
 
 // updateTaskConfigHandler 动态调整任务配置（优雅调整）
@@ -2852,6 +3147,9 @@ func startTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *lo
 	task.StartedAt = time.Now().Format("2006-01-02 15:04:05")
 	tasksMu.Unlock()
 
+	// 【崩溃恢复修复】启动任务后立即持久化状态（status: running）
+	saveTasksState()
+
 	go simulateProgress(task)
 	
 	log.Info("Task started", map[string]interface{}{"task_id": id})
@@ -2943,6 +3241,7 @@ func resumeTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *l
 	task.Init()
 	task.Status = "running"
 	task.PausedAt = ""
+	task.ShutdownPaused = false // 清除升级暂停标记
 	task.UpdatedAt = time.Now().Format(time.RFC3339)
 	pausedDuration := task.PausedDuration
 	
@@ -3132,11 +3431,12 @@ type KeyFilterConfig struct {
 
 // VerifyTaskResult 校验任务结果
 type VerifyTaskResult struct {
-	SourceKeyCount   int64                  `json:"source_key_count"`   // 源端 Key 数量
-	TargetKeyCount   int64                  `json:"target_key_count"`   // 目标端 Key 数量
-	ScannedKeys      int64                  `json:"scanned_keys"`       // 已扫描 Key 数
-	SampledKeys      int64                  `json:"sampled_keys"`       // 已采样 Key 数
-	MatchedKeys      int64                  `json:"matched_keys"`       // 匹配的 Key 数
+	SourceKeyCount   int64                  `json:"source_key_count"`   // 源端 Key 数量（DBSIZE，全量）
+	TargetKeyCount   int64                  `json:"target_key_count"`   // 目标端 Key 数量（DBSIZE，全量）
+	ScannedKeys      int64                  `json:"scanned_keys"`       // SCAN 匹配的 Key 数（受 MATCH pattern 影响，有过滤时 < DBSIZE）
+	SampledKeys      int64                  `json:"sampled_keys"`       // 实际参与校验的 Key 数（过滤+采样后）
+	MatchedKeys      int64                  `json:"matched_keys"`       // 校验一致的 Key 数
+	FilteredKeys     int64                  `json:"filtered_keys"`      // 通过 Key 过滤器的 Key 数（有 key_filter 时 <= ScannedKeys）
 	MissingKeys      int64                  `json:"missing_keys"`       // 源端有目标端无
 	ExtraKeys        int64                  `json:"extra_keys"`         // 目标端有源端无
 	ValueMismatch    int64                  `json:"value_mismatch"`     // 值不匹配
@@ -3219,6 +3519,7 @@ type VerifyMetrics struct {
 	
 	// 按类型统计
 	TypeDistribution map[string]int64 `json:"type_distribution,omitempty"` // Key 类型分布
+	typeDistMu       sync.Mutex       `json:"-"`                           // TypeDistribution 的并发锁
 	
 	// 内存使用
 	PeakMemoryMB     float64 `json:"peak_memory_mb"`     // 峰值内存使用（MB）
@@ -3726,70 +4027,99 @@ func triggerVerifyHandler(w http.ResponseWriter, r *http.Request, id string, log
 
 	// 解析请求参数
 	var req struct {
-		Mode       string  `json:"mode"`        // sample（采样验证）或 full（全量验证），默认 sample
-		SampleRate float64 `json:"sample_rate"` // 采样率，0.001-1.0，默认从任务配置获取
-		MaxKeys    int64   `json:"max_keys"`    // 最大验证 Key 数量，默认 10000
+		Mode       string  `json:"mode"`        // sample（采样验证）或 full（全量验证），默认 full
+		SampleRate float64 `json:"sample_rate"` // 采样率，0.001-1.0
+		MaxKeys    int64   `json:"max_keys"`    // 最大验证 Key 数量，默认 0（不限制）
+		CompareMode string `json:"compare_mode"` // full_value, length_only, exists_only
+		CompareTTL  bool   `json:"compare_ttl"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		// 使用默认值
-		req.Mode = "sample"
-		req.MaxKeys = 10000
+		req.Mode = "full"
 	}
 
 	// 参数校验和默认值
 	if req.Mode == "" {
-		req.Mode = "sample"
+		req.Mode = "full"
 	}
-	
-	// 优先使用请求参数，其次使用任务配置，最后使用默认值
 	if req.SampleRate <= 0 || req.SampleRate > 1.0 {
-		// 尝试从任务配置获取
-		if task.Options != nil && task.Options.VerifyConfig != nil && task.Options.VerifyConfig.SampleRate > 0 {
-			req.SampleRate = task.Options.VerifyConfig.SampleRate
+		if req.Mode == "sample" {
+			req.SampleRate = 0.01 // 采样模式默认 1%
 		} else {
-			req.SampleRate = 0.001 // 默认 0.1%
+			req.SampleRate = 1.0 // 全量模式 100%
 		}
 	}
-	
-	if req.MaxKeys <= 0 {
-		req.MaxKeys = 10000
+	if req.CompareMode == "" {
+		req.CompareMode = "full_value"
 	}
 
-	batchID := uuid.New().String()
-	
-	// 创建验证结果记录
-	result := &VerifyResult{
-		BatchID:    batchID,
-		TaskID:     id,
-		Status:     "running",
-		StartTime:  time.Now().Format(time.RFC3339),
-		SampleRate: req.SampleRate,
-		VerifyMode: req.Mode,
+	// 从迁移任务中提取源端/目标端集群信息，创建独立校验任务（VerifyTask）
+	// 这样校验记录会同步出现在「数据校验」列表页，且持久化到文件
+	verifyTask := &VerifyTask{
+		ID:              uuid.New().String(),
+		Name:            fmt.Sprintf("校验[%s]-%s", task.Name, time.Now().Format("0102-150405")),
+		Status:          "pending",
+		SourceCluster:   task.SourceCluster,
+		TargetCluster:   task.TargetCluster,
+		SourcePassword:  task.SourcePassword,
+		TargetPassword:  task.TargetPassword,
+		VerifyMode:      req.Mode,
+		SampleRate:      req.SampleRate,
+		MaxKeys:         req.MaxKeys,
+		CompareValue:    true,
+		CompareTTL:      req.CompareTTL,
+		TTLTolerance:    5,
+		CompareMode:     req.CompareMode,
+		MigrationTaskID: id,
+		Concurrency:     10,
+		CompareRounds:   3,
+		RoundInterval:   5,
+		Direction:       "source_to_target",
+		CreatedAt:       time.Now().Format(time.RFC3339),
+		Result: &VerifyTaskResult{
+			Progress: 0,
+		},
 	}
-	
-	verifyResultsMu.Lock()
-	verifyResults[batchID] = result
-	verifyResultsMu.Unlock()
 
-	log.Info("Verify triggered", map[string]interface{}{
-		"task_id":     id,
-		"batch_id":    batchID,
-		"mode":        req.Mode,
-		"sample_rate": req.SampleRate,
-		"max_keys":    req.MaxKeys,
+	// 继承迁移任务的 Key 过滤配置
+	if task.Options != nil && task.Options.KeyFilter != nil {
+		kf := task.Options.KeyFilter
+		verifyTask.KeyFilter = &KeyFilterConfig{}
+		if len(kf.Prefixes) > 0 {
+			verifyTask.KeyFilter.Prefixes = kf.Prefixes
+		}
+		if len(kf.ExcludePrefixes) > 0 {
+			verifyTask.KeyFilter.ExcludePrefixes = kf.ExcludePrefixes
+		}
+	}
+
+	// 存入独立校验任务 map 并持久化
+	verifyTasksMu.Lock()
+	verifyTasks[verifyTask.ID] = verifyTask
+	verifyTasksMu.Unlock()
+	saveVerifyTasksState()
+
+	log.Info("Verify task created from migration task", map[string]interface{}{
+		"verify_task_id":    verifyTask.ID,
+		"migration_task_id": id,
+		"mode":              req.Mode,
+		"compare_mode":      req.CompareMode,
+		"sample_rate":       req.SampleRate,
 	})
 
-	// 异步执行验证
-	go runDataVerification(task, result, req.SampleRate, req.MaxKeys, log)
+	// 自动启动校验任务
+	go runVerifyTask(verifyTask)
 
 	jsonResponse(w, map[string]interface{}{
 		"code":    0,
-		"message": "Verification started",
+		"message": "Verification task created and started",
 		"data": map[string]interface{}{
-			"batch_id":    batchID,
-			"mode":        req.Mode,
-			"sample_rate": req.SampleRate,
-			"max_keys":    req.MaxKeys,
+			"verify_task_id":    verifyTask.ID,
+			"migration_task_id": id,
+			"name":              verifyTask.Name,
+			"mode":              req.Mode,
+			"compare_mode":      req.CompareMode,
+			"sample_rate":       req.SampleRate,
 		},
 	})
 }
@@ -4038,19 +4368,19 @@ func runDataVerification(task *Task, result *VerifyResult, sampleRate float64, m
 func verifyResultsHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger) {
 	log.Debug("Verify results queried", map[string]interface{}{"task_id": id})
 
-	// 获取该任务的所有验证结果
-	var results []*VerifyResult
-	verifyResultsMu.RLock()
-	for _, result := range verifyResults {
-		if result.TaskID == id {
-			results = append(results, result)
+	// 从独立校验任务（VerifyTask）中查找关联该迁移任务的所有校验记录
+	var results []*VerifyTask
+	verifyTasksMu.RLock()
+	for _, vt := range verifyTasks {
+		if vt.MigrationTaskID == id {
+			results = append(results, vt)
 		}
 	}
-	verifyResultsMu.RUnlock()
+	verifyTasksMu.RUnlock()
 
-	// 按时间倒序排序
+	// 按创建时间倒序排序
 	sort.Slice(results, func(i, j int) bool {
-		return results[i].StartTime > results[j].StartTime
+		return results[i].CreatedAt > results[j].CreatedAt
 	})
 
 	jsonResponse(w, map[string]interface{}{
@@ -5306,11 +5636,10 @@ func (p *DynamicWorkerPool) processKeyBatch(workerID int, keys []string) {
 		return
 	}
 
-	// 批量模式下的限速优化：只等待一次，不逐个等待
-	// 因为 Pipeline 已经是批量操作，逐个等待会严重降低吞吐量
-	// 如果设置了 QPS 限速，这里按批次大小进行粗粒度控制
+	// 批量模式下的限速：按实际 key 数量消耗令牌
+	// Pipeline 批量操作时，每个 key 都应计入限速
 	if rl := p.GetRateLimiter(); rl != nil {
-		rl.Wait() // 仅等待一次令牌
+		rl.WaitN(len(keys))
 	}
 
 	// 影子模式：只读取源端数据，不写入目标端
@@ -5344,9 +5673,9 @@ func (p *DynamicWorkerPool) processKeyBatch(workerID int, keys []string) {
 		return
 	}
 
-	// 正常模式：写入目标端
+	// 正常模式：写入目标端限速（按实际 key 数量消耗令牌）
 	if tl := p.GetTargetRateLimiter(); tl != nil {
-		tl.Wait() // 仅等待一次令牌
+		tl.WaitN(len(keys))
 	}
 
 	// 使用 Pipeline 批量迁移（问题4修复：添加任务ID和大Key阈值）
@@ -6532,13 +6861,15 @@ func doFullMigration(ctx context.Context, task *Task, sourceClient, targetClient
 	}
 }
 
-// RateLimiter 简单的限速器
+// RateLimiter 基于 golang.org/x/time/rate 的限速器
+// 【BUG-FIX】替换自制 token-channel 限速器，修复多 Worker 争抢 token 导致 QPS 严重下降的问题
+// 旧实现：WaitN 逐个等 token，8 个 Worker 串行争抢 channel → 500 QPS 实际只有 ~100/s
+// 新实现：rate.Limiter 基于精确时间计算，WaitN 一次性预约 N 个 token，多 goroutine 不退化
 type RateLimiter struct {
-	qps      int                // QPS值（用于比较是否需要更新）
-	ticker   *time.Ticker
-	tokens   chan struct{}
-	stopChan chan struct{}
-	stopOnce sync.Once          // 【审查修复】防止 double-close panic
+	qps     int              // QPS值（用于比较是否需要更新）
+	limiter *rate.Limiter    // 标准令牌桶限速器
+	ctx     context.Context  // 用于取消等待
+	cancel  context.CancelFunc
 }
 
 // NewRateLimiter 创建限速器
@@ -6546,62 +6877,53 @@ func NewRateLimiter(qps int) *RateLimiter {
 	if qps <= 0 {
 		return nil
 	}
-	interval := time.Second / time.Duration(qps)
-	if interval < time.Microsecond {
-		interval = time.Microsecond
-	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	rl := &RateLimiter{
-		qps:      qps,
-		ticker:   time.NewTicker(interval),
-		tokens:   make(chan struct{}, qps),
-		stopChan: make(chan struct{}),
+		qps:     qps,
+		limiter: rate.NewLimiter(rate.Limit(qps), qps), // rate=QPS/s, burst=QPS（允许短时突发）
+		ctx:     ctx,
+		cancel:  cancel,
 	}
-
-	// 预填充tokens
-	for i := 0; i < qps/10+1; i++ {
-		select {
-		case rl.tokens <- struct{}{}:
-		default:
-		}
-	}
-
-	// 持续填充tokens
-	go func() {
-		for {
-			select {
-			case <-rl.stopChan:
-				return
-			case <-rl.ticker.C:
-				select {
-				case rl.tokens <- struct{}{}:
-				default:
-				}
-			}
-		}
-	}()
 
 	return rl
 }
 
-// Wait 等待获取令牌
+// Wait 等待获取 1 个令牌
 func (rl *RateLimiter) Wait() {
 	if rl == nil {
 		return
 	}
-	<-rl.tokens
+	_ = rl.limiter.Wait(rl.ctx) // ctx 被 cancel 后立即返回
+}
+
+// WaitN 等待获取 n 个令牌（用于批量操作限速）
+// 基于 rate.Limiter.WaitN：精确时间计算，多 goroutine 并发不退化
+func (rl *RateLimiter) WaitN(n int) {
+	if rl == nil || n <= 0 {
+		return
+	}
+	// rate.Limiter.WaitN 要求 n <= burst，如果 n 超过 burst 则分批等待
+	burst := rl.limiter.Burst()
+	for n > 0 {
+		batch := n
+		if batch > burst {
+			batch = burst
+		}
+		if err := rl.limiter.WaitN(rl.ctx, batch); err != nil {
+			return // ctx cancelled（限速器被 Stop）
+		}
+		n -= batch
+	}
 }
 
 // Stop 停止限速器
+// cancel context 会唤醒所有在 Wait/WaitN 中阻塞的 goroutine
 func (rl *RateLimiter) Stop() {
 	if rl == nil {
 		return
 	}
-	// 【审查修复】使用 sync.Once 防止 double-close panic
-	rl.stopOnce.Do(func() {
-		close(rl.stopChan)
-	})
-	rl.ticker.Stop()
+	rl.cancel()
 }
 
 // getOutboundIP 获取本机可以连接到目标地址的出口 IP
@@ -6746,8 +7068,11 @@ func syncKeyByType(ctx context.Context, sourceClient, targetClient redis.Univers
 				args = append(args, k, v)
 			}
 			err = targetClient.HMSet(ctx, key, args...).Err()
+			// 【BUG-FIX TTL 一致性】使用 PExpire（毫秒精度）+ 检查返回值
 			if err == nil && ttl > 0 {
-				targetClient.Expire(ctx, key, ttl)
+				if expErr := targetClient.PExpire(ctx, key, ttl).Err(); expErr != nil {
+					return fmt.Errorf("hash PExpire failed: %v", expErr)
+				}
 			}
 		}
 
@@ -6764,8 +7089,11 @@ func syncKeyByType(ctx context.Context, sourceClient, targetClient redis.Univers
 				args[i] = v
 			}
 			err = targetClient.RPush(ctx, key, args...).Err()
+			// 【BUG-FIX TTL 一致性】使用 PExpire（毫秒精度）+ 检查返回值
 			if err == nil && ttl > 0 {
-				targetClient.Expire(ctx, key, ttl)
+				if expErr := targetClient.PExpire(ctx, key, ttl).Err(); expErr != nil {
+					return fmt.Errorf("list PExpire failed: %v", expErr)
+				}
 			}
 		}
 
@@ -6782,8 +7110,11 @@ func syncKeyByType(ctx context.Context, sourceClient, targetClient redis.Univers
 				args[i] = v
 			}
 			err = targetClient.SAdd(ctx, key, args...).Err()
+			// 【BUG-FIX TTL 一致性】使用 PExpire（毫秒精度）+ 检查返回值
 			if err == nil && ttl > 0 {
-				targetClient.Expire(ctx, key, ttl)
+				if expErr := targetClient.PExpire(ctx, key, ttl).Err(); expErr != nil {
+					return fmt.Errorf("set PExpire failed: %v", expErr)
+				}
 			}
 		}
 
@@ -6799,8 +7130,11 @@ func syncKeyByType(ctx context.Context, sourceClient, targetClient redis.Univers
 				zMembers[i] = &redis.Z{Score: m.Score, Member: m.Member}
 			}
 			err = targetClient.ZAdd(ctx, key, zMembers...).Err()
+			// 【BUG-FIX TTL 一致性】使用 PExpire（毫秒精度）+ 检查返回值
 			if err == nil && ttl > 0 {
-				targetClient.Expire(ctx, key, ttl)
+				if expErr := targetClient.PExpire(ctx, key, ttl).Err(); expErr != nil {
+					return fmt.Errorf("zset PExpire failed: %v", expErr)
+				}
 			}
 		}
 
@@ -6861,7 +7195,9 @@ func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient re
 	dumpCmds := make([]*redis.StringCmd, len(keys))
 
 	for i, key := range keys {
-		ttlCmds[i] = sourcePipe.TTL(ctx, key)
+		// 【BUG-FIX TTL 一致性】使用 PTTL（毫秒精度）替代 TTL（秒精度）
+		// 确保迁移前后 TTL 完全一致，不丢失毫秒精度
+		ttlCmds[i] = sourcePipe.PTTL(ctx, key)
 		dumpCmds[i] = sourcePipe.Dump(ctx, key)
 	}
 
@@ -7091,8 +7427,30 @@ func MigrateBatchWithPipelineAndFilter(ctx context.Context, sourceClient, target
 	return
 }
 
+// systemInternalKeyPrefixes 内置排除的系统内部 key 前缀（不包含业务数据，不应被迁移）
+var systemInternalKeyPrefixes = []string{
+	"stat:total:",
+	"stat:daily:",
+	"stat:hourly:",
+}
+
+// isSystemInternalKey 判断是否为 Tendis 系统内部 key
+func isSystemInternalKey(key string) bool {
+	for _, prefix := range systemInternalKeyPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // matchKeyFilterV2 检查 Key 是否匹配过滤规则（支持 KeyFilter 结构）
 func matchKeyFilterV2(key string, filter *KeyFilter) bool {
+	// 内置排除：系统内部 key 始终跳过（无论过滤配置如何）
+	if isSystemInternalKey(key) {
+		return false
+	}
+
 	if filter == nil {
 		return true
 	}
@@ -7100,6 +7458,13 @@ func matchKeyFilterV2(key string, filter *KeyFilter) bool {
 	// 检查排除前缀
 	for _, prefix := range filter.ExcludePrefixes {
 		if strings.HasPrefix(key, prefix) {
+			return false
+		}
+	}
+
+	// 检查排除正则模式
+	for _, pattern := range filter.ExcludePatterns {
+		if matched, err := regexp.MatchString(pattern, key); err == nil && matched {
 			return false
 		}
 	}
@@ -8162,10 +8527,10 @@ func processBinlogEntries(
 		case "SET":
 			// 【BUG-2 修复】SET 类型：不再使用 RESTORE 命令（Tendis 间 DUMP 格式可能不兼容）
 			// 改为从源端重新读取数据并使用原生命令写入
+			// 【BUG-FIX TTL】entry.TTL 在 binlog 解析中始终为 0，必须从源端重新获取真实 PTTL
+			// 否则 PERSIST/EXPIRE 等命令产生的 SET entry 会导致目标端 TTL 丢失（变为 -1）
 			taskLog.Debug("Entering SET case", map[string]interface{}{"key": entry.Key})
 			if len(entry.Key) > 0 {
-				ttl := time.Duration(entry.TTL) * time.Millisecond
-				
 				// 从源端重新获取 Key 的类型和值
 				keyType, err := sourceClient.Type(ctx, entry.Key).Result()
 				taskLog.Debug("Got key type from source", map[string]interface{}{
@@ -8180,6 +8545,23 @@ func processBinlogEntries(
 					})
 					continue
 				}
+
+				// 【关键】从源端获取真实的 PTTL（毫秒精度）
+				// Tendis binlog entry 的 TTL 字段始终为 0，不能使用
+				// 必须从源端实时查询，确保迁移后 TTL 与源端一致
+				pttl, pttlErr := sourceClient.PTTL(ctx, entry.Key).Result()
+				var ttl time.Duration
+				if pttlErr == nil && pttl > 0 {
+					ttl = pttl
+				}
+				// pttl == -1 表示永不过期，pttl == -2 表示 Key 不存在
+				// 两种情况下 ttl 保持 0（永不过期或跳过）
+				
+				taskLog.Debug("Got PTTL from source", map[string]interface{}{
+					"key":  entry.Key,
+					"pttl": pttl.Milliseconds(),
+					"ttl":  ttl.Milliseconds(),
+				})
 				
 				// 根据 Key 类型使用对应的命令同步
 				syncErr := syncKeyByType(ctx, sourceClient, targetClient, entry.Key, keyType, ttl, conflictPolicy)
@@ -8210,6 +8592,65 @@ func processBinlogEntries(
 				})
 				// 删除失败不计入 failed（目标端可能本来就不存在）
 			} else {
+				synced++
+			}
+
+		case "TTL":
+			// 【BUG-FIX TTL 一致性】TTL 设置操作（EXPIRE/PEXPIRE/PEXPIREAT 等）
+			// Tendis binlog 中 EXPIRE 等命令产生 ReplOpTTL(4) 类型的 entry
+			// 必须从源端获取最新 PTTL 并设置到目标端，确保迁移前后 TTL 完全一致
+			if len(entry.Key) > 0 {
+				pttl, err := sourceClient.PTTL(ctx, entry.Key).Result()
+				if err == nil && pttl > 0 {
+					expErr := targetClient.PExpire(ctx, entry.Key, pttl).Err()
+					if expErr != nil {
+						taskLog.Debug("Binlog TTL PExpire failed", map[string]interface{}{
+							"key":   entry.Key,
+							"pttl":  pttl.Milliseconds(),
+							"error": expErr.Error(),
+						})
+						failed++
+						addErrorKeyWithDetails(task.ID, entry.Key, "unknown", "failed",
+							"Binlog TTL PExpire failed: "+expErr.Error(),
+							"binlog", "target", "TTL", "incremental", 0)
+						continue
+					}
+					synced++
+				} else if err == nil && pttl == -1 {
+					// 源端 Key 无过期时间（可能同时执行了 PERSIST）
+					// 不需要设置 TTL，跳过
+					synced++
+				} else if err == nil && pttl == -2 {
+					// Key 不存在，跳过
+					taskLog.Debug("Binlog TTL key not found in source", map[string]interface{}{
+						"key": entry.Key,
+					})
+				} else if err != nil {
+					taskLog.Debug("Binlog TTL PTTL query failed", map[string]interface{}{
+						"key":   entry.Key,
+						"error": err.Error(),
+					})
+					failed++
+				}
+			}
+
+		case "TTLDEL":
+			// 【BUG-FIX TTL 一致性】TTL 删除操作（PERSIST 命令）
+			// Tendis binlog 中 PERSIST 命令产生 ReplOpTTLDel(5) 类型的 entry
+			// 在目标端也执行 PERSIST，移除过期时间
+			if len(entry.Key) > 0 {
+				err := targetClient.Persist(ctx, entry.Key).Err()
+				if err != nil {
+					taskLog.Debug("Binlog TTLDEL Persist failed", map[string]interface{}{
+						"key":   entry.Key,
+						"error": err.Error(),
+					})
+					failed++
+					addErrorKeyWithDetails(task.ID, entry.Key, "unknown", "failed",
+						"Binlog TTLDEL Persist failed: "+err.Error(),
+						"binlog", "target", "TTLDEL", "incremental", 0)
+					continue
+				}
 				synced++
 			}
 
@@ -8465,11 +8906,12 @@ func doIncrementalSync(ctx context.Context, task *Task, sourceClient, targetClie
 			}
 
 			// 更新任务统计（包括速度）
-			// 【死锁修复】使用 task.statsMu 代替全局 tasksMu
+			// 【BUG-FIX】增量阶段应使用独立计数器 IncrKeysSynced，不能累加到全量的 KeysMigrated
+			// 否则会出现 已迁移Key > 待迁移Key 的显示异常
 			task.statsMu.Lock()
-			task.KeysMigrated += roundSynced
-			task.KeysSkipped += roundSkipped
-			task.KeysFailed += roundFailed
+			task.IncrKeysSynced += roundSynced
+			task.IncrKeysSkipped += roundSkipped
+			task.IncrKeysFailed += roundFailed
 			task.UpdatedAt = time.Now().Format(time.RFC3339)
 			// 增量阶段更新速度：显示本轮扫描速度
 			if roundSpeed > 0 {
@@ -9042,11 +9484,12 @@ func doIncrementalSyncWithBinlog(
 			keysFailed += roundFailed
 
 			if roundSynced > 0 || roundSkipped > 0 || roundFailed > 0 {
-				// 【死锁修复】使用 task.statsMu 代替全局 tasksMu
+				// 【BUG-FIX】增量阶段应使用独立计数器 IncrKeysSynced，不能累加到全量的 KeysMigrated
+				// 否则会出现 已迁移Key > 待迁移Key 的显示异常
 				task.statsMu.Lock()
-				task.KeysMigrated += roundSynced
-				task.KeysSkipped += roundSkipped
-				task.KeysFailed += roundFailed
+				task.IncrKeysSynced += roundSynced
+				task.IncrKeysSkipped += roundSkipped
+				task.IncrKeysFailed += roundFailed
 				task.UpdatedAt = time.Now().Format(time.RFC3339)
 				task.statsMu.Unlock()
 
@@ -9587,6 +10030,77 @@ func getAllErrorKeys(taskID string, limit int) []ErrorKey {
 	return allKeys
 }
 
+// iterateFailedKeys 流式迭代失败的 Key，通过 channel 发送，避免一次性加载全部到内存
+// 适用于几百万 failed keys 的重试场景
+// 返回: (channel, totalEstimate)  totalEstimate 是估算总数（内存+磁盘，未扣除 removed）
+func iterateFailedKeys(taskID string) (<-chan ErrorKey, int64) {
+	ch := make(chan ErrorKey, 1000)
+
+	// 获取已移除的 Key 集合
+	removedErrorKeysMu.RLock()
+	removed := removedErrorKeys[taskID]
+	removedErrorKeysMu.RUnlock()
+
+	// 估算总数
+	errorKeyMu.RLock()
+	memCount := int64(len(errorKeys[taskID]))
+	errorKeyMu.RUnlock()
+
+	errorKeysTrackersMu.RLock()
+	tracker := errorKeysTrackers[taskID]
+	var fileCount int64
+	var files []string
+	if tracker != nil {
+		fileCount = tracker.TotalInFiles
+		files = make([]string, len(tracker.Files))
+		copy(files, tracker.Files)
+	}
+	errorKeysTrackersMu.RUnlock()
+
+	totalEstimate := memCount + fileCount
+
+	go func() {
+		defer close(ch)
+
+		// 1. 先发送内存中的 failed keys
+		errorKeyMu.RLock()
+		memoryKeys := make([]ErrorKey, len(errorKeys[taskID]))
+		copy(memoryKeys, errorKeys[taskID])
+		errorKeyMu.RUnlock()
+
+		for _, k := range memoryKeys {
+			if removed != nil && removed[k.Key] {
+				continue
+			}
+			if k.Reason == "failed" || k.Reason == "timeout" {
+				ch <- k
+			}
+		}
+
+		// 2. 逐文件流式读取磁盘文件（正序，从最早的文件开始）
+		for _, file := range files {
+			data, err := os.ReadFile(file)
+			if err != nil {
+				continue
+			}
+			var fileKeys []ErrorKey
+			if err := json.Unmarshal(data, &fileKeys); err != nil {
+				continue
+			}
+			for _, k := range fileKeys {
+				if removed != nil && removed[k.Key] {
+					continue
+				}
+				if k.Reason == "failed" || k.Reason == "timeout" {
+					ch <- k
+				}
+			}
+		}
+	}()
+
+	return ch, totalEstimate
+}
+
 // ==================== 增量同步断点 ====================
 
 // IncrementalSyncCheckpoint 增量同步断点（旧版本，保留兼容）
@@ -9751,6 +10265,20 @@ func saveFullSyncCheckpoint(taskID string, checkpoint *FullSyncCheckpoint) {
 		IsComplete:       checkpoint.IsComplete,
 		UpdatedAt:        checkpoint.UpdatedAt,
 	}
+
+	// 【崩溃恢复修复】同步快照 task 计数器到断点中
+	// kill -9 时 tasks-state.json 可能落后（30秒周期保存），但断点保存更频繁（每1000 key）
+	// 恢复时取 max(tasks-state计数器, 断点计数器) 确保计数器不落后
+	tasksMu.RLock()
+	if task, ok := tasks[taskID]; ok {
+		cpCopy.KeysMigrated = atomic.LoadInt64(&task.KeysMigrated)
+		cpCopy.KeysFailed = atomic.LoadInt64(&task.KeysFailed)
+		cpCopy.KeysSkipped = atomic.LoadInt64(&task.KeysSkipped)
+		cpCopy.KeysFiltered = atomic.LoadInt64(&task.KeysFiltered)
+		cpCopy.KeysToMigrate = task.KeysToMigrate
+		cpCopy.BytesMigrated = atomic.LoadInt64(&task.BytesMigrated)
+	}
+	tasksMu.RUnlock()
 
 	// 保存到内存
 	fullSyncCheckpointsMu.Lock()
@@ -10098,7 +10626,7 @@ type PreflightCheckItem struct {
 	Status   string `json:"status"`   // passed, failed, warning
 	Required bool   `json:"required"` // 是否为必须通过项
 	Message  string `json:"message"`  // 结果描述
-	Detail   string `json:"detail"`   // 详细信息
+	Details  string `json:"details"`  // 详细信息
 }
 
 // preflightCheckHandler 迁移前依赖校验
@@ -10131,7 +10659,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 			Status:   "failed",
 			Required: true,
 			Message:  "源集群连接失败",
-			Detail:   sourceErr.Error(),
+			Details:  sourceErr.Error(),
 		})
 		allPassed = false
 		hasBlocker = true
@@ -10146,7 +10674,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 			Status:   "passed",
 			Required: true,
 			Message:  fmt.Sprintf("源集群连接成功（%s）", modeStr),
-			Detail:   fmt.Sprintf("节点地址: %s", strings.Join(sourceAddrs, ", ")),
+			Details:  fmt.Sprintf("节点地址: %s", strings.Join(sourceAddrs, ", ")),
 		})
 	}
 
@@ -10162,7 +10690,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 			Status:   "failed",
 			Required: true,
 			Message:  "目标集群连接失败",
-			Detail:   targetErr.Error(),
+			Details:  targetErr.Error(),
 		})
 		allPassed = false
 		hasBlocker = true
@@ -10177,7 +10705,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 			Status:   "passed",
 			Required: true,
 			Message:  fmt.Sprintf("目标集群连接成功（%s）", modeStr),
-			Detail:   fmt.Sprintf("节点地址: %s", strings.Join(targetAddrs, ", ")),
+			Details:  fmt.Sprintf("节点地址: %s", strings.Join(targetAddrs, ", ")),
 		})
 	}
 
@@ -10191,7 +10719,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 					Status:   "warning",
 					Required: false,
 					Message:  "源集群拓扑存在异常节点",
-					Detail:   err.Error(),
+					Details:  err.Error(),
 				})
 				allPassed = false
 			} else {
@@ -10214,7 +10742,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 					Status:   "warning",
 					Required: false,
 					Message:  "目标集群拓扑存在异常节点",
-					Detail:   err.Error(),
+					Details:  err.Error(),
 				})
 				allPassed = false
 			} else {
@@ -10243,7 +10771,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 					Status:   "warning",
 					Required: false,
 					Message:  fmt.Sprintf("源端与目标端时间差 %s，超过 5 秒", skew.String()),
-					Detail:   fmt.Sprintf("源端: %s, 目标端: %s，TTL 精度可能受影响", sourceTime.Format("2006-01-02 15:04:05"), targetTime.Format("2006-01-02 15:04:05")),
+					Details:  fmt.Sprintf("源端: %s, 目标端: %s，TTL 精度可能受影响", sourceTime.Format("2006-01-02 15:04:05"), targetTime.Format("2006-01-02 15:04:05")),
 				})
 				allPassed = false
 			} else {
@@ -10252,7 +10780,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 					Status:   "passed",
 					Required: false,
 					Message:  fmt.Sprintf("时间同步正常（差值 %s）", skew.String()),
-					Detail:   fmt.Sprintf("源端: %s, 目标端: %s", sourceTime.Format("2006-01-02 15:04:05"), targetTime.Format("2006-01-02 15:04:05")),
+					Details:  fmt.Sprintf("源端: %s, 目标端: %s", sourceTime.Format("2006-01-02 15:04:05"), targetTime.Format("2006-01-02 15:04:05")),
 				})
 			}
 		} else {
@@ -10271,7 +10799,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 				Status:   "warning",
 				Required: false,
 				Message:  "获取集群时间失败，无法校验",
-				Detail:   detail,
+				Details:  detail,
 			})
 		}
 	}
@@ -10286,7 +10814,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 				Status:   "passed",
 				Required: true,
 				Message:  "源端支持 Binlog 增量同步",
-				Detail:   binlogMsg,
+				Details:  binlogMsg,
 			})
 		} else {
 			checks = append(checks, PreflightCheckItem{
@@ -10294,10 +10822,42 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 				Status:   "failed",
 				Required: true,
 				Message:  "源端不支持 Binlog 增量同步",
-				Detail:   binlogMsg + "。增量同步需要 Tendis 并开启 binlog-enabled=yes",
+				Details:  binlogMsg + "。增量同步需要 Tendis 并开启 binlog-enabled=yes",
 			})
 			allPassed = false
 			hasBlocker = true
+		}
+	}
+
+	// ===== 6b. binlog-enabled 配置检测（Tendis 必须） =====
+	if sourceErr == nil && needIncremental {
+		binlogEnabled := checkTendisBinlogEnabledConfig(ctx, sourceClient)
+		if binlogEnabled != nil {
+			checks = append(checks, *binlogEnabled)
+			if binlogEnabled.Status == "failed" {
+				allPassed = false
+				hasBlocker = true
+			}
+		}
+	}
+
+	// ===== 6c. aof-enabled 配置检测（Tendis 必须） =====
+	if sourceErr == nil && needIncremental {
+		aofEnabled := checkTendisAofEnabledConfig(ctx, sourceClient)
+		if aofEnabled != nil {
+			checks = append(checks, *aofEnabled)
+			if aofEnabled.Status == "failed" {
+				allPassed = false
+				hasBlocker = true
+			}
+		}
+	}
+
+	// ===== 6d. KvStoreCount 配置（Tendis 信息展示） =====
+	if sourceErr == nil && needIncremental {
+		kvCheck := checkTendisKvstorecount(ctx, sourceClient)
+		if kvCheck != nil {
+			checks = append(checks, *kvCheck)
 		}
 	}
 
@@ -10312,7 +10872,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 				Status:   "warning",
 				Required: false,
 				Message:  "无法获取源端 Key 总数",
-				Detail:   err.Error(),
+				Details:  err.Error(),
 			})
 		} else {
 			checks = append(checks, PreflightCheckItem{
@@ -10320,7 +10880,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 				Status:   "passed",
 				Required: false,
 				Message:  fmt.Sprintf("源端 Key 总数: %s", formatKeyCount(totalKeys)),
-				Detail:   fmt.Sprintf("DBSIZE 返回 %d", totalKeys),
+				Details:  fmt.Sprintf("DBSIZE 返回 %d", totalKeys),
 			})
 		}
 	}
@@ -10334,7 +10894,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 				Status:   "warning",
 				Required: false,
 				Message:  "Key过滤模式为 prefix，但未配置任何前缀",
-				Detail:   "将迁移所有 Key",
+				Details:  "将迁移所有 Key",
 			})
 		} else {
 			detail := fmt.Sprintf("模式: %s", kf.Mode)
@@ -10349,7 +10909,7 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 				Status:   "passed",
 				Required: false,
 				Message:  "Key过滤配置正常",
-				Detail:   detail,
+				Details:  detail,
 			})
 		}
 	} else {
@@ -10359,6 +10919,32 @@ func preflightCheckHandler(w http.ResponseWriter, r *http.Request, id string, lo
 			Required: false,
 			Message:  "未配置Key过滤，将迁移所有Key",
 		})
+	}
+
+	// ===== 9. 目标端数据覆盖风险检测（非必须，仅警告） =====
+	if targetErr == nil {
+		dbSizeCtx2, dbSizeCancel2 := context.WithTimeout(ctx, 10*time.Second)
+		targetKeys, err := getDBSize(dbSizeCtx2, targetClient, targetIsCluster)
+		dbSizeCancel2()
+		if err == nil {
+			if targetKeys == 0 {
+				checks = append(checks, PreflightCheckItem{
+					Name:     "目标端数据检查",
+					Status:   "passed",
+					Required: false,
+					Message:  "目标端为空，可安全写入",
+				})
+			} else {
+				checks = append(checks, PreflightCheckItem{
+					Name:     "目标端数据检查",
+					Status:   "warning",
+					Required: false,
+					Message:  fmt.Sprintf("目标端已有 %s Key，迁移可能覆盖已有数据", formatKeyCount(targetKeys)),
+					Details:  "如果使用 RESTORE REPLACE 模式，同名 Key 将被覆盖。请确认目标端数据是否可以被覆盖",
+				})
+				allPassed = false
+			}
+		}
 	}
 
 	// 汇总结果
@@ -10818,7 +11404,383 @@ func systemBackupHandler(w http.ResponseWriter, r *http.Request, log *logger.Req
 	})
 }
 
-// stopIncrementalHandler 停止增量同步（任务进入准备完成状态）
+// systemBackupListHandler 列出所有备份文件
+func systemBackupListHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	backupDir := "./data/backups"
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		// 目录不存在，返回空列表
+		jsonResponse(w, map[string]interface{}{
+			"code": 0, "message": "success",
+			"data": map[string]interface{}{"backups": []interface{}{}},
+		})
+		return
+	}
+
+	type BackupInfo struct {
+		FileName   string `json:"file_name"`
+		FilePath   string `json:"file_path"`
+		Size       int64  `json:"size"`
+		CreatedAt  string `json:"created_at"`
+		TasksCount int    `json:"tasks_count"`
+	}
+
+	var backups []BackupInfo
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		// 尝试读取文件获取任务数
+		tasksCount := 0
+		filePath := fmt.Sprintf("%s/%s", backupDir, entry.Name())
+		if raw, err := os.ReadFile(filePath); err == nil {
+			var bk map[string]interface{}
+			if json.Unmarshal(raw, &bk) == nil {
+				if t, ok := bk["tasks"].(map[string]interface{}); ok {
+					tasksCount = len(t)
+				}
+			}
+		}
+
+		backups = append(backups, BackupInfo{
+			FileName:   entry.Name(),
+			FilePath:   filePath,
+			Size:       info.Size(),
+			CreatedAt:  info.ModTime().Format(time.RFC3339),
+			TasksCount: tasksCount,
+		})
+	}
+
+	// 按时间倒序（新的在前）
+	sort.Slice(backups, func(i, j int) bool {
+		return backups[i].CreatedAt > backups[j].CreatedAt
+	})
+
+	jsonResponse(w, map[string]interface{}{
+		"code": 0, "message": "success",
+		"data": map[string]interface{}{"backups": backups},
+	})
+}
+
+// systemBackupActionHandler 处理单个备份的操作：恢复、下载、删除
+func systemBackupActionHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
+	// 路径格式: /api/v1/system/backup/{filename}/{action}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/system/backup/"), "/")
+	if len(parts) < 1 {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "Missing backup filename"})
+		return
+	}
+
+	filename := parts[0]
+	action := ""
+	if len(parts) >= 2 {
+		action = parts[1]
+	}
+
+	// 安全检查：防止路径遍历
+	if strings.Contains(filename, "..") || strings.Contains(filename, "/") {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "Invalid filename"})
+		return
+	}
+
+	filePath := fmt.Sprintf("./data/backups/%s", filename)
+
+	switch action {
+	case "restore":
+		systemBackupRestoreHandler(w, r, filePath, log)
+	case "download":
+		systemBackupDownloadHandler(w, r, filePath)
+	default:
+		// DELETE 方法 = 删除备份
+		if r.Method == "DELETE" {
+			systemBackupDeleteHandler(w, r, filePath, log)
+		} else {
+			jsonResponse(w, map[string]interface{}{"code": 400, "message": "Unknown action: " + action})
+		}
+	}
+}
+
+// systemBackupRestoreHandler 从备份恢复任务
+func systemBackupRestoreHandler(w http.ResponseWriter, r *http.Request, filePath string, log *logger.RequestLogger) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 检查是否有正在运行的任务
+	tasksMu.RLock()
+	for _, task := range tasks {
+		if task.Status == "running" || task.Status == "incremental" {
+			tasksMu.RUnlock()
+			jsonResponse(w, map[string]interface{}{
+				"code":    400,
+				"message": "有正在运行的任务，请先停止所有任务再恢复备份",
+			})
+			return
+		}
+	}
+	tasksMu.RUnlock()
+
+	// 读取备份文件
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Error("Failed to read backup file", map[string]interface{}{"error": err.Error(), "file": filePath})
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "备份文件不存在"})
+		return
+	}
+
+	var backup map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &backup); err != nil {
+		log.Error("Failed to parse backup file", map[string]interface{}{"error": err.Error()})
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "备份文件格式错误"})
+		return
+	}
+
+	// 解析任务
+	var tasksBackup map[string]json.RawMessage
+	if t, ok := backup["tasks"]; ok {
+		json.Unmarshal(t, &tasksBackup)
+	}
+
+	// 解析错误 Key
+	var errorKeysBackup map[string][]ErrorKey
+	if ek, ok := backup["error_keys"]; ok {
+		json.Unmarshal(ek, &errorKeysBackup)
+	}
+
+	restoredCount := 0
+	skippedCount := 0
+
+	tasksMu.Lock()
+	for id, rawTask := range tasksBackup {
+		// 如果任务已存在，跳过
+		if _, exists := tasks[id]; exists {
+			skippedCount++
+			continue
+		}
+
+		// 解析任务数据
+		var taskData struct {
+			ID             string          `json:"id"`
+			Name           string          `json:"name"`
+			Status         string          `json:"status"`
+			Phase          string          `json:"phase"`
+			Progress       float64         `json:"progress"`
+			SourceCluster  string          `json:"source_cluster"`
+			TargetCluster  string          `json:"target_cluster"`
+			MigrationMode  string          `json:"migration_mode"`
+			KeysTotal      int64           `json:"keys_total"`
+			KeysMigrated   int64           `json:"keys_migrated"`
+			KeysFailed     int64           `json:"keys_failed"`
+			KeysSkipped    int64           `json:"keys_skipped"`
+			KeysFiltered   int64           `json:"keys_filtered"`
+			BytesMigrated  int64           `json:"bytes_migrated"`
+			CreatedAt      string          `json:"created_at"`
+			UpdatedAt      string          `json:"updated_at"`
+			StartedAt      string          `json:"started_at"`
+			Options        json.RawMessage `json:"options"`
+		}
+		if err := json.Unmarshal(rawTask, &taskData); err != nil {
+			continue
+		}
+
+		// 恢复的任务状态设为 stopped（不能恢复到 running）
+		restoredStatus := taskData.Status
+		if restoredStatus == "running" || restoredStatus == "incremental" {
+			restoredStatus = "stopped"
+		}
+
+		task := &Task{
+			ID:            taskData.ID,
+			Name:          taskData.Name,
+			Status:        restoredStatus,
+			Phase:         taskData.Phase,
+			Progress:      taskData.Progress,
+			SourceCluster: taskData.SourceCluster,
+			TargetCluster: taskData.TargetCluster,
+			MigrationMode: taskData.MigrationMode,
+			KeysTotal:     taskData.KeysTotal,
+			KeysMigrated:  taskData.KeysMigrated,
+			KeysFailed:    taskData.KeysFailed,
+			KeysSkipped:   taskData.KeysSkipped,
+			KeysFiltered:  taskData.KeysFiltered,
+			BytesMigrated: taskData.BytesMigrated,
+			CreatedAt:     taskData.CreatedAt,
+			UpdatedAt:     taskData.UpdatedAt,
+			StartedAt:     taskData.StartedAt,
+		}
+
+		// 恢复 Options
+		if taskData.Options != nil {
+			var opts TaskOptions
+			if json.Unmarshal(taskData.Options, &opts) == nil {
+				task.Options = &opts
+			}
+		}
+
+		tasks[id] = task
+		restoredCount++
+	}
+	tasksMu.Unlock()
+
+	// 恢复错误 Key
+	errorKeyMu.Lock()
+	for taskID, keys := range errorKeysBackup {
+		if _, exists := errorKeys[taskID]; !exists {
+			errorKeys[taskID] = keys
+		}
+	}
+	errorKeyMu.Unlock()
+
+	// 持久化
+	saveTasksState()
+
+	log.Info("Backup restored", map[string]interface{}{
+		"file":     filePath,
+		"restored": restoredCount,
+		"skipped":  skippedCount,
+	})
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+		"data": map[string]interface{}{
+			"restored_tasks": restoredCount,
+			"skipped_tasks":  skippedCount,
+		},
+	})
+}
+
+// systemBackupDownloadHandler 下载备份文件
+func systemBackupDownloadHandler(w http.ResponseWriter, r *http.Request, filePath string) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "备份文件不存在"})
+		return
+	}
+
+	filename := filepath.Base(filePath)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	w.Write(data)
+}
+
+// systemBackupDeleteHandler 删除备份文件
+func systemBackupDeleteHandler(w http.ResponseWriter, r *http.Request, filePath string, log *logger.RequestLogger) {
+	if err := os.Remove(filePath); err != nil {
+		log.Error("Failed to delete backup", map[string]interface{}{"error": err.Error()})
+		jsonResponse(w, map[string]interface{}{"code": 404, "message": "备份文件不存在或删除失败"})
+		return
+	}
+
+	log.Info("Backup deleted", map[string]interface{}{"file": filePath})
+	jsonResponse(w, map[string]interface{}{"code": 0, "message": "success"})
+}
+
+// systemBackupUploadHandler 上传导入备份文件
+func systemBackupUploadHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 限制上传大小 100MB
+	r.Body = http.MaxBytesReader(w, r.Body, 100*1024*1024)
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		log.Error("Failed to read upload file", map[string]interface{}{"error": err.Error()})
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "请选择备份文件上传"})
+		return
+	}
+	defer file.Close()
+
+	// 读取文件内容
+	data, err := io.ReadAll(file)
+	if err != nil {
+		log.Error("Failed to read file content", map[string]interface{}{"error": err.Error()})
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "读取文件失败"})
+		return
+	}
+
+	// 验证是有效的 JSON 备份格式
+	var backup map[string]interface{}
+	if err := json.Unmarshal(data, &backup); err != nil {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "文件格式错误，请上传有效的 JSON 备份文件"})
+		return
+	}
+
+	// 检查是否包含 tasks 字段
+	if _, ok := backup["tasks"]; !ok {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "无效的备份文件：缺少 tasks 字段"})
+		return
+	}
+
+	// 确保备份目录存在
+	backupDir := "./data/backups"
+	os.MkdirAll(backupDir, 0755)
+
+	// 使用原始文件名或生成新文件名
+	filename := header.Filename
+	if !strings.HasSuffix(filename, ".json") {
+		filename = filename + ".json"
+	}
+
+	// 如果文件已存在，添加时间戳后缀
+	destPath := fmt.Sprintf("%s/%s", backupDir, filename)
+	if _, err := os.Stat(destPath); err == nil {
+		ext := filepath.Ext(filename)
+		base := strings.TrimSuffix(filename, ext)
+		filename = fmt.Sprintf("%s_%s%s", base, time.Now().Format("20060102150405"), ext)
+		destPath = fmt.Sprintf("%s/%s", backupDir, filename)
+	}
+
+	// 写入文件
+	if err := os.WriteFile(destPath, data, 0644); err != nil {
+		log.Error("Failed to save backup file", map[string]interface{}{"error": err.Error()})
+		jsonResponse(w, map[string]interface{}{"code": 500, "message": "保存备份文件失败"})
+		return
+	}
+
+	// 统计任务数
+	tasksCount := 0
+	if t, ok := backup["tasks"].(map[string]interface{}); ok {
+		tasksCount = len(t)
+	}
+
+	log.Info("Backup uploaded", map[string]interface{}{
+		"file":        filename,
+		"size":        len(data),
+		"tasks_count": tasksCount,
+	})
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+		"data": map[string]interface{}{
+			"file_name":   filename,
+			"size":        len(data),
+			"tasks_count": tasksCount,
+		},
+	})
+}
+
 // stopTaskHandler 停止任务（通用停止接口）
 func stopTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *logger.RequestLogger, taskLog *logger.TaskLogger) {
 	tasksMu.Lock()
@@ -11139,6 +12101,15 @@ func retryFailedKeysHandler(w http.ResponseWriter, r *http.Request, id string, l
 		jsonResponse(w, map[string]interface{}{
 			"code":    400,
 			"message": "Task is already retrying failed keys",
+		})
+		return
+	}
+
+	// 全量迁移进行中不允许手动重试（和 SCAN worker 冲突）
+	if task.Status == "running" && task.Phase == "full" {
+		jsonResponse(w, map[string]interface{}{
+			"code":    400,
+			"message": "全量迁移进行中不能重试，请先暂停任务再重试",
 		})
 		return
 	}
@@ -11574,6 +12545,89 @@ func retryFailedKeysAsyncSilent(task *Task, keysToRetry []ErrorKey, maxRetries i
 	}
 }
 
+// retryFailedKeysAsyncSilentParallel 并行静默异步重试失败的 key（用于自动重试，不改变任务状态）
+func retryFailedKeysAsyncSilentParallel(task *Task, keysToRetry []ErrorKey, maxRetries int, workerCount int, taskLog *logger.TaskLogger) {
+	ctx := context.Background()
+
+	// 连接 Redis
+	readFromSlave := task.Options != nil && task.Options.ReadFromSlave
+	sourceAddrs := strings.Split(task.SourceCluster, ",")
+	targetAddrs := strings.Split(task.TargetCluster, ",")
+
+	for i := range sourceAddrs {
+		sourceAddrs[i] = strings.TrimSpace(sourceAddrs[i])
+	}
+	for i := range targetAddrs {
+		targetAddrs[i] = strings.TrimSpace(targetAddrs[i])
+	}
+
+	sourceClient, _, err := connectRedisWithPoolSize(ctx, sourceAddrs, task.SourcePassword, 0, readFromSlave)
+	if err != nil {
+		taskLog.Error("Failed to connect source for parallel retry", map[string]interface{}{"error": err.Error()})
+		return
+	}
+	defer sourceClient.Close()
+
+	targetClient, _, err := connectRedis(ctx, targetAddrs, task.TargetPassword)
+	if err != nil {
+		taskLog.Error("Failed to connect target for parallel retry", map[string]interface{}{"error": err.Error()})
+		return
+	}
+	defer targetClient.Close()
+
+	var successCount, failCount int64
+
+	// 创建 key 通道
+	keyChan := make(chan ErrorKey, workerCount*2)
+
+	// 启动 worker goroutines
+	var wg sync.WaitGroup
+	for w := 0; w < workerCount; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for errorKey := range keyChan {
+				key := errorKey.Key
+				var migrated bool
+				var reason string
+
+				for retry := 0; retry < maxRetries; retry++ {
+					migrated, _, reason = migrateKeyWithPolicy(ctx, sourceClient, targetClient, key, "replace")
+					if migrated || reason == "skipped" {
+						break
+					}
+					time.Sleep(time.Duration((retry+1)*100) * time.Millisecond)
+				}
+
+				if migrated {
+					atomic.AddInt64(&successCount, 1)
+					removeErrorKey(task.ID, key)
+					atomic.AddInt64(&task.KeysMigrated, 1)
+					atomic.AddInt64(&task.KeysFailed, -1)
+				} else {
+					atomic.AddInt64(&failCount, 1)
+				}
+			}
+		}()
+	}
+
+	// 分发 keys
+	for _, ek := range keysToRetry {
+		keyChan <- ek
+	}
+	close(keyChan)
+	wg.Wait()
+
+	if successCount > 0 || failCount > 0 {
+		taskLog.Info("🔄 自动重试完成（并行模式）", map[string]interface{}{
+			"success":      successCount,
+			"failed":       failCount,
+			"total":        len(keysToRetry),
+			"worker_count": workerCount,
+		})
+	}
+}
+
 // removeErrorKey 从错误列表中移除 key
 // 【BUG-FIX】同时记录到已移除集合，确保落盘文件中的 Key 也能被过滤
 func removeErrorKey(taskID, key string) {
@@ -11774,13 +12828,8 @@ func testConnectionHandler(w http.ResponseWriter, r *http.Request, log *logger.R
 		})
 
 		jsonResponse(w, map[string]interface{}{
-			"code":    0,
-			"message": "success",
-			"data": map[string]interface{}{
-				"success":    false,
-				"message":    "连接失败: " + err.Error(),
-				"latency_ms": time.Since(startTime).Milliseconds(),
-			},
+			"code":    400,
+			"message": "连接失败: " + err.Error(),
 		})
 		return
 	}
@@ -12832,6 +13881,9 @@ func createTaskFromTemplate(w http.ResponseWriter, r *http.Request, id string, l
 	tasks[task.ID] = task
 	tasksMu.Unlock()
 
+	// 【崩溃恢复修复】创建任务后立即持久化
+	saveTasksState()
+
 	log.Info("Task created from template", map[string]interface{}{
 		"task_id":     task.ID,
 		"template_id": id,
@@ -12856,18 +13908,34 @@ func createTaskFromTemplate(w http.ResponseWriter, r *http.Request, id string, l
 
 const (
 	// 默认配置
-	DefaultHealthCheckIntervalSec   = 30  // 默认健康检测间隔（秒）
-	DefaultPeriodicRetryIntervalSec = 300 // 默认定期重试间隔（秒）= 5 分钟
-	DefaultPeriodicRetryBatchSize   = 100 // 默认每次定期重试的 Key 数量
-	DefaultMaxAutoResumeAttempts    = 10  // 默认最大自动恢复尝试次数
+	DefaultHealthCheckIntervalSec  = 30 // 默认健康检测间隔（秒）
+	DefaultPeriodicRetryIntervalSec = 60 // 默认定期重试间隔（秒）= 1 分钟
+	DefaultMaxAutoResumeAttempts   = 10 // 默认最大自动恢复尝试次数
 )
+
+// calcSmartRetryParams 根据失败 Key 数量智能计算重试参数
+// 返回: (batchSize, workerCount)
+func calcSmartRetryParams(failedCount int) (int, int) {
+	switch {
+	case failedCount <= 100:
+		return failedCount, 1 // 少量：全部取出，单线程
+	case failedCount <= 1000:
+		return failedCount, 2 // 中量：全部取出，2 worker
+	case failedCount <= 10000:
+		return 5000, 4 // 较多：每轮 5000，4 worker
+	case failedCount <= 100000:
+		return 10000, 8 // 大量：每轮 1 万，8 worker
+	default:
+		return 50000, 16 // 海量（>10万）：每轮 5 万，16 worker
+	}
+}
 
 // startSmartRetryService 启动智能重试后台服务
 func startSmartRetryService() {
 	logger.Info("🔄 Starting smart retry service", map[string]interface{}{
 		"health_check_interval_sec":   DefaultHealthCheckIntervalSec,
 		"periodic_retry_interval_sec": DefaultPeriodicRetryIntervalSec,
-		"periodic_retry_batch_size":   DefaultPeriodicRetryBatchSize,
+		"smart_batch_mode":            true,
 	})
 
 	// 启动健康检测和自动恢复 goroutine
@@ -12939,12 +14007,21 @@ func checkAndRecoverPausedTasks() {
 			continue
 		}
 
-		// 检查是否超过最大尝试次数
-		if state.ResumeAttempts >= DefaultMaxAutoResumeAttempts {
+		// 检查任务级别配置：如果任务配置了 SmartRetry 且关闭了自动恢复，跳过
+		if task.Options != nil && task.Options.SmartRetry != nil && !task.Options.SmartRetry.EnableAutoRecovery {
+			continue
+		}
+
+		// 检查是否超过最大尝试次数（优先使用任务级配置）
+		maxAttempts := DefaultMaxAutoResumeAttempts
+		if task.Options != nil && task.Options.SmartRetry != nil && task.Options.SmartRetry.MaxAutoResumeAttempts > 0 {
+			maxAttempts = task.Options.SmartRetry.MaxAutoResumeAttempts
+		}
+		if state.ResumeAttempts >= maxAttempts {
 			logger.Debug("Task exceeded max auto resume attempts", map[string]interface{}{
 				"task_id":  task.ID,
 				"attempts": state.ResumeAttempts,
-				"max":      DefaultMaxAutoResumeAttempts,
+				"max":      maxAttempts,
 			})
 			continue
 		}
@@ -13109,23 +14186,39 @@ func resetFailureTracker(taskID string) {
 	tracker.LastTargetSuccess = time.Now()
 }
 
-// retryFailedKeysForRunningTasks 为运行中的任务重试失败的 Key
+// retryFailedKeysForRunningTasks 为符合条件的任务重试失败的 Key（智能批次 + 并行）
+// 策略：全量 SCAN 阶段不自动重试（避免和 SCAN worker 抢资源/重复写入/计数混乱）
+//       仅在增量同步阶段、已完成、已停止时自动重试
 func retryFailedKeysForRunningTasks() {
-	// 获取所有运行中或增量同步中的任务（修复：增量阶段也需要自动重试）
-	var runningTasks []*Task
+	var eligibleTasks []*Task
 	tasksMu.RLock()
 	for _, task := range tasks {
-		if task.Status == "running" || task.Status == "incremental" {
-			runningTasks = append(runningTasks, task)
+		switch {
+		case task.Status == "running" && task.Phase == "full":
+			// 全量 SCAN 进行中 → 跳过（和 worker 冲突）
+			continue
+		case task.Status == "running" && task.Phase == "incremental":
+			// 增量同步中 → 可以重试（SCAN 已结束，增量处理不同 key）
+			eligibleTasks = append(eligibleTasks, task)
+		case task.Status == "incremental":
+			eligibleTasks = append(eligibleTasks, task)
+		case task.Status == "completed" || task.Status == "stopped":
+			// 已完成/已停止 → 可以重试
+			eligibleTasks = append(eligibleTasks, task)
 		}
 	}
 	tasksMu.RUnlock()
 
-	if len(runningTasks) == 0 {
+	if len(eligibleTasks) == 0 {
 		return
 	}
 
-	for _, task := range runningTasks {
+	for _, task := range eligibleTasks {
+		// 检查任务级容错配置：如果明确关闭了自动重试失败 Key，跳过
+		if task.Options != nil && task.Options.FaultTolerance != nil && !task.Options.FaultTolerance.AutoRetryFailedKeys {
+			continue
+		}
+
 		// 【BUG-FIX】从内存 + 落盘文件合并获取失败 Key
 		allKeys := getAllErrorKeys(task.ID, 0)
 		var failedKeys []ErrorKey
@@ -13139,22 +14232,26 @@ func retryFailedKeysForRunningTasks() {
 			continue
 		}
 
+		// 智能计算批次大小和 worker 数量
+		batchSize, workerCount := calcSmartRetryParams(len(failedKeys))
+
 		// 限制每次重试的数量
 		keysToRetry := failedKeys
-		if len(keysToRetry) > DefaultPeriodicRetryBatchSize {
-			keysToRetry = keysToRetry[:DefaultPeriodicRetryBatchSize]
+		if len(keysToRetry) > batchSize {
+			keysToRetry = keysToRetry[:batchSize]
 		}
 
 		taskLog := logger.WithTask(task.ID)
-		taskLog.Info("🔄 Starting periodic retry of failed keys", map[string]interface{}{
+		taskLog.Info("🔄 Starting periodic retry of failed keys (smart mode)", map[string]interface{}{
 			"total_failed": len(failedKeys),
 			"batch_size":   len(keysToRetry),
+			"worker_count": workerCount,
 		})
 
-		// 异步重试（自动重试不改变状态，传空字符串表示保持当前状态）
-		go func(t *Task, keys []ErrorKey) {
-			retryFailedKeysAsyncSilent(t, keys, 3, logger.WithTask(t.ID))
-		}(task, keysToRetry)
+		// 异步并行重试（自动重试不改变状态）
+		go func(t *Task, keys []ErrorKey, wc int) {
+			retryFailedKeysAsyncSilentParallel(t, keys, 3, wc, logger.WithTask(t.ID))
+		}(task, keysToRetry, workerCount)
 	}
 }
 
@@ -13773,6 +14870,9 @@ func importTaskConfigHandler(w http.ResponseWriter, r *http.Request, log *logger
 	tasks[taskID] = task
 	tasksMu.Unlock()
 
+	// 【崩溃恢复修复】创建任务后立即持久化
+	saveTasksState()
+
 	log.Info("Task imported from config", map[string]interface{}{
 		"task_id":   taskID,
 		"task_name": task.Name,
@@ -13829,7 +14929,7 @@ func smartRetryStatusHandler(w http.ResponseWriter, r *http.Request, log *logger
 			"config": map[string]interface{}{
 				"health_check_interval_sec":   DefaultHealthCheckIntervalSec,
 				"periodic_retry_interval_sec": DefaultPeriodicRetryIntervalSec,
-				"periodic_retry_batch_size":   DefaultPeriodicRetryBatchSize,
+				"periodic_retry_batch_mode":   "smart (dynamic based on failed count)",
 				"max_auto_resume_attempts":    DefaultMaxAutoResumeAttempts,
 			},
 			"task_stats": map[string]interface{}{
@@ -14010,12 +15110,20 @@ func createVerifyTaskHandler(w http.ResponseWriter, r *http.Request, log *logger
 		MigrationTaskID string           `json:"migration_task_id"` // 关联的迁移任务
 		AutoStart       bool             `json:"auto_start"`        // 是否自动启动
 		// 新增参数
-		Concurrency       int    `json:"concurrency"`         // 并发数
-		QPS               int    `json:"qps"`                 // QPS 限制
-		CompareMode       string `json:"compare_mode"`        // full_value, length_only, exists_only
-		SkipLargeKey      bool   `json:"skip_large_key"`      // 是否跳过大 Key
-		LargeKeyThreshold int64  `json:"large_key_threshold"` // 大 Key 阈值（字节）
-		DBList            string `json:"db_list"`             // DB 列表，分号分隔
+		Concurrency        int    `json:"concurrency"`           // 并发数
+		QPS                int    `json:"qps"`                   // QPS 限制
+		CompareMode        string `json:"compare_mode"`          // full_value, length_only, exists_only
+		SkipLargeKey       bool   `json:"skip_large_key"`        // 是否跳过大 Key
+		LargeKeyThreshold  int64  `json:"large_key_threshold"`   // 大 Key 阈值（字节）
+		DBList             string `json:"db_list"`               // DB 列表，分号分隔
+		SmartCompare       bool   `json:"smart_compare"`         // 智能比较
+		BigKeyThreshold    int64  `json:"big_key_threshold"`     // 智能比较大 Key 元素数阈值
+		CompareRounds      int    `json:"compare_rounds"`        // 多轮迭代收敛
+		RoundInterval      int    `json:"round_interval"`        // 轮次间隔（秒）
+		Direction          string `json:"direction"`             // 校验方向
+		FieldLevelCompare  bool   `json:"field_level_compare"`   // Field 级别比对
+		FieldScanThreshold int64  `json:"field_scan_threshold"`  // Field SCAN 阈值
+		EnableSQLite       bool   `json:"enable_sqlite"`         // SQLite 存储
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -14084,10 +15192,18 @@ func createVerifyTaskHandler(w http.ResponseWriter, r *http.Request, log *logger
 		Concurrency:       req.Concurrency,
 		QPS:               req.QPS,
 		CompareMode:       req.CompareMode,
-		SkipLargeKey:      req.SkipLargeKey,
-		LargeKeyThreshold: req.LargeKeyThreshold,
-		DBList:            req.DBList,
-		CreatedAt:         time.Now().Format(time.RFC3339),
+		SkipLargeKey:       req.SkipLargeKey,
+		LargeKeyThreshold:  req.LargeKeyThreshold,
+		DBList:             req.DBList,
+		SmartCompare:       req.SmartCompare,
+		BigKeyThreshold:    req.BigKeyThreshold,
+		CompareRounds:      req.CompareRounds,
+		RoundInterval:      req.RoundInterval,
+		Direction:          req.Direction,
+		FieldLevelCompare:  req.FieldLevelCompare,
+		FieldScanThreshold: req.FieldScanThreshold,
+		EnableSQLite:       req.EnableSQLite,
+		CreatedAt:          time.Now().Format(time.RFC3339),
 		Result: &VerifyTaskResult{
 			Progress: 0,
 		},
@@ -14201,6 +15317,61 @@ func deleteVerifyTaskHandler(w http.ResponseWriter, r *http.Request, id string, 
 	jsonResponse(w, map[string]interface{}{
 		"code":    0,
 		"message": "success",
+	})
+}
+
+// batchDeleteVerifyTasksHandler 批量删除校验任务
+func batchDeleteVerifyTasksHandler(w http.ResponseWriter, r *http.Request, log *logger.RequestLogger) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "Invalid request body"})
+		return
+	}
+	if len(req.IDs) == 0 {
+		jsonResponse(w, map[string]interface{}{"code": 400, "message": "No task IDs provided"})
+		return
+	}
+
+	var deleted, skipped, notFound int
+	verifyTasksMu.Lock()
+	for _, id := range req.IDs {
+		task, ok := verifyTasks[id]
+		if !ok {
+			notFound++
+			continue
+		}
+		if task.Status == "running" {
+			task.Status = "cancelled"
+			task.CompletedAt = time.Now().Format(time.RFC3339)
+		}
+		delete(verifyTasks, id)
+		deleted++
+	}
+	verifyTasksMu.Unlock()
+
+	saveVerifyTasksState()
+
+	log.Info("Batch delete verify tasks", map[string]interface{}{
+		"requested": len(req.IDs),
+		"deleted":   deleted,
+		"skipped":   skipped,
+		"not_found": notFound,
+	})
+
+	jsonResponse(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+		"data": map[string]interface{}{
+			"deleted":   deleted,
+			"not_found": notFound,
+		},
 	})
 }
 
@@ -14726,7 +15897,8 @@ func runVerifyTask(task *VerifyTask) {
 
 	// 阶段2：采样获取 Key 列表（只在第1轮执行）
 	var keysToVerify []string
-	var scannedKeys int64
+	var scannedKeys int64   // SCAN 返回的 Key 总数（受 MATCH pattern 过滤）
+	var filteredKeys int64  // 通过 matchVerifyKeyFilter 的 Key 数
 	var mu sync.Mutex
 	startTime := time.Now()
 
@@ -14747,7 +15919,7 @@ func runVerifyTask(task *VerifyTask) {
 		// 集群模式：遍历所有 Master 节点
 		clusterClient := sourceClient.(*redis.ClusterClient)
 		clusterClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
-			scanKeysFromNode(ctx, node, task, scanPattern, &keysToVerify, &scannedKeys, &mu, startTime, rateLimiter)
+			scanKeysFromNode(ctx, node, task, scanPattern, &keysToVerify, &scannedKeys, &filteredKeys, &mu, startTime, rateLimiter)
 			return nil
 		})
 	} else {
@@ -14772,20 +15944,22 @@ func runVerifyTask(task *VerifyTask) {
 				}
 				
 				taskLog.Info("Scanning DB", map[string]interface{}{"db": dbNum})
-				scanKeysFromClient(ctx, sourceClient, task, scanPattern, &keysToVerify, &scannedKeys, &mu, startTime, rateLimiter)
+				scanKeysFromClient(ctx, sourceClient, task, scanPattern, &keysToVerify, &scannedKeys, &filteredKeys, &mu, startTime, rateLimiter)
 			}
 		} else {
 			// 默认扫描 DB 0
-			scanKeysFromClient(ctx, sourceClient, task, scanPattern, &keysToVerify, &scannedKeys, &mu, startTime, rateLimiter)
+			scanKeysFromClient(ctx, sourceClient, task, scanPattern, &keysToVerify, &scannedKeys, &filteredKeys, &mu, startTime, rateLimiter)
 		}
 	}
 
 	task.Result.ScannedKeys = scannedKeys
+	task.Result.FilteredKeys = filteredKeys
 	task.Result.SampledKeys = int64(len(keysToVerify))
 
 	taskLog.Info("Sampling completed", map[string]interface{}{
-		"scanned": scannedKeys,
-		"sampled": len(keysToVerify),
+		"scanned":  scannedKeys,
+		"filtered": filteredKeys,
+		"sampled":  len(keysToVerify),
 	})
 
 	// ========== 阶段3：多轮迭代比对（核心逻辑）==========
@@ -14825,7 +15999,7 @@ func runVerifyTask(task *VerifyTask) {
 		
 		// 执行本轮比对
 		roundMismatches := verifyKeysForRound(ctx, task, sourceClient, targetClient, 
-			currentMismatchKeys, concurrency, compareMode, largeKeyThreshold, taskLog)
+			currentMismatchKeys, concurrency, compareMode, largeKeyThreshold, taskLog, metrics)
 		
 		roundEndTime := time.Now()
 		
@@ -15034,7 +16208,7 @@ func parseDBList(dbListStr string) []int {
 
 // scanKeysFromNode 从集群节点扫描 Key
 func scanKeysFromNode(ctx context.Context, node *redis.Client, task *VerifyTask, scanPattern string, 
-	keysToVerify *[]string, scannedKeys *int64, mu *sync.Mutex, startTime time.Time, rateLimiter <-chan time.Time) {
+	keysToVerify *[]string, scannedKeys *int64, filteredKeys *int64, mu *sync.Mutex, startTime time.Time, rateLimiter <-chan time.Time) {
 	
 	var cursor uint64
 	for {
@@ -15058,14 +16232,15 @@ func scanKeysFromNode(ctx context.Context, node *redis.Client, task *VerifyTask,
 
 		mu.Lock()
 		for _, key := range keys {
-			*scannedKeys++
+			*scannedKeys++ // SCAN MATCH 返回的 Key（已被服务端 pattern 过滤）
 			// 根据采样率或全量模式决定是否采样
 			shouldSample := task.VerifyMode == "full" || rand.Float64() < task.SampleRate
 			// 全量校验模式不限制 MaxKeys
 			maxKeysReached := task.VerifyMode != "full" && int64(len(*keysToVerify)) >= task.MaxKeys
 			if shouldSample && !maxKeysReached {
-				// 检查 Key 过滤
+				// 检查 Key 过滤（可能有额外的 exclude_prefixes 等过滤条件）
 				if matchVerifyKeyFilter(key, task.KeyFilter) {
+					*filteredKeys++
 					*keysToVerify = append(*keysToVerify, key)
 				}
 			}
@@ -15073,6 +16248,7 @@ func scanKeysFromNode(ctx context.Context, node *redis.Client, task *VerifyTask,
 			// 更新进度
 			if *scannedKeys%10000 == 0 {
 				task.Result.ScannedKeys = *scannedKeys
+				task.Result.FilteredKeys = *filteredKeys
 				task.Result.SampledKeys = int64(len(*keysToVerify))
 				elapsed := time.Since(startTime).Seconds()
 				if elapsed > 0 {
@@ -15096,7 +16272,7 @@ func scanKeysFromNode(ctx context.Context, node *redis.Client, task *VerifyTask,
 
 // scanKeysFromClient 从客户端扫描 Key（非集群模式）
 func scanKeysFromClient(ctx context.Context, client redis.Cmdable, task *VerifyTask, scanPattern string,
-	keysToVerify *[]string, scannedKeys *int64, mu *sync.Mutex, startTime time.Time, rateLimiter <-chan time.Time) {
+	keysToVerify *[]string, scannedKeys *int64, filteredKeys *int64, mu *sync.Mutex, startTime time.Time, rateLimiter <-chan time.Time) {
 	
 	var cursor uint64
 	for {
@@ -15120,12 +16296,13 @@ func scanKeysFromClient(ctx context.Context, client redis.Cmdable, task *VerifyT
 
 		mu.Lock()
 		for _, key := range keys {
-			*scannedKeys++
+			*scannedKeys++ // SCAN MATCH 返回的 Key
 			shouldSample := task.VerifyMode == "full" || rand.Float64() < task.SampleRate
 			// 全量校验模式不限制 MaxKeys
 			maxKeysReached := task.VerifyMode != "full" && int64(len(*keysToVerify)) >= task.MaxKeys
 			if shouldSample && !maxKeysReached {
 				if matchVerifyKeyFilter(key, task.KeyFilter) {
+					*filteredKeys++
 					*keysToVerify = append(*keysToVerify, key)
 				}
 			}
@@ -15133,6 +16310,7 @@ func scanKeysFromClient(ctx context.Context, client redis.Cmdable, task *VerifyT
 			// 更新进度
 			if *scannedKeys%10000 == 0 {
 				task.Result.ScannedKeys = *scannedKeys
+				task.Result.FilteredKeys = *filteredKeys
 				task.Result.SampledKeys = int64(len(*keysToVerify))
 				elapsed := time.Since(startTime).Seconds()
 				if elapsed > 0 {
@@ -15159,7 +16337,13 @@ func scanKeysFromClient(ctx context.Context, client redis.Cmdable, task *VerifyT
 func verifyKeysForRound(ctx context.Context, task *VerifyTask, 
 	sourceClient, targetClient redis.Cmdable,
 	keysToVerify []string, concurrency int, compareMode string, 
-	largeKeyThreshold int64, taskLog *logger.Logger) map[string]VerifyMismatchDetail {
+	largeKeyThreshold int64, taskLog *logger.Logger, metrics *VerifyMetrics) map[string]VerifyMismatchDetail {
+	
+	// 如果启用了智能比较，走逐 Key 智能比较路径
+	if task.SmartCompare {
+		return verifyKeysForRoundSmart(ctx, task, sourceClient, targetClient,
+			keysToVerify, concurrency, taskLog, metrics)
+	}
 	
 	const batchSize = 100
 	mismatches := make(map[string]VerifyMismatchDetail)
@@ -15184,7 +16368,7 @@ func verifyKeysForRound(ctx context.Context, task *VerifyTask,
 				verifyTasksMu.RUnlock()
 
 				batchMismatches := verifyBatchForRound(ctx, task, sourceClient, targetClient, 
-					batchKeys, compareMode, largeKeyThreshold)
+					batchKeys, compareMode, largeKeyThreshold, metrics)
 				
 				if len(batchMismatches) > 0 {
 					mismatchMu.Lock()
@@ -15226,7 +16410,7 @@ func verifyKeysForRound(ctx context.Context, task *VerifyTask,
 // verifyBatchForRound 单批次校验（返回不一致的 Key 详情）
 func verifyBatchForRound(ctx context.Context, task *VerifyTask, 
 	sourceClient, targetClient redis.Cmdable,
-	batchKeys []string, compareMode string, largeKeyThreshold int64) map[string]VerifyMismatchDetail {
+	batchKeys []string, compareMode string, largeKeyThreshold int64, metrics *VerifyMetrics) map[string]VerifyMismatchDetail {
 	
 	mismatches := make(map[string]VerifyMismatchDetail)
 	
@@ -15247,17 +16431,25 @@ func verifyBatchForRound(ctx context.Context, task *VerifyTask,
 		sourceStrLenCmds = make([]*redis.IntCmd, len(batchKeys))
 	}
 
+	var sourceCmdCount int64
 	for j, key := range batchKeys {
 		sourceTypeCmds[j] = sourcePipe.Type(ctx, key)
 		sourceTTLCmds[j] = sourcePipe.TTL(ctx, key)
+		sourceCmdCount += 2
 		if needDump {
 			sourceDumpCmds[j] = sourcePipe.Dump(ctx, key)
+			sourceCmdCount++
 		}
 		if needLen {
 			sourceStrLenCmds[j] = sourcePipe.StrLen(ctx, key)
+			sourceCmdCount++
 		}
 	}
 	sourcePipe.Exec(ctx)
+	if metrics != nil {
+		metrics.RecordRedisCommand(sourceCmdCount)
+		metrics.RecordPipelineBatch()
+	}
 
 	// Pipeline 获取目标端数据
 	targetPipe := targetClient.Pipeline()
@@ -15273,17 +16465,25 @@ func verifyBatchForRound(ctx context.Context, task *VerifyTask,
 		targetStrLenCmds = make([]*redis.IntCmd, len(batchKeys))
 	}
 
+	var targetCmdCount int64
 	for j, key := range batchKeys {
 		targetExistsCmds[j] = targetPipe.Exists(ctx, key)
 		targetTTLCmds[j] = targetPipe.TTL(ctx, key)
+		targetCmdCount += 2
 		if needDump {
 			targetDumpCmds[j] = targetPipe.Dump(ctx, key)
+			targetCmdCount++
 		}
 		if needLen {
 			targetStrLenCmds[j] = targetPipe.StrLen(ctx, key)
+			targetCmdCount++
 		}
 	}
 	targetPipe.Exec(ctx)
+	if metrics != nil {
+		metrics.RecordRedisCommand(targetCmdCount)
+		metrics.RecordPipelineBatch()
+	}
 
 	// 比对结果
 	for j, key := range batchKeys {
@@ -15296,6 +16496,11 @@ func verifyBatchForRound(ctx context.Context, task *VerifyTask,
 		// 源端 Key 不存在（可能已被删除）- 视为已收敛/一致
 		if sourceType == "none" {
 			continue
+		}
+
+		// P3: 记录 Key 类型
+		if metrics != nil {
+			metrics.RecordKeyType(sourceType)
 		}
 
 		// 目标端 Key 不存在 - 不一致
@@ -15845,13 +17050,15 @@ type SmartCompareConfig struct {
 }
 
 // smartCompareKey 智能比较单个 Key（根据大小自动选择策略）
+// 返回：matched 是否一致, detail 不一致详情, keyType Key 类型
 func smartCompareKey(ctx context.Context, sourceClient, targetClient redis.Cmdable,
-	key string, config SmartCompareConfig) (matched bool, detail *VerifyMismatchDetail) {
+	key string, config SmartCompareConfig) (matched bool, detail *VerifyMismatchDetail, keyType string) {
 	
 	// 获取 Key 类型
-	keyType, err := sourceClient.Type(ctx, key).Result()
+	var err error
+	keyType, err = sourceClient.Type(ctx, key).Result()
 	if err != nil || keyType == "none" {
-		return true, nil // 源端不存在，视为一致
+		return true, nil, "" // 源端不存在，视为一致
 	}
 	
 	// 检查目标端是否存在
@@ -15860,7 +17067,7 @@ func smartCompareKey(ctx context.Context, sourceClient, targetClient redis.Cmdab
 		return false, &VerifyMismatchDetail{
 			Key:  key,
 			Type: "missing",
-		}
+		}, keyType
 	}
 	
 	// 获取 Key 大小
@@ -15877,9 +17084,9 @@ func smartCompareKey(ctx context.Context, sourceClient, targetClient redis.Cmdab
 					Type:        "length_mismatch",
 					SourceValue: fmt.Sprintf("%d bytes", keySize),
 					TargetValue: fmt.Sprintf("%d bytes", targetSize),
-				}
+				}, keyType
 			}
-			return true, nil
+			return true, nil, keyType
 		}
 		
 	case "hash":
@@ -15918,9 +17125,9 @@ func smartCompareKey(ctx context.Context, sourceClient, targetClient redis.Cmdab
 				Type:        "length_mismatch",
 				SourceValue: fmt.Sprintf("[%s] %d elements", keyType, keySize),
 				TargetValue: fmt.Sprintf("%d elements", targetSize),
-			}
+			}, keyType
 		}
-		return true, nil
+		return true, nil, keyType
 	}
 	
 	// 正常 Key：全量比较（使用 DUMP）
@@ -15933,10 +17140,120 @@ func smartCompareKey(ctx context.Context, sourceClient, targetClient redis.Cmdab
 			Type:        "value_mismatch",
 			SourceValue: fmt.Sprintf("[%s] %d bytes", keyType, len(sourceDump)),
 			TargetValue: fmt.Sprintf("%d bytes", len(targetDump)),
-		}
+		}, keyType
 	}
 	
-	return true, nil
+	return true, nil, keyType
+}
+
+// verifyKeysForRoundSmart 智能比较模式的单轮校验
+// 逐 Key 调用 smartCompareKey，根据 Key 大小自动选择比较策略
+func verifyKeysForRoundSmart(ctx context.Context, task *VerifyTask,
+	sourceClient, targetClient redis.Cmdable,
+	keysToVerify []string, concurrency int,
+	taskLog *logger.Logger, metrics *VerifyMetrics) map[string]VerifyMismatchDetail {
+
+	mismatches := make(map[string]VerifyMismatchDetail)
+	var mismatchMu sync.Mutex
+	var wg sync.WaitGroup
+
+	// 构建 SmartCompareConfig
+	bigKeyThresholdBytes := task.LargeKeyThreshold
+	if bigKeyThresholdBytes <= 0 {
+		bigKeyThresholdBytes = 10 * 1024 * 1024 // 默认 10MB
+	}
+	bigKeyThresholdItems := task.BigKeyThreshold
+	if bigKeyThresholdItems <= 0 {
+		bigKeyThresholdItems = 5000 // 默认 5000 元素
+	}
+	config := SmartCompareConfig{
+		BigKeyThresholdBytes: bigKeyThresholdBytes,
+		BigKeyThresholdItems: bigKeyThresholdItems,
+	}
+
+	// 创建工作通道
+	workChan := make(chan string, concurrency*2)
+
+	// 启动工作协程
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for key := range workChan {
+				// 检查是否已取消
+				verifyTasksMu.RLock()
+				if task.Status == "cancelled" {
+					verifyTasksMu.RUnlock()
+					continue
+				}
+				verifyTasksMu.RUnlock()
+
+				matched, detail, kt := smartCompareKey(ctx, sourceClient, targetClient, key, config)
+
+				// 记录指标
+				if metrics != nil {
+					// smartCompareKey 内部至少调用 TYPE + EXISTS = 2 条命令，
+					// 大 Key 额外 2 条（StrLen/HLen + 目标端对应命令），小 Key 额外 2 条（DUMP*2）
+					metrics.RecordRedisCommand(4)
+					if kt != "" {
+						metrics.RecordKeyType(kt)
+					}
+				}
+
+				if !matched && detail != nil {
+					mismatchMu.Lock()
+					mismatches[key] = *detail
+					mismatchMu.Unlock()
+				}
+
+				// TTL 比较
+				if matched && task.CompareTTL {
+					sourceTTL, err1 := sourceClient.TTL(ctx, key).Result()
+					targetTTL, err2 := targetClient.TTL(ctx, key).Result()
+					if metrics != nil {
+						metrics.RecordRedisCommand(2)
+					}
+					if err1 == nil && err2 == nil {
+						ttlDiff := sourceTTL - targetTTL
+						if ttlDiff < 0 {
+							ttlDiff = -ttlDiff
+						}
+						if ttlDiff > time.Duration(task.TTLTolerance)*time.Second {
+							mismatchMu.Lock()
+							mismatches[key] = VerifyMismatchDetail{
+								Key:       key,
+								Type:      "ttl_mismatch",
+								SourceTTL: int64(sourceTTL.Seconds()),
+								TargetTTL: int64(targetTTL.Seconds()),
+							}
+							mismatchMu.Unlock()
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	// 发送任务
+	for _, key := range keysToVerify {
+		verifyTasksMu.RLock()
+		if task.Status == "cancelled" {
+			verifyTasksMu.RUnlock()
+			break
+		}
+		verifyTasksMu.RUnlock()
+		workChan <- key
+	}
+
+	close(workChan)
+	wg.Wait()
+
+	taskLog.Info("Smart compare round completed", map[string]interface{}{
+		"keys_checked": len(keysToVerify),
+		"mismatches":   len(mismatches),
+	})
+
+	return mismatches
 }
 
 // ==================== P3: 指标监控实现 ====================
@@ -15949,12 +17266,14 @@ func NewVerifyMetrics() *VerifyMetrics {
 	}
 }
 
-// RecordKeyType 记录 Key 类型
+// RecordKeyType 记录 Key 类型（线程安全）
 func (m *VerifyMetrics) RecordKeyType(keyType string) {
+	m.typeDistMu.Lock()
 	if m.TypeDistribution == nil {
 		m.TypeDistribution = make(map[string]int64)
 	}
 	m.TypeDistribution[keyType]++
+	m.typeDistMu.Unlock()
 }
 
 // RecordRedisCommand 记录 Redis 命令
@@ -16395,4 +17714,131 @@ func countClusterKeys(ctx context.Context, sourceClient redis.Cmdable, sourceIsC
 	}
 
 	return sourceCount, targetCount
+}
+
+// checkTendisBinlogEnabledConfig 检查 Tendis binlog-enabled 配置
+// 返回 nil 表示非 Tendis（不需要此检测）
+func checkTendisBinlogEnabledConfig(ctx context.Context, client redis.UniversalClient) *PreflightCheckItem {
+	// 先检测是否是 Tendis
+	if _, err := client.Do(ctx, "binlogpos", "0").Result(); err != nil {
+		return nil // 非 Tendis
+	}
+
+	result, err := client.Do(ctx, "CONFIG", "GET", "binlog-enabled").Result()
+	if err != nil {
+		return &PreflightCheckItem{
+			Name:     "Binlog 配置",
+			Status:   "warning",
+			Required: true,
+			Message:  "无法读取 binlog-enabled 配置: " + err.Error(),
+			Details:  "请手动确认源端 Tendis 已设置 binlog-enabled=yes",
+		}
+	}
+
+	if vals, ok := result.([]interface{}); ok && len(vals) >= 2 {
+		val := fmt.Sprintf("%v", vals[1])
+		if val == "yes" || val == "true" || val == "1" {
+			return &PreflightCheckItem{
+				Name:     "Binlog 配置",
+				Status:   "passed",
+				Required: true,
+				Message:  "binlog-enabled=yes，增量同步数据源就绪",
+			}
+		}
+		return &PreflightCheckItem{
+			Name:     "Binlog 配置",
+			Status:   "failed",
+			Required: true,
+			Message:  "源端 Tendis 未开启 binlog（binlog-enabled=" + val + "）",
+			Details:  "增量同步依赖 binlog，请在源端执行: CONFIG SET binlog-enabled yes，并确认持久化到配置文件",
+		}
+	}
+
+	return &PreflightCheckItem{
+		Name:     "Binlog 配置",
+		Status:   "warning",
+		Required: true,
+		Message:  "binlog-enabled 配置返回格式异常",
+		Details:  fmt.Sprintf("返回值: %v，请手动确认源端 binlog 已启用", result),
+	}
+}
+
+// checkTendisAofEnabledConfig 检查 Tendis aof-enabled 配置
+// aof-enabled=yes 时 binlog cmdStr 包含完整 RESP 命令，EXPIRE/TTL 等才能正确回放
+// 返回 nil 表示非 Tendis
+func checkTendisAofEnabledConfig(ctx context.Context, client redis.UniversalClient) *PreflightCheckItem {
+	// 先检测是否是 Tendis
+	if _, err := client.Do(ctx, "binlogpos", "0").Result(); err != nil {
+		return nil // 非 Tendis
+	}
+
+	result, err := client.Do(ctx, "CONFIG", "GET", "aof-enabled").Result()
+	if err != nil {
+		return &PreflightCheckItem{
+			Name:     "AOF 配置",
+			Status:   "warning",
+			Required: true,
+			Message:  "无法读取 aof-enabled 配置: " + err.Error(),
+			Details:  "请手动确认源端 Tendis 已设置 aof-enabled=yes",
+		}
+	}
+
+	if vals, ok := result.([]interface{}); ok && len(vals) >= 2 {
+		val := fmt.Sprintf("%v", vals[1])
+		if val == "yes" || val == "true" || val == "1" {
+			return &PreflightCheckItem{
+				Name:     "AOF 配置",
+				Status:   "passed",
+				Required: true,
+				Message:  "aof-enabled=yes，binlog 将包含完整 RESP 命令",
+			}
+		}
+		return &PreflightCheckItem{
+			Name:     "AOF 配置",
+			Status:   "failed",
+			Required: true,
+			Message:  "源端 Tendis 未开启 AOF（aof-enabled=" + val + "）",
+			Details:  "aof-enabled=no 时 binlog 只记录命令名，不包含参数，EXPIRE/TTL 等命令无法正确回放。请在源端执行: CONFIG SET aof-enabled yes",
+		}
+	}
+
+	return &PreflightCheckItem{
+		Name:     "AOF 配置",
+		Status:   "warning",
+		Required: true,
+		Message:  "aof-enabled 配置返回格式异常",
+		Details:  fmt.Sprintf("返回值: %v，请手动确认源端 aof-enabled=yes", result),
+	}
+}
+
+// checkTendisKvstorecount 检查 Tendis kvstorecount 配置
+// 返回 nil 表示非 Tendis
+func checkTendisKvstorecount(ctx context.Context, client redis.UniversalClient) *PreflightCheckItem {
+	// 先检测是否是 Tendis
+	if _, err := client.Do(ctx, "binlogpos", "0").Result(); err != nil {
+		return nil // 非 Tendis
+	}
+
+	result, err := client.Do(ctx, "CONFIG", "GET", "kvstorecount").Result()
+	if err != nil {
+		return &PreflightCheckItem{
+			Name:     "KvStoreCount 配置",
+			Status:   "warning",
+			Required: false,
+			Message:  "无法读取 kvstorecount 配置: " + err.Error(),
+		}
+	}
+
+	if vals, ok := result.([]interface{}); ok && len(vals) >= 2 {
+		val := fmt.Sprintf("%v", vals[1])
+		return &PreflightCheckItem{
+			Name:     "KvStoreCount 配置",
+			Status:   "passed",
+			Required: false,
+			Message:  fmt.Sprintf("kvstorecount=%s", val),
+			Details:  "每个 Tendis 节点有 " + val + " 个 Store，增量同步将为每个 Store 注册独立的 Binlog 通道",
+		}
+	}
+
+	return nil
 }

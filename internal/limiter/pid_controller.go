@@ -180,14 +180,32 @@ func (rl *RateLimiter) tokenRefillLoop() {
 	}
 }
 
-// AcquireSource 获取源端读取令牌
+// AcquireSource 获取源端读取令牌（消耗1个令牌）
 func (rl *RateLimiter) AcquireSource() {
-	for {
+	rl.AcquireSourceN(1)
+}
+
+// AcquireSourceN 获取 n 个源端读取令牌
+func (rl *RateLimiter) AcquireSourceN(n int64) {
+	if n <= 0 {
+		return
+	}
+	remaining := n
+	for remaining > 0 {
 		tokens := rl.sourceTokens.Load()
 		if tokens > 0 {
-			if rl.sourceTokens.CompareAndSwap(tokens, tokens-1) {
-				return
+			// 尽可能多地消耗令牌，但不超过可用量
+			consume := remaining
+			if consume > tokens {
+				consume = tokens
 			}
+			if rl.sourceTokens.CompareAndSwap(tokens, tokens-consume) {
+				remaining -= consume
+				if remaining <= 0 {
+					return
+				}
+			}
+			continue
 		}
 
 		select {
@@ -199,14 +217,31 @@ func (rl *RateLimiter) AcquireSource() {
 	}
 }
 
-// AcquireTarget 获取目标端写入令牌
+// AcquireTarget 获取目标端写入令牌（消耗1个令牌）
 func (rl *RateLimiter) AcquireTarget() {
-	for {
+	rl.AcquireTargetN(1)
+}
+
+// AcquireTargetN 获取 n 个目标端写入令牌
+func (rl *RateLimiter) AcquireTargetN(n int64) {
+	if n <= 0 {
+		return
+	}
+	remaining := n
+	for remaining > 0 {
 		tokens := rl.targetTokens.Load()
 		if tokens > 0 {
-			if rl.targetTokens.CompareAndSwap(tokens, tokens-1) {
-				return
+			consume := remaining
+			if consume > tokens {
+				consume = tokens
 			}
+			if rl.targetTokens.CompareAndSwap(tokens, tokens-consume) {
+				remaining -= consume
+				if remaining <= 0 {
+					return
+				}
+			}
+			continue
 		}
 
 		select {

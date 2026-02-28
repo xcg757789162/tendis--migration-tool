@@ -40,6 +40,10 @@ export default {
       headers: { 'X-Confirm-Password': 'confirm-delete' }
     })
   },
+
+  batchDeleteTasks(ids) {
+    return api.post('/tasks/batch-delete', { ids })
+  },
   
   startTask(id) {
     return api.post(`/tasks/${id}/start`)
@@ -236,6 +240,40 @@ export default {
     return api.post('/system/backup')
   },
 
+  // 获取备份列表
+  getBackups() {
+    return api.get('/system/backups')
+  },
+
+  // 恢复备份
+  restoreBackup(filename) {
+    return api.post(`/system/backup/${filename}/restore`)
+  },
+
+  // 下载备份
+  downloadBackup(filename) {
+    return axios.get(`/api/v1/system/backup/${filename}/download`, {
+      responseType: 'blob'
+    }).then(res => res.data)
+  },
+
+  // 删除备份
+  deleteBackup(filename) {
+    return api.delete(`/system/backup/${filename}`)
+  },
+
+  // 上传导入备份
+  uploadBackup(file) {
+    const formData = new FormData()
+    formData.append('file', file)
+    return axios.post('/api/v1/system/backup-upload', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    }).then(res => {
+      if (res.data && res.data.code === 0) return res.data.data
+      throw new Error(res.data?.message || '上传失败')
+    })
+  },
+
   // 系统健康检查
   getHealth() {
     return api.get('/health')
@@ -291,6 +329,11 @@ export default {
   // 删除校验任务
   deleteVerifyTask(id) {
     return api.delete(`/verify-tasks/${id}`)
+  },
+
+  // 批量删除校验任务
+  batchDeleteVerifyTasks(ids) {
+    return api.post('/verify-tasks/batch-delete', { ids })
   },
 
   // 启动校验任务

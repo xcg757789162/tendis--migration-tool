@@ -26,7 +26,7 @@ type RotationConfig struct {
 func DefaultRotationConfig() *RotationConfig {
 	return &RotationConfig{
 		MaxFileSize:    100 * 1024 * 1024, // 100MB
-		MaxFiles:       7,
+		MaxFiles:       30,
 		MaxAge:         30,
 		CleanupEnabled: true,
 	}
@@ -397,9 +397,40 @@ func (l *Logger) GetLogStats() map[string]interface{} {
 	}
 }
 
-// CleanupNow 立即执行日志清理
+// CleanupNow 立即执行日志清理（使用默认配置）
 func (l *Logger) CleanupNow() {
 	l.cleanupOldLogs()
+}
+
+// CleanupKeepDays 手动清理，仅保留最近 N 天的日志
+func (l *Logger) CleanupKeepDays(days int) (removed int64) {
+	files, err := l.getLogFiles()
+	if err != nil || len(files) == 0 {
+		return 0
+	}
+
+	cutoff := time.Now().AddDate(0, 0, -days)
+	var removedCount, removedSize int64
+
+	for _, f := range files {
+		fullPath := filepath.Join(l.logDir, f.Name())
+		if fullPath == l.currentLogPath {
+			continue
+		}
+		if f.ModTime().Before(cutoff) {
+			if err := os.Remove(fullPath); err == nil {
+				removedCount++
+				removedSize += f.Size()
+			}
+		}
+	}
+
+	if removedCount > 0 {
+		fmt.Printf("[%s] [INFO] Manual cleanup: removed %d files older than %d days, freed %s\n",
+			time.Now().Format("2006-01-02 15:04:05"),
+			removedCount, days, formatBytes(removedSize))
+	}
+	return removedCount
 }
 
 // SetLevel 设置日志级别

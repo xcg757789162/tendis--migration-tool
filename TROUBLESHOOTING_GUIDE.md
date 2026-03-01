@@ -435,6 +435,8 @@ func matchKeyFilter(key string, options *TaskOptions) bool {
 | 2026-02-10 | 添加 UI 问题修复记录（ETA 不刷新、全量模式、校验状态、停止按钮、日志优化） |
 | 2026-02-11 | 添加功能缺失修复（运行时参数、增量Key Filter、incremental模式、FakeSlave修复、集群拓扑缓存、DBSIZE超时） |
 | 2026-02-12 | 添加环境适配代码污染回滚记录、v2.4.0新增功能问题记录（Preflight Check、拓扑刷新、IP探测、Error Keys） |
+| 2026-02-16 | v2.5.0: 限速修复（BUG-4/5/6）、TTL一致性、系统key过滤、FakeSlave panic、崩溃恢复、生产故障（P0/P1） |
+| 2026-03-01 | v2.6.0: 流式处理优化、数据校验增强、回归测试 97/97 全部通过 |
 
 ---
 
@@ -1731,7 +1733,7 @@ func (rl *RateLimiter) WaitN(n int) {
 
 ---
 
-## 15. 回归测试覆盖映射（2026-02-28 更新）
+## 15. 回归测试覆盖映射（2026-03-01 更新）
 
 本文档中记录的每个问题是否有对应的自动化回归测试，确保问题不会回归。
 

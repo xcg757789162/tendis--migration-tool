@@ -1072,30 +1072,41 @@ func (r *TaskRunner) runIdletimeIncrementalSync() error {
 	return nil
 }
 
-// runVerification 数据校验
+// runVerification 数据校验（任务自动完成时触发，使用采样模式）
 func (r *TaskRunner) runVerification() {
-	batchID := uuid.New().String()
-	verifier := NewVerifier(r.sourceClient, r.targetClient)
+	r.runVerificationWithConfig(&VerifyConfig{
+		Mode:       VerifyModeSample,
+		SampleSize: 10000,
+		BatchSize:  1000,
+		Concurrency: 50,
+		KeyFilter:  r.shouldMigrateKey,
+	})
+}
 
-	result, err := verifier.Verify(r.ctx, 10000) // 采样10000个Key
+// runVerificationWithConfig 使用指定配置执行校验
+func (r *TaskRunner) runVerificationWithConfig(config *VerifyConfig) {
+	batchID := uuid.New().String()
+	verifier := NewVerifier(r.sourceClient, r.targetClient, config)
+
+	result, err := verifier.Verify(r.ctx)
 	if err != nil {
 		log.Printf("Verification failed: %v", err)
 		return
 	}
 
-	// 保存校验结果
 	r.master.store.SaveVerifyResult(&model.VerifyResult{
-		TaskID:         r.task.ID,
-		BatchID:        batchID,
-		TotalKeys:      result.TotalKeys,
-		MatchedKeys:    result.MatchedKeys,
-		MismatchedKeys: result.MismatchedKeys,
-		MissingKeys:    result.MissingKeys,
-		ExtraKeys:      result.ExtraKeys,
+		TaskID:          r.task.ID,
+		BatchID:         batchID,
+		TotalKeys:       result.TotalKeys,
+		MatchedKeys:     result.MatchedKeys,
+		MismatchedKeys:  result.MismatchedKeys,
+		MissingKeys:     result.MissingKeys,
+		ExtraKeys:       result.ExtraKeys,
+		ConsistencyRate: result.ConsistencyRate,
 	})
 
-	log.Printf("Verification result: total=%d, matched=%d, consistency=%.2f%%",
-		result.TotalKeys, result.MatchedKeys, result.ConsistencyRate)
+	log.Printf("Verification result: mode=%s, total=%d, matched=%d, consistency=%.2f%%",
+		config.Mode, result.TotalKeys, result.MatchedKeys, result.ConsistencyRate)
 }
 
 // Pause 暂停
@@ -1128,25 +1139,39 @@ func (r *TaskRunner) Stop() {
 	r.wg.Wait()
 }
 
-// TriggerVerify 触发校验
-func (r *TaskRunner) TriggerVerify() (string, error) {
+// TriggerVerify 触发校验（支持指定校验配置）
+func (r *TaskRunner) TriggerVerify(config *VerifyConfig) (string, error) {
+	if config == nil {
+		config = &VerifyConfig{
+			Mode:        VerifyModeSample,
+			SampleSize:  10000,
+			BatchSize:   1000,
+			Concurrency: 50,
+			KeyFilter:   r.shouldMigrateKey,
+		}
+	} else if config.KeyFilter == nil {
+		config.KeyFilter = r.shouldMigrateKey
+	}
+
 	batchID := uuid.New().String()
 	
 	go func() {
-		verifier := NewVerifier(r.sourceClient, r.targetClient)
-		result, err := verifier.Verify(r.ctx, 10000)
+		verifier := NewVerifier(r.sourceClient, r.targetClient, config)
+		result, err := verifier.Verify(r.ctx)
 		if err != nil {
+			log.Printf("Verification failed: %v", err)
 			return
 		}
 
 		r.master.store.SaveVerifyResult(&model.VerifyResult{
-			TaskID:         r.task.ID,
-			BatchID:        batchID,
-			TotalKeys:      result.TotalKeys,
-			MatchedKeys:    result.MatchedKeys,
-			MismatchedKeys: result.MismatchedKeys,
-			MissingKeys:    result.MissingKeys,
-			ExtraKeys:      result.ExtraKeys,
+			TaskID:          r.task.ID,
+			BatchID:         batchID,
+			TotalKeys:       result.TotalKeys,
+			MatchedKeys:     result.MatchedKeys,
+			MismatchedKeys:  result.MismatchedKeys,
+			MissingKeys:     result.MissingKeys,
+			ExtraKeys:       result.ExtraKeys,
+			ConsistencyRate: result.ConsistencyRate,
 		})
 	}()
 
@@ -2152,16 +2177,57 @@ func (d *ConvergenceDetector) IsConverged(record ConvergenceRecord) (bool, strin
 }
 
 // Verifier 数据校验器
+// VerifyMode 校验模式
+type VerifyMode string
+
+const (
+	VerifyModeSample VerifyMode = "sample" // 采样校验（默认，快速）
+	VerifyModeFull   VerifyMode = "full"   // 全量校验（流式，适用于 100 亿 Key 场景）
+)
+
+// VerifyConfig 校验配置
+type VerifyConfig struct {
+	Mode       VerifyMode             // 校验模式：sample / full
+	SampleSize int                    // 采样模式下的采样数量（默认 10000）
+	BatchSize  int64                  // 每次 SCAN 的批大小（默认 1000）
+	Concurrency int                   // 并发校验协程数（默认 50）
+	KeyFilter  func(key string) bool  // Key 过滤函数（nil 表示不过滤）
+}
+
+// DefaultVerifyConfig 默认校验配置
+func DefaultVerifyConfig() *VerifyConfig {
+	return &VerifyConfig{
+		Mode:        VerifyModeSample,
+		SampleSize:  10000,
+		BatchSize:   1000,
+		Concurrency: 50,
+	}
+}
+
 type Verifier struct {
 	sourceClient *redis.ClusterClient
 	targetClient *redis.ClusterClient
+	config       *VerifyConfig
 }
 
 // NewVerifier 创建校验器
-func NewVerifier(source, target *redis.ClusterClient) *Verifier {
+func NewVerifier(source, target *redis.ClusterClient, config *VerifyConfig) *Verifier {
+	if config == nil {
+		config = DefaultVerifyConfig()
+	}
+	if config.BatchSize <= 0 {
+		config.BatchSize = 1000
+	}
+	if config.Concurrency <= 0 {
+		config.Concurrency = 50
+	}
+	if config.SampleSize <= 0 {
+		config.SampleSize = 10000
+	}
 	return &Verifier{
 		sourceClient: source,
 		targetClient: target,
+		config:       config,
 	}
 }
 
@@ -2175,90 +2241,116 @@ type VerifyResult struct {
 	ConsistencyRate float64
 }
 
-// Verify 执行校验
-func (v *Verifier) Verify(ctx context.Context, sampleSize int) (*VerifyResult, error) {
-	result := &VerifyResult{}
-
-	// 采样Key
-	keys, err := v.sampleKeys(ctx, sampleSize)
-	if err != nil {
-		return nil, err
-	}
-
-	result.TotalKeys = len(keys)
-
-	// 并发校验
-	var wg sync.WaitGroup
+// Verify 执行校验（流式：SCAN 一批 → 过滤 → 比对 → 释放，不存储全量 Key）
+func (v *Verifier) Verify(ctx context.Context) (*VerifyResult, error) {
+	var totalKeys int64
 	var matched, mismatched, missing int64
 
-	sem := make(chan struct{}, 50) // 并发控制
+	sem := make(chan struct{}, v.config.Concurrency)
+	var wg sync.WaitGroup
 
-	for _, key := range keys {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(k string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			match, exists := v.verifyKey(ctx, k)
-			if !exists {
-				atomic.AddInt64(&missing, 1)
-			} else if match {
-				atomic.AddInt64(&matched, 1)
-			} else {
-				atomic.AddInt64(&mismatched, 1)
-			}
-		}(key)
-	}
-
-	wg.Wait()
-
-	result.MatchedKeys = int(matched)
-	result.MismatchedKeys = int(mismatched)
-	result.MissingKeys = int(missing)
-
-	if result.TotalKeys > 0 {
-		result.ConsistencyRate = float64(result.MatchedKeys) / float64(result.TotalKeys) * 100
-	}
-
-	return result, nil
-}
-
-// sampleKeys 采样Key
-func (v *Verifier) sampleKeys(ctx context.Context, count int) ([]string, error) {
-	var keys []string
-
-	// 简单采样：SCAN
 	cursor := uint64(0)
-	for len(keys) < count {
-		result, nextCursor, err := v.sourceClient.Scan(ctx, cursor, "*", int64(count-len(keys))).Result()
-		if err != nil {
-			return nil, err
+	scanPattern := "*"
+	batchSize := v.config.BatchSize
+	isSample := v.config.Mode == VerifyModeSample
+	sampleLimit := int64(v.config.SampleSize)
+
+	for {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return v.buildResult(totalKeys, matched, mismatched, missing), ctx.Err()
+		default:
 		}
-		keys = append(keys, result...)
+
+		// 采样模式：已达到采样数则停止 SCAN
+		if isSample && atomic.LoadInt64(&totalKeys) >= sampleLimit {
+			break
+		}
+
+		// SCAN 一批 key
+		scanCount := batchSize
+		if isSample {
+			remaining := sampleLimit - atomic.LoadInt64(&totalKeys)
+			if remaining < scanCount {
+				scanCount = remaining
+			}
+		}
+		keys, nextCursor, err := v.sourceClient.Scan(ctx, cursor, scanPattern, scanCount).Result()
+		if err != nil {
+			wg.Wait()
+			return v.buildResult(totalKeys, matched, mismatched, missing), fmt.Errorf("SCAN failed: %w", err)
+		}
+
+		// 过滤 + 立即并发比对（不存储到全局切片）
+		for _, key := range keys {
+			// Key 过滤
+			if v.config.KeyFilter != nil && !v.config.KeyFilter(key) {
+				continue
+			}
+
+			// 采样模式：检查是否已达上限
+			if isSample && atomic.LoadInt64(&totalKeys) >= sampleLimit {
+				break
+			}
+
+			atomic.AddInt64(&totalKeys, 1)
+
+			wg.Add(1)
+			sem <- struct{}{}
+
+			go func(k string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				match, exists := v.verifyKey(ctx, k)
+				if !exists {
+					atomic.AddInt64(&missing, 1)
+				} else if match {
+					atomic.AddInt64(&matched, 1)
+				} else {
+					atomic.AddInt64(&mismatched, 1)
+				}
+			}(key)
+		}
+
 		cursor = nextCursor
 		if cursor == 0 {
 			break
 		}
 	}
 
-	if len(keys) > count {
-		keys = keys[:count]
-	}
+	wg.Wait()
 
-	return keys, nil
+	result := v.buildResult(totalKeys, matched, mismatched, missing)
+
+	log.Printf("Verify completed: mode=%s, total=%d, matched=%d, mismatched=%d, missing=%d, consistency=%.2f%%",
+		v.config.Mode, result.TotalKeys, result.MatchedKeys, result.MismatchedKeys, result.MissingKeys, result.ConsistencyRate)
+
+	return result, nil
 }
 
-// verifyKey 校验单个Key
+// buildResult 构建校验结果
+func (v *Verifier) buildResult(total, matched, mismatched, missing int64) *VerifyResult {
+	result := &VerifyResult{
+		TotalKeys:      int(total),
+		MatchedKeys:    int(matched),
+		MismatchedKeys: int(mismatched),
+		MissingKeys:    int(missing),
+	}
+	if result.TotalKeys > 0 {
+		result.ConsistencyRate = float64(result.MatchedKeys) / float64(result.TotalKeys) * 100
+	}
+	return result
+}
+
+// verifyKey 校验单个 Key（比较 DUMP 序列化值）
 func (v *Verifier) verifyKey(ctx context.Context, key string) (match, exists bool) {
-	// 检查目标端是否存在
 	targetExists, err := v.targetClient.Exists(ctx, key).Result()
 	if err != nil || targetExists == 0 {
 		return false, false
 	}
 
-	// 比较DUMP值
 	sourceDump, err := v.sourceClient.Dump(ctx, key).Result()
 	if err != nil {
 		return false, true

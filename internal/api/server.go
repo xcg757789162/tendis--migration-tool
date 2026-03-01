@@ -1014,7 +1014,32 @@ func (s *Server) getMetrics(c *gin.Context) {
 func (s *Server) triggerVerify(c *gin.Context) {
 	taskID := c.Param("id")
 
-	batchID, err := s.master.TriggerVerify(taskID)
+	// 解析校验配置
+	mode := c.DefaultQuery("mode", "sample")
+	sampleSizeStr := c.DefaultQuery("sample_size", "10000")
+	sampleSize := 10000
+	if n, err := strconv.Atoi(sampleSizeStr); err == nil && n > 0 {
+		sampleSize = n
+	}
+
+	var config *engine.VerifyConfig
+	switch mode {
+	case "full":
+		config = &engine.VerifyConfig{
+			Mode:        engine.VerifyModeFull,
+			BatchSize:   1000,
+			Concurrency: 50,
+		}
+	default:
+		config = &engine.VerifyConfig{
+			Mode:        engine.VerifyModeSample,
+			SampleSize:  sampleSize,
+			BatchSize:   1000,
+			Concurrency: 50,
+		}
+	}
+
+	batchID, err := s.master.TriggerVerify(taskID, config)
 	if err != nil {
 		fail(c, 500, "Trigger verify failed: "+err.Error())
 		return

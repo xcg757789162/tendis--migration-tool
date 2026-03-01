@@ -1728,3 +1728,36 @@ func (rl *RateLimiter) WaitN(n int) {
 | W=16, QPS=500→5000 | - | **~5000/s** ✅ |
 | W=16, 无限速 | - | **~38000/s** ✅ |
 | 无限速→QPS=1000 | - | **收敛到 ~1052/s** ✅ |
+
+---
+
+## 15. 回归测试覆盖映射（2026-02-28 更新）
+
+本文档中记录的每个问题是否有对应的自动化回归测试，确保问题不会回归。
+
+**测试脚本**: `tests/regression_test.py` — **U 分类（历史问题回归）**
+
+| 编号 | 问题 | 回归测试 | 覆盖方式 |
+|:---|:---|:---|:---|
+| 2.1 | 创建任务字段名错误 | **U1** | 使用错误字段名创建任务，验证被拒绝 |
+| 2.2 | incr_keys_synced 字段位置 | **U2** | 检查 stats/progress/top-level 三个位置 |
+| 3.1 | Pattern 增量匹配失败 | **U3** | 增量阶段 pattern 通配符过滤验证 |
+| 3.2 | FakeSlave heartbeats 检测 | **U2** | 验证 incr_heartbeats > 0 |
+| 7.4 | TTL 一致性/PTTL 精度 | **U11** | EXPIRE/PEXPIRE/PERSIST 增量同步精度 |
+| 9.6 | 待迁移Key数显示为0 | **U9** | 采样检查 keys_to_migrate > 0 |
+| 12.1 | 增量恢复后重新全量 | **U5** | 增量阶段暂停恢复后验证 phase=incremental |
+| 14.1 | Stop API 404 | **U6** | POST /tasks/{id}/stop 可用 |
+| 14.2 | 空参数创建任务 | **U7** | 空 body / 只有 name 应被拒绝 |
+| 14.3 | 启动不存在任务 | **U8** | 返回错误而非 success |
+| BUG-1 | 系统 key 被迁移 | **U4** | stat:total 等不出现在目标端 |
+| BUG-3 | ShutdownPaused 自动恢复 | **U12** | SIGTERM→重启→任务自动恢复 |
+| BUG-5 | 动态调整限速卡死 | **U10** | 运行中修改 QPS 后任务正常完成 |
+
+**运行回归测试**:
+```bash
+# 只运行历史问题回归
+python3 tests/regression_test.py --env home --categories U
+
+# 运行全部（包含 97 个测试）
+python3 tests/regression_test.py --env home
+```

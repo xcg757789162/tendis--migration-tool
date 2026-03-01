@@ -352,8 +352,8 @@ func (m *Master) CompleteTask(taskID string, skipVerify bool) error {
 
 	// 如果需要校验
 	if !skipVerify && ok {
-		// 触发最终校验
-		_, err := runner.TriggerVerify()
+		// 触发最终校验（使用默认采样配置）
+		_, err := runner.TriggerVerify(nil)
 		if err != nil {
 			log.Printf("Final verification failed: %v", err)
 		}
@@ -391,7 +391,7 @@ func (m *Master) GetTaskStats(taskID string) (*model.MigrationStats, error) {
 }
 
 // TriggerVerify 触发校验
-func (m *Master) TriggerVerify(taskID string) (string, error) {
+func (m *Master) TriggerVerify(taskID string, config *VerifyConfig) (string, error) {
 	m.tasksMu.RLock()
 	runner, ok := m.tasks[taskID]
 	m.tasksMu.RUnlock()
@@ -400,7 +400,7 @@ func (m *Master) TriggerVerify(taskID string) (string, error) {
 		return "", fmt.Errorf("task not running")
 	}
 
-	return runner.TriggerVerify()
+	return runner.TriggerVerify(config)
 }
 
 // GetVerifyResults 获取校验结果

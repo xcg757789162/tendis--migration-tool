@@ -1,7 +1,7 @@
 # Tendis-Migrate 综合测试方案
 
-**更新日期**: 2026-02-27  
-**测试脚本**: `tests/regression_test.py`（76 个测试用例，18 个分类）
+**更新日期**: 2026-02-28  
+**测试脚本**: `tests/regression_test.py`（97 个测试用例，20 个分类）
 
 ---
 
@@ -44,8 +44,10 @@
 | **Q** | 辅助API扩展 | 6 | 集群分析、推荐配置、冲突Key、模板、系统日志、智能重试 |
 | **R** | 增量深度 | 4 | ZSet增量、修改已有Key、增量EXPIRE、批量写入 |
 | **S** | 补充测试 | 6 | 自然过期、TTL续期、16MB拦截、**同Key全类型顺序**、无Key命令、**Lua多类型** |
+| **T** | **OOM 保护** | **9** | **Key清单上传预览、错误Key限流下载、校验overflow、限速配置** |
+| **U** | **历史问题回归** | **12** | **TROUBLESHOOTING 场景覆盖：字段名错误、增量Pattern、系统Key、增量暂停恢复、TTL精度** |
 
-**总计: 18 个分类, 76 个测试用例**
+**总计: 20 个分类, 97 个测试用例**
 
 ---
 
@@ -222,6 +224,20 @@
 | S5 | 无 Key 命令 | PING/DBSIZE/INFO 不影响迁移 |
 | **S6** | **Lua 脚本多类型** | **EVAL 5 种类型：INCR/SET/HSET/RPUSH/SADD** |
 
+### T. OOM 保护（9 项）
+
+| ID | 测试名称 | 说明 |
+|:---|:---|:---|
+| **T1** | **小文件上传预览** | 50 Key TXT 文件上传，验证 code=0, total=50, truncated=false |
+| **T2** | **大文件截断预览** | **150 万 Key 文件上传，验证 code=0（不报错！）, truncated=true, total≥140万** |
+| T3 | CSV 格式上传 | CSV Key 清单正确解析 |
+| T4 | JSON 格式上传 | JSON Key 清单正确解析 |
+| T5 | 内容解析 API | parse-keylist 去重验证 |
+| **T6** | **错误 Key 限流+下载** | error-keys API 分页限流 + CSV/ZIP 流式下载 |
+| **T7** | **校验 overflow 标记** | 验证校验结果包含 mismatch_overflow 字段 |
+| T8 | 错误 Key 统计 | metrics 中 error_keys 统计信息 |
+| T9 | 限速配置 | 创建任务时设置 source_qps/target_qps 限速 |
+
 ---
 
 ## 重点场景详细说明
@@ -290,6 +306,97 @@
 
 ---
 
+### T2. 大文件截断预览（150 万 Key）
+
+**测试目的**: 验证 Key 清单文件超过 100 万 Key 上限时，不报错，而是截断预览 + 提示。
+
+**背景（2026-02-28 改进）**: 之前 `LoadKeyListFromFile` 超过 100 万 Key 直接返回 400 错误，阻止用户上传。但实际迁移走 `StreamKeyListFromFile`（流式处理，无上限），所以报错是不合理的。
+
+| 项目 | 值 |
+|:---|:---|
+| **文件规模** | 150 万 Key（约 30MB TXT） |
+| **预期行为** | code=0, truncated=true, total=1500000 |
+| **之前行为** | ❌ code=400, "key list has 1500000 keys (> 1000000 limit)" |
+| **实际迁移** | 不受影响，走 StreamKeyListFromFile 流式处理 |
+
+**三层保护策略**：
+
+| 文件大小 | Key 数量 | 处理方式 |
+|:---|:---|:---|
+| ≤ 200MB | ≤ 100 万 | 全量解析 + 完整预览 |
+| ≤ 200MB | > 100 万 | 全量解析 + 截断预览到 100 万 |
+| > 200MB | - | 采样前 4MB 估算总量 + 前 10 条预览 |
+
+---
+
+### T6. 错误 Key 限流 + 流式下载
+
+**测试目的**: 验证 error-keys API 的 OOM 保护机制。
+
+| 保护措施 | 说明 |
+|:---|:---|
+| **分页查询限流** | `GET /error-keys?page=1&page_size=100`，返回 `actual_total` 和 `truncated` |
+| **CSV 流式下载** | `GET /error-keys/download`，大数据量时流式输出不全量加载 |
+| **removedErrorKeys 落盘** | 每任务超 100 万条已移除 Key 时自动落盘到文件 |
+
+---
+
+### T7. 校验 mismatch_overflow 标记
+
+**测试目的**: 验证数据校验的不一致 Key 有 100 万上限保护，超出后设置 `mismatch_overflow=true`。
+
+| 项目 | 值 |
+|:---|:---|
+| **上限** | maxMismatchKeys = 1,000,000 |
+| **超出行为** | 停止收集新的不一致，设置 mismatchOverflow 标记 |
+| **测试方式** | 小数据集制造 1 个不一致，验证字段存在 |
+
+---
+
+### T9. 限速配置与参数协同
+
+**测试目的**: 验证 source_qps/target_qps 限速配置能正确传入并生效。
+
+**参数协同关系**：
+
+```
+SCAN 生产端（不限速）        Worker 消费端（限速在这里）
+┌───────────────────┐       ┌─────────────────────────────────┐
+│ Node1/2/3 SCAN    │──→ keyChan ──→│  全局共享限速器       │
+│ COUNT=scan_batch   │  (workers×100) │  Worker-0 ... Worker-N│
+└───────────────────┘       └─────────────────────────────────┘
+```
+
+| 参数 | 控制什么 | 粒度 |
+|:---|:---|:---|
+| source_qps | 全局源端 QPS 上限 | 每个 Key 算 1 次 |
+| target_qps | 全局目标端 QPS 上限 | 每个 Key 算 1 次 |
+| workers | 消费端并发数 | 所有 Worker 共享限速器 |
+| scan_batch_size | SCAN COUNT 参数 | 不受限速器控制 |
+
+---
+
+### U. 历史问题回归（12 项）
+
+基于 `TROUBLESHOOTING_GUIDE.md` 中记录的历史 Bug 和问题，确保这些问题不会回归。
+
+| ID | 测试名称 | 对应 TROUBLESHOOTING 编号 | 说明 |
+|:---|:---|:---|:---|
+| **U1** | **错误字段名拒绝** | §2.1 | 用错误字段名 source/target/addresses 创建任务，应被拒绝 |
+| **U2** | **增量计数器字段位置** | §2.2, §3.2 | incr_keys_synced 在 stats 中可获取 + heartbeats 检测 |
+| **U3** | **增量 Pattern 过滤** | §3.1 | 增量阶段 matchSimplePattern 通配符匹配（非 strings.Contains） |
+| **U4** | **系统 Key 过滤** | §12 BUG-1 | stat:total/daily/hourly 等系统内部 Key 不被迁移 |
+| **U5** | **增量阶段暂停恢复** | §12.1 (P0) | 增量阶段暂停后恢复，不应重新执行全量迁移 |
+| **U6** | **Stop API 路由** | §14.1 | `/tasks/{id}/stop` 路由可用，返回 code=0 |
+| **U7** | **空请求体拒绝** | §14.2 | 空 JSON `{}` 或只有 name 创建任务，应被拒绝 |
+| **U8** | **启动不存在任务** | §14.3 | 启动不存在的 task_id，应返回错误而非 success |
+| **U9** | **待迁移数不为 0** | §9.6 | 全量迁移中 keys_to_migrate 应 > 0 |
+| **U10** | **动态限速不卡死** | BUG-5 | 运行中修改 QPS 限速后任务不卡死，正常完成 |
+| **U11** | **增量 TTL 毫秒精度** | §7.4 | EXPIRE/PEXPIRE/PERSIST 增量同步后 TTL 一致 |
+| **U12** | **优雅关闭自动恢复** | BUG-3 | SIGTERM 后 ShutdownPaused 任务重启自动恢复 |
+
+---
+
 ## 数据类型全覆盖矩阵
 
 | 数据类型 | 全量测试 | 增量测试 | 大 Key 测试 | 顺序操作 |
@@ -304,14 +411,63 @@
 
 ---
 
+## OOM 保护覆盖矩阵
+
+| 保护点 | 机制 | 测试用例 | 100 亿 Key 适用 |
+|:---|:---|:---|:---|
+| **Key 清单上传** | 200MB 采样 + 100万截断 | T1, T2, T3, T4 | ✅ 流式迁移不受影响 |
+| **Key 清单解析** | 去重 + 预览截断 | T5 | ✅ |
+| **错误 Key 查询** | 分页限流 + actual_total | T6 | ✅ 不全量加载 |
+| **错误 Key 下载** | 流式 CSV/ZIP | T6 | ✅ |
+| **removedErrorKeys** | 100万/任务 + 落盘 | (间接) T6 | ✅ 自动落盘 |
+| **校验不一致 Key** | 100万上限 + overflow 标记 | T7 | ✅ 停止收集 |
+| **错误 Key 统计** | getErrorKeysStats | T8 | ✅ 原子计数器 |
+| **限速保护** | 全局令牌桶 + 背压 | T9 | ✅ 精确控速 |
+
+---
+
+## TROUBLESHOOTING 问题覆盖矩阵
+
+| TROUBLESHOOTING 编号 | 问题描述 | 测试用例 | 覆盖状态 |
+|:---|:---|:---|:---|
+| §2.1 | API 字段名错误(source/addresses) | **U1** | ✅ 直接覆盖 |
+| §2.2 | incr_keys_synced 字段位置 | **U2** | ✅ 直接覆盖 |
+| §3.1 | Pattern 匹配 strings.Contains bug | **U3**, B4, P1 | ✅ 增量+全量 |
+| §3.2 | FakeSlave heartbeats 检测 | **U2** | ✅ 直接覆盖 |
+| §3.3 | 增量计数不更新 | E1-E5, **U2** | ✅ 多角度 |
+| §7.4 | TTL 一致性(PTTL精度/PERSIST) | K5, R3, S2, **U11** | ✅ 增量+全量 |
+| §8.3/8.4 | incremental 纯增量模式 | E5 | ✅ |
+| §8.6 | 集群拓扑缓存 :0 | _(无法自动测)_ | ⚠️ 需异常集群 |
+| §8.7 | DBSIZE 超时 totalKeys | **U9** (间接) | ⚠️ 验证不为0 |
+| §9.6 | 待迁移Key数显示为0 | **U9**, I1, I2 | ✅ |
+| §12.1 (P0) | 增量恢复后重新全量 | **U5** | ✅ 直接覆盖 |
+| §12.2 (P0) | 增量阶段并发新全量 | **U5** (间接) | ⚠️ |
+| §12.3 (P1) | 断点恢复 cursor=0 | H1, H3 | ✅ |
+| §14.1 | Stop API 404 | **U6** | ✅ 直接覆盖 |
+| §14.2 | 空参数创建任务 | **U7**, L2 | ✅ |
+| §14.3 | 启动不存在任务返回 success | **U8**, L3 | ✅ |
+| BUG-1(§12) | 系统 key 被迁移 | **U4** | ✅ 直接覆盖 |
+| BUG-3 | ShutdownPaused 自动恢复 | **U12** | ✅ 直接覆盖 |
+| BUG-4 | 限速 WaitN 不生效 | T9 | ✅ |
+| BUG-5 | 动态调整限速卡死 | **U10** | ✅ 直接覆盖 |
+| BUG-6 | 多Worker限速退化 | T9 (间接) | ⚠️ 需大数据量 |
+
+---
+
 ## 运行方式
 
 ```bash
-# 运行全部 76 项测试
+# 运行全部 97 项测试
 python3 regression_test.py --env cloud-local
 
 # 运行指定分类
-python3 regression_test.py --env cloud-local --categories S,K,N
+python3 regression_test.py --env cloud-local --categories S,K,N,T,U
+
+# 只运行 OOM 保护测试
+python3 regression_test.py --env cloud-local --categories T
+
+# 只运行历史问题回归测试
+python3 regression_test.py --env cloud-local --categories U
 
 # 列出所有测试
 python3 regression_test.py --list

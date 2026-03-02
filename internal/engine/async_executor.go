@@ -151,13 +151,14 @@ func (e *AsyncCommandExecutor) Stop() {
 		return
 	}
 	
+	// 先取消 context（通知所有 worker 不再重试失败命令）
+	e.cancel()
+	
 	// 关闭缓冲区（这会使 worker 退出）
 	close(e.buffer)
 	
 	// 等待所有 worker 完成
 	e.wg.Wait()
-	
-	e.cancel()
 	
 	log.Printf("[AsyncCommandExecutor] Stopped. Stats: received=%d, executed=%d, failed=%d, retried=%d",
 		e.stats.receivedCommands.Load(),
@@ -175,6 +176,13 @@ func (e *AsyncCommandExecutor) Submit(cmd *AsyncCommand) error {
 	if cmd.Timestamp.IsZero() {
 		cmd.Timestamp = time.Now()
 	}
+	
+	// 【BUG-FIX】使用 recover 防止 Submit 与 Stop 之间竞态导致 send on closed channel panic
+	defer func() {
+		if r := recover(); r != nil {
+			// channel 已关闭，忽略 panic
+		}
+	}()
 	
 	select {
 	case e.buffer <- cmd:
@@ -251,24 +259,47 @@ func (e *AsyncCommandExecutor) executeBatch(batch []*AsyncCommand) {
 			
 			pipe := e.target.Pipeline()
 			
-			for _, cmd := range cmds {
-				e.addToPipeline(ctx, pipe, cmd)
+			// 【BUG-FIX】记录每个命令实际产生的 Pipeline 条目数（如 HSET+PExpire=2条）
+			cmdPipelineCounts := make([]int, len(cmds))
+			for i, cmd := range cmds {
+				cmdPipelineCounts[i] = e.addToPipelineWithCount(ctx, pipe, cmd)
 			}
 			
 			results, err := pipe.Exec(ctx)
 			
-			// 处理结果
+			// 【BUG-FIX】使用 cmdPipelineCounts 正确映射 results 到 cmds
+			resultIdx := 0
 			for i, cmd := range cmds {
-				if err != nil || (i < len(results) && results[i].Err() != nil) {
-					// 检查是否需要重试
+				pipeCount := cmdPipelineCounts[i]
+				var cmdErr error
+				
+				// 检查该命令对应的所有 Pipeline 结果
+				for j := 0; j < pipeCount; j++ {
+					if resultIdx < len(results) {
+						if results[resultIdx].Err() != nil {
+							cmdErr = results[resultIdx].Err()
+						}
+						resultIdx++
+					} else if err != nil {
+						cmdErr = err
+					}
+				}
+				
+				// pipeCount == 0 表示命令未添加到 pipeline
+				if pipeCount == 0 {
+					e.stats.failedCommands.Add(1)
+					continue
+				}
+				
+				if cmdErr != nil {
 					if cmd.RetryCount < e.maxRetries {
 						cmd.RetryCount++
 						failedCmds <- cmd
 						e.stats.retriedCommands.Add(1)
 					} else {
 						e.stats.failedCommands.Add(1)
-						log.Printf("[AsyncCommandExecutor] Command failed after %d retries: %s %v",
-							cmd.RetryCount, cmd.Name, cmd.Args)
+						log.Printf("[AsyncCommandExecutor] Command permanently failed after %d retries: %s key=%s err=%v",
+							cmd.RetryCount, cmd.Name, cmd.Key, cmdErr)
 					}
 				} else {
 					e.stats.executedCommands.Add(1)
@@ -280,9 +311,25 @@ func (e *AsyncCommandExecutor) executeBatch(batch []*AsyncCommand) {
 	wg.Wait()
 	close(failedCmds)
 	
-	// 重新提交失败的命令
+	// 【BUG-FIX】重新提交失败的命令：检查 context 和 running 状态，防止 send on closed channel
 	for cmd := range failedCmds {
-		e.Submit(cmd)
+		// 如果已停止，不再重试
+		if !e.running.Load() {
+			e.stats.failedCommands.Add(1)
+			log.Printf("[AsyncCommandExecutor] Executor stopped, dropping retry: %s key=%s", cmd.Name, cmd.Key)
+			continue
+		}
+		select {
+		case e.buffer <- cmd:
+			// 成功放入缓冲区
+		default:
+			// 缓冲区满：同步重试，失败则记录
+			if err := e.executeSync(cmd); err != nil {
+				e.stats.failedCommands.Add(1)
+				log.Printf("[AsyncCommandExecutor] Retry command sync exec failed: %s key=%s err=%v",
+					cmd.Name, cmd.Key, err)
+			}
+		}
 	}
 	
 	e.stats.flushedBatches.Add(1)
@@ -312,63 +359,101 @@ func (e *AsyncCommandExecutor) executeSync(cmd *AsyncCommand) error {
 	return nil
 }
 
-// addToPipeline 添加命令到 Pipeline
-func (e *AsyncCommandExecutor) addToPipeline(ctx context.Context, pipe redis.Pipeliner, cmd *AsyncCommand) {
+// addToPipelineWithCount 添加命令到 Pipeline，返回实际添加的 Pipeline 条目数
+func (e *AsyncCommandExecutor) addToPipelineWithCount(ctx context.Context, pipe redis.Pipeliner, cmd *AsyncCommand) int {
+	count := 0
 	switch cmd.Name {
 	case "SET":
 		if len(cmd.Args) >= 2 {
-			if cmd.TTL > 0 {
-				pipe.Set(ctx, cmd.Args[0].(string), cmd.Args[1], cmd.TTL)
-			} else {
-				pipe.Set(ctx, cmd.Args[0].(string), cmd.Args[1], 0)
+			key, ok := cmd.Args[0].(string)
+			if !ok {
+				log.Printf("[AsyncCommandExecutor] SET: Args[0] is not string, type=%T", cmd.Args[0])
+				return 0
 			}
+			if cmd.TTL > 0 {
+				pipe.Set(ctx, key, cmd.Args[1], cmd.TTL)
+			} else {
+				pipe.Set(ctx, key, cmd.Args[1], 0)
+			}
+			count = 1
 		}
 		
 	case "DEL":
 		if len(cmd.Args) >= 1 {
-			keys := make([]string, len(cmd.Args))
-			for i, arg := range cmd.Args {
-				keys[i] = arg.(string)
+			keys := make([]string, 0, len(cmd.Args))
+			for _, arg := range cmd.Args {
+				if k, ok := arg.(string); ok {
+					keys = append(keys, k)
+				}
 			}
-			pipe.Del(ctx, keys...)
+			if len(keys) > 0 {
+				pipe.Del(ctx, keys...)
+				count = 1
+			}
 		}
 		
 	case "HSET":
 		if len(cmd.Args) >= 3 {
-			pipe.HSet(ctx, cmd.Args[0].(string), cmd.Args[1:]...)
-			// 【BUG-FIX TTL 一致性】非 string 类型也必须设置 TTL
+			key, ok := cmd.Args[0].(string)
+			if !ok {
+				return 0
+			}
+			pipe.HSet(ctx, key, cmd.Args[1:]...)
+			count = 1
 			if cmd.TTL > 0 {
-				pipe.PExpire(ctx, cmd.Args[0].(string), cmd.TTL)
+				pipe.PExpire(ctx, key, cmd.TTL)
+				count = 2
 			}
 		}
 		
 	case "HDEL":
 		if len(cmd.Args) >= 2 {
-			key := cmd.Args[0].(string)
-			fields := make([]string, len(cmd.Args)-1)
-			for i, arg := range cmd.Args[1:] {
-				fields[i] = arg.(string)
+			key, ok := cmd.Args[0].(string)
+			if !ok {
+				return 0
 			}
-			pipe.HDel(ctx, key, fields...)
+			fields := make([]string, 0, len(cmd.Args)-1)
+			for _, arg := range cmd.Args[1:] {
+				if f, ok := arg.(string); ok {
+					fields = append(fields, f)
+				}
+			}
+			if len(fields) > 0 {
+				pipe.HDel(ctx, key, fields...)
+				count = 1
+			}
 		}
 		
 	case "SADD":
 		if len(cmd.Args) >= 2 {
-			pipe.SAdd(ctx, cmd.Args[0].(string), cmd.Args[1:]...)
-			// 【BUG-FIX TTL 一致性】
+			key, ok := cmd.Args[0].(string)
+			if !ok {
+				return 0
+			}
+			pipe.SAdd(ctx, key, cmd.Args[1:]...)
+			count = 1
 			if cmd.TTL > 0 {
-				pipe.PExpire(ctx, cmd.Args[0].(string), cmd.TTL)
+				pipe.PExpire(ctx, key, cmd.TTL)
+				count = 2
 			}
 		}
 		
 	case "SREM":
 		if len(cmd.Args) >= 2 {
-			pipe.SRem(ctx, cmd.Args[0].(string), cmd.Args[1:]...)
+			key, ok := cmd.Args[0].(string)
+			if !ok {
+				return 0
+			}
+			pipe.SRem(ctx, key, cmd.Args[1:]...)
+			count = 1
 		}
 		
 	case "ZADD":
 		if len(cmd.Args) >= 3 {
-			key := cmd.Args[0].(string)
+			key, ok := cmd.Args[0].(string)
+			if !ok {
+				return 0
+			}
 			members := make([]*redis.Z, 0)
 			for i := 1; i < len(cmd.Args); i += 2 {
 				if i+1 < len(cmd.Args) {
@@ -381,75 +466,111 @@ func (e *AsyncCommandExecutor) addToPipeline(ctx context.Context, pipe redis.Pip
 			}
 			if len(members) > 0 {
 				pipe.ZAdd(ctx, key, members...)
-				// 【BUG-FIX TTL 一致性】
+				count = 1
 				if cmd.TTL > 0 {
 					pipe.PExpire(ctx, key, cmd.TTL)
+					count = 2
 				}
 			}
 		}
 		
 	case "ZREM":
 		if len(cmd.Args) >= 2 {
-			pipe.ZRem(ctx, cmd.Args[0].(string), cmd.Args[1:]...)
+			key, ok := cmd.Args[0].(string)
+			if !ok {
+				return 0
+			}
+			pipe.ZRem(ctx, key, cmd.Args[1:]...)
+			count = 1
 		}
 		
 	case "LPUSH":
 		if len(cmd.Args) >= 2 {
-			pipe.LPush(ctx, cmd.Args[0].(string), cmd.Args[1:]...)
-			// 【BUG-FIX TTL 一致性】
+			key, ok := cmd.Args[0].(string)
+			if !ok {
+				return 0
+			}
+			pipe.LPush(ctx, key, cmd.Args[1:]...)
+			count = 1
 			if cmd.TTL > 0 {
-				pipe.PExpire(ctx, cmd.Args[0].(string), cmd.TTL)
+				pipe.PExpire(ctx, key, cmd.TTL)
+				count = 2
 			}
 		}
 		
 	case "RPUSH":
 		if len(cmd.Args) >= 2 {
-			pipe.RPush(ctx, cmd.Args[0].(string), cmd.Args[1:]...)
-			// 【BUG-FIX TTL 一致性】
+			key, ok := cmd.Args[0].(string)
+			if !ok {
+				return 0
+			}
+			pipe.RPush(ctx, key, cmd.Args[1:]...)
+			count = 1
 			if cmd.TTL > 0 {
-				pipe.PExpire(ctx, cmd.Args[0].(string), cmd.TTL)
+				pipe.PExpire(ctx, key, cmd.TTL)
+				count = 2
 			}
 		}
 		
 	case "LPOP":
 		if len(cmd.Args) >= 1 {
-			pipe.LPop(ctx, cmd.Args[0].(string))
+			if key, ok := cmd.Args[0].(string); ok {
+				pipe.LPop(ctx, key)
+				count = 1
+			}
 		}
 		
 	case "RPOP":
 		if len(cmd.Args) >= 1 {
-			pipe.RPop(ctx, cmd.Args[0].(string))
+			if key, ok := cmd.Args[0].(string); ok {
+				pipe.RPop(ctx, key)
+				count = 1
+			}
 		}
 		
 	case "EXPIRE":
 		if len(cmd.Args) >= 2 {
-			key := cmd.Args[0].(string)
-			seconds, _ := cmd.Args[1].(int64)
-			pipe.Expire(ctx, key, time.Duration(seconds)*time.Second)
+			if key, ok := cmd.Args[0].(string); ok {
+				seconds, _ := cmd.Args[1].(int64)
+				pipe.Expire(ctx, key, time.Duration(seconds)*time.Second)
+				count = 1
+			}
 		}
 		
 	case "PEXPIRE":
 		if len(cmd.Args) >= 2 {
-			key := cmd.Args[0].(string)
-			ms, _ := cmd.Args[1].(int64)
-			pipe.PExpire(ctx, key, time.Duration(ms)*time.Millisecond)
+			if key, ok := cmd.Args[0].(string); ok {
+				ms, _ := cmd.Args[1].(int64)
+				pipe.PExpire(ctx, key, time.Duration(ms)*time.Millisecond)
+				count = 1
+			}
 		}
 		
 	case "EXPIREAT":
 		if len(cmd.Args) >= 2 {
-			key := cmd.Args[0].(string)
-			ts, _ := cmd.Args[1].(int64)
-			pipe.ExpireAt(ctx, key, time.Unix(ts, 0))
+			if key, ok := cmd.Args[0].(string); ok {
+				ts, _ := cmd.Args[1].(int64)
+				pipe.ExpireAt(ctx, key, time.Unix(ts, 0))
+				count = 1
+			}
 		}
 		
 	case "PERSIST":
 		if len(cmd.Args) >= 1 {
-			pipe.Persist(ctx, cmd.Args[0].(string))
+			if key, ok := cmd.Args[0].(string); ok {
+				pipe.Persist(ctx, key)
+				count = 1
+			}
 		}
 		
 	case "RENAME":
 		if len(cmd.Args) >= 2 {
-			pipe.Rename(ctx, cmd.Args[0].(string), cmd.Args[1].(string))
+			src, ok1 := cmd.Args[0].(string)
+			dst, ok2 := cmd.Args[1].(string)
+			if ok1 && ok2 {
+				pipe.Rename(ctx, src, dst)
+				count = 1
+			}
 		}
 		
 	default:
@@ -458,7 +579,9 @@ func (e *AsyncCommandExecutor) addToPipeline(ctx context.Context, pipe redis.Pip
 		args = append(args, cmd.Name)
 		args = append(args, cmd.Args...)
 		pipe.Do(ctx, args...)
+		count = 1
 	}
+	return count
 }
 
 // groupBySlot 按 Slot 分组

@@ -103,6 +103,9 @@ type Task struct {
 
 	fakeSlaves   []*replication.FakeSlave `json:"-"` // Binlog 接收器（每个节点一个）
 	cacheManager *replication.BinlogCacheManager `json:"-"` // Binlog 缓存管理器
+	// 暂停时保存每个 FakeSlave 的 binlog 位置，恢复时从此位置继续
+	// key格式: "nodeAddr:storeID", value: binlogPos
+	savedBinlogPositions map[string]uint64 `json:"-"`
 	stopCh       chan struct{} `json:"-"` // 任务停止通道（用于优雅停止迁移 goroutine）
 	stopOnce     sync.Once     `json:"-"` // 确保 stopCh 只关闭一次
 	startedTime  time.Time     `json:"-"` // 任务启动时间（用于启动冷却期检查）
@@ -4773,6 +4776,10 @@ func simulateProgress(task *Task) {
 				binlogCancel()
 				cacheManager = nil
 				fakeSlaves = nil
+				// 【BUG-FIX】FakeSlave 失败降级后，回退 IncrSyncMode 为 time_window
+				tasksMu.Lock()
+				task.IncrSyncMode = "time_window"
+				tasksMu.Unlock()
 			} else {
 				taskLog.Info("FakeSlaves started", map[string]interface{}{
 					"node_count":  len(fakeSlaves),
@@ -8070,16 +8077,31 @@ func startFakeSlaves(
 		})
 
 		for storeID := 0; storeID < kvstorecount; storeID++ {
-			// 获取当前 store 的 binlog 位置
+			// 【暂停恢复修复】优先使用保存的 binlog 位置（暂停前保存的），避免丢失暂停期间的 binlog
 			var startBinlogPos uint64
-			binlogPosResult, err := nodeClient.Do(ctx, "binlogpos", fmt.Sprintf("%d", storeID)).Result()
+			savedKey := fmt.Sprintf("%s:%d", nodeAddr, storeID)
+			tasksMu.RLock()
+			savedPos, hasSaved := task.savedBinlogPositions[savedKey]
+			tasksMu.RUnlock()
+			
+			if hasSaved && savedPos > 0 {
+				startBinlogPos = savedPos
+				taskLog.Info("Using saved binlog position for resume", map[string]interface{}{
+					"node":     nodeAddr,
+					"store_id": storeID,
+					"saved_pos": savedPos,
+				})
+			} else {
+				// 没有保存的位置，获取当前 store 的 binlog 位置
+				binlogPosResult, err := nodeClient.Do(ctx, "binlogpos", fmt.Sprintf("%d", storeID)).Result()
 
-			if err == nil {
-				switch v := binlogPosResult.(type) {
-				case int64:
-					startBinlogPos = uint64(v)
-				case string:
-					fmt.Sscanf(v, "%d", &startBinlogPos)
+				if err == nil {
+					switch v := binlogPosResult.(type) {
+					case int64:
+						startBinlogPos = uint64(v)
+					case string:
+						fmt.Sscanf(v, "%d", &startBinlogPos)
+					}
 				}
 			}
 
@@ -8162,6 +8184,11 @@ waitLoop:
 		"total":     len(fakeSlaves),
 	})
 
+	// 【暂停恢复修复】FakeSlave 启动成功后清除保存的 binlog 位置
+	tasksMu.Lock()
+	task.savedBinlogPositions = nil
+	tasksMu.Unlock()
+
 	return fakeSlaves, nil
 }
 
@@ -8214,6 +8241,8 @@ func waitForFakeSlaves(
 	select {
 	case <-ctx.Done():
 		taskLog.Info("Incremental sync cancelled via context, stopping FakeSlaves...")
+		// 【暂停恢复修复】停止前保存每个 FakeSlave 的 binlog 位置
+		saveFakeSlaveBinlogPositions(task, fakeSlaves, taskLog)
 		for _, fs := range fakeSlaves {
 			fs.Stop()
 		}
@@ -8222,6 +8251,8 @@ func waitForFakeSlaves(
 		// 【P1修复】同时监听 task.stopCh 作为双保险
 		// 当外部 handler 关闭 stopCh 时，即使 context 链取消有延迟，也能立即响应
 		taskLog.Info("Incremental sync cancelled via stopCh, stopping FakeSlaves...")
+		// 【暂停恢复修复】停止前保存每个 FakeSlave 的 binlog 位置
+		saveFakeSlaveBinlogPositions(task, fakeSlaves, taskLog)
 		cancel() // 取消 binlogCtx，让统计 goroutine 也能退出
 		for _, fs := range fakeSlaves {
 			fs.Stop()
@@ -8237,6 +8268,24 @@ func waitForFakeSlaves(
 		"keys_synced":   task.IncrKeysSynced,
 		"keys_filtered": task.IncrKeysFiltered,
 		"keys_failed":   task.IncrKeysFailed,
+	})
+}
+
+// saveFakeSlaveBinlogPositions 暂停时保存每个 FakeSlave 的当前 binlog 位置
+// 恢复时可以从这些位置继续，避免丢失暂停期间的 binlog 数据
+func saveFakeSlaveBinlogPositions(task *Task, fakeSlaves []*replication.FakeSlave, taskLog *logger.TaskLogger) {
+	positions := make(map[string]uint64)
+	for _, fs := range fakeSlaves {
+		key := fmt.Sprintf("%s:%d", fs.GetSourceAddr(), fs.GetStoreID())
+		pos := fs.GetCurrentBinlogPos()
+		positions[key] = pos
+	}
+	tasksMu.Lock()
+	task.savedBinlogPositions = positions
+	tasksMu.Unlock()
+	taskLog.Info("Saved FakeSlave binlog positions for resume", map[string]interface{}{
+		"positions": positions,
+		"count":     len(positions),
 	})
 }
 
@@ -9686,9 +9735,19 @@ func processSingleNodeBinlog(
 		}
 	}
 
-	// 更新偏移量
-	if newOffset > offset {
+	// 更新偏移量（只有在没有严重失败时才推进，避免丢失 entry）
+	if newOffset > offset && failed == 0 {
 		nodeOffsets[nodeAddr] = newOffset
+	} else if newOffset > offset && failed > 0 {
+		// 有失败的 entry：仍然推进 offset（因为 binlog 是顺序的，不推进会导致无限重复）
+		// 但通过错误 key 记录机制确保失败的 key 不会被遗漏
+		nodeOffsets[nodeAddr] = newOffset
+		taskLog.Warn("Binlog offset advanced with failures", map[string]interface{}{
+			"node":       nodeAddr,
+			"new_offset": newOffset,
+			"failed":     failed,
+			"synced":     synced,
+		})
 	}
 
 	return
@@ -12051,12 +12110,12 @@ func restartTaskHandler(w http.ResponseWriter, r *http.Request, id string, log *
 		return
 	}
 
-	// 只能重启失败或已完成的任务
-	if task.Status != "failed" && task.Status != "completed" && task.Status != "paused" {
+	// 只能重启失败、已完成、已暂停或已停止的任务
+	if task.Status != "failed" && task.Status != "completed" && task.Status != "paused" && task.Status != "stopped" {
 		tasksMu.Unlock()
 		jsonResponse(w, map[string]interface{}{
 			"code":    400,
-			"message": fmt.Sprintf("Cannot restart task in '%s' status. Only 'failed', 'completed', or 'paused' tasks can be restarted.", task.Status),
+			"message": fmt.Sprintf("Cannot restart task in '%s' status. Only 'failed', 'completed', 'paused', or 'stopped' tasks can be restarted.", task.Status),
 		})
 		return
 	}

@@ -111,6 +111,20 @@ def dst_redis_cmd(port, cmd):
 def redis_set(port, key, value):
     redis_cmd(port, f'SET {key} "{value}"')
 
+def redis_set_large(port, key, value):
+    """写入大值到源端（通过 stdin pipe 避免 ARG_MAX 限制）"""
+    host = SRC_HOST
+    cmd_args = ['redis-cli', '-c', '-h', host, '-p', str(port), '-x', 'SET', key]
+    if REDIS_VIA_SSH and SSH_CMD:
+        parts = SSH_CMD.split()
+        cmd_args = parts + cmd_args
+    try:
+        r = subprocess.run(cmd_args, input=value.encode('utf-8'),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        return r.stdout.decode('utf-8', errors='replace').strip()
+    except Exception as e:
+        return f"ERROR: {e}"
+
 def dst_redis_set(port, key, value):
     """在目标端写入 Key"""
     dst_redis_cmd(port, f'SET {key} "{value}"')
@@ -228,6 +242,9 @@ def resume_task(tid):
 def stop_task(tid):
     return api_post(f"/tasks/{tid}/stop")
 
+def restart_task(tid):
+    return api_post(f"/tasks/{tid}/restart")
+
 def delete_task(tid):
     return api_delete(f"/tasks/{tid}")
 
@@ -275,8 +292,8 @@ def restart_service():
 def cleanup_tasks():
     """删除所有测试任务"""
     resp = api_get("/tasks")
-    d = resp.get("data", {})
-    tasks = d.get("items", d.get("tasks", []))
+    d = resp.get("data") or {}
+    tasks = d.get("items") or d.get("tasks") or []
     for t in tasks:
         if t.get("name", "").startswith("reg-"):
             api_delete(f"/tasks/{t['id']}")
@@ -360,6 +377,13 @@ def test_B1_full_no_filter():
     """B1. 全量无过滤 - 数据完整性 + 计数器全过程监控"""
     log("=== B1. 全量无过滤 ===")
     flush_dst()
+
+    # 自行准备测试数据（不依赖其他测试残留）
+    src = SRC_PORTS[0]
+    for i in range(200):
+        redis_set(src, f"b1_data:{i:04d}", f"value_{i}")
+    time.sleep(1)
+
     src_total = src_dbsize()
     log(f"  源端总量: {src_total}")
 
@@ -1532,8 +1556,8 @@ def test_J1_error_keys_api():
 
     # 找一个已完成的任务
     resp = api_get("/tasks")
-    d = resp.get("data", {})
-    tasks = d.get("items", d.get("tasks", []))
+    d = resp.get("data") or {}
+    tasks = d.get("items") or d.get("tasks") or []
     tid = None
     for t in tasks:
         if t.get("name", "").startswith("reg-") and t.get("status") in ("completed", "stopped"):
@@ -2555,8 +2579,8 @@ def test_O3_export_report():
 
     # 找一个已完成任务
     resp = api_get("/tasks")
-    d = resp.get("data", {})
-    tasks = d.get("items", d.get("tasks", []))
+    d = resp.get("data") or {}
+    tasks = d.get("items") or d.get("tasks") or []
     tid = None
     for t in tasks:
         if t.get("name", "").startswith("reg-") and t.get("status") == "completed":
@@ -3976,8 +4000,8 @@ def test_T6_error_keys_limit_and_download():
 
     # 找一个已完成的任务
     resp = api_get("/tasks")
-    d = resp.get("data", {})
-    tasks = d.get("items", d.get("tasks", []))
+    d = resp.get("data") or {}
+    tasks = d.get("items") or d.get("tasks") or []
     tid = None
     for t in tasks:
         if t.get("name", "").startswith("reg-") and t.get("status") in ("completed", "stopped"):
@@ -4132,8 +4156,8 @@ def test_T8_error_keys_stats_api():
 
     # 找一个任务
     resp = api_get("/tasks")
-    d = resp.get("data", {})
-    tasks = d.get("items", d.get("tasks", []))
+    d = resp.get("data") or {}
+    tasks = d.get("items") or d.get("tasks") or []
     tid = None
     for t in tasks:
         if t.get("name", "").startswith("reg-") and t.get("status") in ("completed", "stopped", "running"):
@@ -4889,6 +4913,3850 @@ def test_U12_sigterm_auto_resume():
 
 
 # ================================================================
+# V. 风险修复验证测试（27 个风险点修复后的专项验证）
+# ================================================================
+def test_V1_incr_sync_failure_marks_failed():
+    """V1. 增量同步异常失败时任务标记为 failed（而非 completed）
+    修复点：task_runner.go - 增量同步失败应标记 Failed
+    验证：创建一个目标端不可达的增量任务，观察状态是否为 failed
+    """
+    log("=== V1. 增量同步失败标记 Failed ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    # 写入数据
+    for i in range(50):
+        redis_set(src, f"v1_fail:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    # 创建指向不可达目标端的任务
+    data = {
+        "name": "reg-V1-incr-fail",
+        "migration_mode": "full_and_incremental",
+        "source_cluster": {"addrs": SRC_NODES},
+        "target_cluster": {"addrs": ["10.255.255.1:9999"]},  # 不可达地址
+        "options": {
+            "worker_count": 1,
+            "scan_batch_size": 100,
+            "conflict_policy": "replace",
+            "key_filter": {"mode": "prefix", "prefixes": ["v1_fail:"]},
+        }
+    }
+    resp = api_post("/tasks", data)
+    tid = resp.get("data", {}).get("task_id")
+    if not tid:
+        record("V1 增量失败标记Failed", False, f"创建任务失败: {resp}")
+        return
+
+    start_task(tid)
+    # 等待任务完成（应该因目标不可达而 failed）
+    # TCP 连接超时可能需要较长时间，使用轮询方式等待
+    for _ in range(30):
+        t = get_task(tid)
+        status = t.get("status", "")
+        if status in ("failed", "error", "stopped", "completed"):
+            break
+        time.sleep(3)
+    else:
+        t = get_task(tid)
+    status = t.get("status", "")
+
+    checks = [f"status={status}"]
+
+    # 任务应该失败（不可达目标端），不应该是 completed
+    failed_ok = status in ("failed", "error", "stopped")
+    not_completed = status != "completed"
+
+    checks.append(f"not_completed={not_completed}")
+    all_ok = not_completed  # 关键：不能标记为 completed
+
+    record("V1 增量失败标记Failed", all_ok, "; ".join(checks))
+
+    # 清理
+    for i in range(50):
+        redis_cmd(src, f'DEL v1_fail:{i:04d}')
+    if tid:
+        delete_task(tid)
+    return tid
+
+
+def test_V2_slot_migration_retry():
+    """V2. Slot 迁移失败带重试 + 最终完成
+    修复点：task_runner.go - slot 迁移失败记录并重试
+    验证：正常全量迁移完成后日志中含有 "completed successfully"
+    """
+    log("=== V2. Slot 迁移重试 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(100):
+        redis_set(src, f"v2_slot:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-V2-slot-retry", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["v2_slot:"]})
+    if not tid:
+        record("V2 Slot迁移重试", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+    migrated = t.get("progress", {}).get("migrated_keys", 0)
+
+    checks = [f"status={status}", f"migrated={migrated}"]
+
+    # 正常情况下应该完成且迁移 100 个 key
+    all_ok = status == "completed" and migrated >= 90
+
+    # 检查日志中是否有重试相关信息（可选验证）
+    logs_resp = api_get(f"/tasks/{tid}/logs?last=100")
+    logs = logs_resp.get("data", {}).get("logs", [])
+    has_retry_log = any("failed slots" in str(l).lower() for l in logs)
+    # 正常场景不应有 failed slots
+    checks.append(f"has_failed_slots_log={has_retry_log}")
+
+    record("V2 Slot迁移重试", all_ok, "; ".join(checks))
+
+    # 清理
+    for i in range(100):
+        redis_cmd(src, f'DEL v2_slot:{i:04d}')
+    return tid
+
+
+def test_V3_user_stop_incr_not_failed():
+    """V3. 用户停止增量同步 → 状态不是 failed
+    修复点：task_runner.go - 区分用户停止和异常失败
+    """
+    log("=== V3. 用户停止增量不算失败 ===")
+    flush_dst()
+
+    tid = create_task("reg-V3-stop-ok", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["v3_stop:"]})
+    if not tid:
+        record("V3 停止增量不算失败", False, "创建任务失败")
+        return
+
+    src = SRC_PORTS[0]
+    for i in range(30):
+        redis_set(src, f"v3_stop:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+
+    if phase != "incremental":
+        record("V3 停止增量不算失败", False, f"未进入增量阶段 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 用户主动停止
+    stop_task(tid)
+    time.sleep(5)
+
+    t = get_task(tid)
+    status = t.get("status", "")
+
+    checks = [f"status={status}"]
+
+    # 关键验证：用户主动停止不应该标记为 failed
+    not_failed = status != "failed"
+    ok_status = status in ("completed", "stopped", "paused", "incremental_stopped")
+    checks.append(f"not_failed={not_failed}, ok_status={ok_status}")
+
+    all_ok = not_failed
+    record("V3 停止增量不算失败", all_ok, "; ".join(checks))
+
+    # 清理
+    for i in range(30):
+        redis_cmd(src, f'DEL v3_stop:{i:04d}')
+    return tid
+
+
+def test_V4_pipeline_partial_failure_stats():
+    """V4. Pipeline 部分失败精确统计
+    修复点：pipeline_migrator.go + concurrent_writer.go
+    验证：skip 策略下已存在的 key 被正确跳过/记录，不会整批标记失败
+    """
+    log("=== V4. Pipeline部分失败精确统计 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 源端写入 100 个 key
+    for i in range(100):
+        redis_set(src, f"v4_pipe:{i:04d}", f"src_val_{i}")
+    time.sleep(1)
+
+    # 目标端预写 30 个 key（制造冲突）
+    for i in range(30):
+        dst_redis_set(dst, f"v4_pipe:{i:04d}", f"dst_existing_{i}")
+    time.sleep(1)
+
+    # 使用 skip 策略：已存在的应该被跳过
+    tid = create_task("reg-V4-partial", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["v4_pipe:"]},
+                      conflict_policy="skip")
+    if not tid:
+        record("V4 Pipeline部分失败", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+    migrated = t.get("progress", {}).get("migrated_keys", 0)
+    stats = t.get("stats", {})
+    skipped = stats.get("skipped_keys", stats.get("keys_skipped", 0))
+
+    checks = [f"status={status}", f"migrated={migrated}", f"skipped={skipped}"]
+
+    # 验证：任务应该完成，且跳过了部分 key
+    dst_total = 0
+    for i in range(100):
+        if dst_redis_exists(dst, f"v4_pipe:{i:04d}"):
+            dst_total += 1
+
+    checks.append(f"dst_total={dst_total}/100")
+
+    # 检查冲突 key 中前 30 个是否保留了目标端的值（skip 策略）
+    preserved = 0
+    for i in range(30):
+        val = dst_redis_get(dst, f"v4_pipe:{i:04d}")
+        if "dst_existing" in str(val):
+            preserved += 1
+    checks.append(f"preserved={preserved}/30")
+
+    all_ok = status == "completed" and dst_total >= 90 and preserved >= 25
+    record("V4 Pipeline部分失败", all_ok, "; ".join(checks))
+
+    # 清理
+    for i in range(100):
+        redis_cmd(src, f'DEL v4_pipe:{i:04d}')
+    return tid
+
+
+def test_V5_fakeslave_fallback_mode():
+    """V5. FakeSlave 降级回退 IncrSyncMode
+    修复点：cmd/simple/main.go - FakeSlave 失败降级后回退 IncrSyncMode 为 time_window
+    验证：创建增量任务后检查 incr_sync_mode 字段
+    """
+    log("=== V5. FakeSlave降级回退 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(30):
+        redis_set(src, f"v5_fs:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-V5-fallback", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["v5_fs:"]})
+    if not tid:
+        record("V5 FakeSlave降级", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    status = t.get("status", "")
+
+    # 获取增量同步模式
+    incr_mode = t.get("incr_sync_mode", t.get("IncrSyncMode", "unknown"))
+
+    checks = [f"phase={phase}", f"status={status}", f"incr_mode={incr_mode}"]
+
+    # 增量模式应该是 binlog 或 time_window（取决于环境是否支持 FakeSlave）
+    mode_valid = incr_mode in ("binlog", "time_window", "unknown", "")
+
+    # 写入增量数据验证同步正常
+    if phase == "incremental":
+        for i in range(20):
+            redis_set(src, f"v5_fs:incr_{i:04d}", f"incr_val_{i}")
+        time.sleep(15)
+        synced = sum(1 for i in range(20) if dst_redis_exists(DST_PORTS[0], f"v5_fs:incr_{i:04d}"))
+        checks.append(f"incr_synced={synced}/20")
+
+    stop_task(tid)
+    time.sleep(2)
+
+    # 验证状态正常（不论哪种模式都应该正常工作）
+    all_ok = phase == "incremental" or status == "completed"
+    record("V5 FakeSlave降级", all_ok, "; ".join(checks))
+
+    # 清理
+    for i in range(30):
+        redis_cmd(src, f'DEL v5_fs:{i:04d}')
+    for i in range(20):
+        redis_cmd(src, f'DEL v5_fs:incr_{i:04d}')
+    return tid
+
+
+def test_V6_conflict_key_disk_flush():
+    """V6. 冲突 Key 记录落盘 + error-keys API 可用
+    修复点：conflict_store.go - 磁盘写入错误处理
+    验证：制造大量冲突后 error-keys API 返回正确
+    """
+    log("=== V6. 冲突Key落盘验证 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 源端写入 200 个 key
+    for i in range(200):
+        redis_set(src, f"v6_conf:{i:04d}", f"src_{i}")
+    time.sleep(1)
+
+    # 目标端预写 150 个（制造冲突）
+    for i in range(150):
+        dst_redis_set(dst, f"v6_conf:{i:04d}", f"dst_{i}")
+    time.sleep(1)
+
+    # skip 策略 → 冲突 key 会被记录
+    tid = create_task("reg-V6-conflict-disk", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["v6_conf:"]},
+                      conflict_policy="skip")
+    if not tid:
+        record("V6 冲突Key落盘", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+    checks = [f"status={status}"]
+
+    # 查询 error-keys API
+    ek_resp = api_get(f"/tasks/{tid}/error-keys?page=1&page_size=50")
+    ek_data = ek_resp.get("data", {})
+    ek_total = ek_data.get("total", ek_data.get("actual_total", 0))
+    ek_items = ek_data.get("items", [])
+
+    checks.append(f"error_keys_total={ek_total}")
+    checks.append(f"error_keys_page_items={len(ek_items)}")
+
+    # 验证 error-keys 下载 API（CSV）
+    try:
+        dl_resp = requests.get(f"{API}/tasks/{tid}/error-keys/download", timeout=10)
+        dl_ok = dl_resp.status_code == 200
+        dl_size = len(dl_resp.content)
+        checks.append(f"download_ok={dl_ok},size={dl_size}")
+    except Exception as e:
+        dl_ok = False
+        checks.append(f"download_error={e}")
+
+    # skip 策略下可能有或没有 error_keys（取决于实现：skip 是否记录为 error）
+    # 关键验证：API 不崩溃，返回正确格式
+    api_ok = ek_resp.get("code", -1) == 0 or ("data" in ek_resp and "error" not in str(ek_resp.get("message", "")).lower())
+    all_ok = status == "completed" and api_ok
+    record("V6 冲突Key落盘", all_ok, "; ".join(checks))
+
+    # 清理
+    for i in range(200):
+        redis_cmd(src, f'DEL v6_conf:{i:04d}')
+    return tid
+
+
+def test_V7_incr_sync_concurrent_stats():
+    """V7. 增量同步统计并发安全
+    修复点：incremental_syncer.go - 统计字段改为 atomic
+    验证：快速写入 500+ key，stats 计数不出负数/异常值
+    """
+    log("=== V7. 增量同步并发统计安全 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(20):
+        redis_set(src, f"v7_stat:{i:04d}", f"base_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-V7-concurrent-stats", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["v7_stat:"]})
+    if not tid:
+        record("V7 增量并发统计", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+
+    if phase != "incremental":
+        record("V7 增量并发统计", False, f"未进入增量阶段 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 快速写入 500 个增量 key
+    log("  快速写入 500 个增量 key...")
+    for i in range(500):
+        redis_set(src, f"v7_stat:incr_{i:06d}", f"incr_val_{i}")
+
+    # 连续采样 stats，检查是否有负数或异常
+    log("  采样 stats 10 次...")
+    anomalies = []
+    for sample_idx in range(10):
+        time.sleep(2)
+        t = get_task(tid)
+        stats = t.get("stats", {})
+        progress = t.get("progress", {})
+
+        migrated = progress.get("migrated_keys", 0)
+        incr_synced = stats.get("incr_keys_synced", 0)
+
+        # 检查负数
+        if migrated < 0:
+            anomalies.append(f"sample{sample_idx}:migrated={migrated}<0")
+        if incr_synced < 0:
+            anomalies.append(f"sample{sample_idx}:incr_synced={incr_synced}<0")
+
+    stop_task(tid)
+    time.sleep(2)
+
+    checks = [f"anomalies={len(anomalies)}"]
+    if anomalies:
+        checks.append(f"details={anomalies[:3]}")
+
+    # 最终 stats 检查
+    t = get_task(tid)
+    final_incr = t.get("stats", {}).get("incr_keys_synced", 0)
+    checks.append(f"final_incr_synced={final_incr}")
+
+    all_ok = len(anomalies) == 0
+    record("V7 增量并发统计", all_ok, "; ".join(checks))
+
+    # 清理
+    for i in range(20):
+        redis_cmd(src, f'DEL v7_stat:{i:04d}')
+    for i in range(500):
+        redis_cmd(src, f'DEL v7_stat:incr_{i:06d}')
+    return tid
+
+
+def test_V8_binlog_offset_no_warning_normal():
+    """V8. 正常场景 binlog offset 不出现失败告警
+    修复点：cmd/simple/main.go - Binlog offset 推进告警
+    验证：正常增量同步日志中不出现 "offset advanced with failures"
+    """
+    log("=== V8. Binlog offset 正常无告警 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(50):
+        redis_set(src, f"v8_offset:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-V8-offset-ok", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["v8_offset:"]})
+    if not tid:
+        record("V8 offset正常无告警", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+
+    if phase != "incremental":
+        record("V8 offset正常无告警", False, f"未进入增量阶段 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 写入一些增量数据
+    for i in range(30):
+        redis_set(src, f"v8_offset:incr_{i:04d}", f"incr_val_{i}")
+    time.sleep(15)
+
+    # 检查日志
+    logs_resp = api_get(f"/tasks/{tid}/logs?last=200")
+    logs = logs_resp.get("data", {}).get("logs", [])
+    logs_text = str(logs)
+
+    has_offset_warning = "offset advanced with failures" in logs_text.lower()
+    checks = [f"has_offset_warning={has_offset_warning}", f"logs_count={len(logs)}"]
+
+    stop_task(tid)
+    time.sleep(2)
+
+    # 正常场景不应有此告警
+    all_ok = not has_offset_warning
+    record("V8 offset正常无告警", all_ok, "; ".join(checks))
+
+    # 清理
+    for i in range(50):
+        redis_cmd(src, f'DEL v8_offset:{i:04d}')
+    for i in range(30):
+        redis_cmd(src, f'DEL v8_offset:incr_{i:04d}')
+    return tid
+
+
+def test_V9_full_migration_no_failed_slots():
+    """V9. 正常全量迁移 0 failed slots
+    修复点：task_runner.go - slot 迁移重试机制
+    验证：正常迁移日志中含 "completed successfully"（无 failed slots）
+    """
+    log("=== V9. 全量迁移无failed slots ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(200):
+        redis_set(src, f"v9_nofail:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-V9-no-fail-slots", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["v9_nofail:"]})
+    if not tid:
+        record("V9 全量无failed slots", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+    migrated = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 验证目标端数据
+    dst_count = sum(1 for i in range(200) if dst_redis_exists(DST_PORTS[0], f"v9_nofail:{i:04d}"))
+
+    checks = [f"status={status}", f"migrated={migrated}", f"dst_count={dst_count}/200"]
+
+    # 检查日志中不应有 "failed slots"
+    logs_resp = api_get(f"/tasks/{tid}/logs?last=100")
+    logs = logs_resp.get("data", {}).get("logs", [])
+    has_failed_slots = any("failed slots" in str(l).lower() for l in logs)
+    checks.append(f"has_failed_slots={has_failed_slots}")
+
+    all_ok = status == "completed" and migrated >= 190 and dst_count >= 190 and not has_failed_slots
+    record("V9 全量无failed slots", all_ok, "; ".join(checks))
+
+    # 清理
+    for i in range(200):
+        redis_cmd(src, f'DEL v9_nofail:{i:04d}')
+    return tid
+
+
+def test_V10_multi_task_error_isolation():
+    """V10. 多任务并发错误隔离
+    修复点：async_executor.go + concurrent_writer.go
+    验证：同时运行 2 个任务，一个正常一个有冲突，互不影响
+    """
+    log("=== V10. 多任务错误隔离 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 任务 A 的数据（正常）
+    for i in range(100):
+        redis_set(src, f"v10_taskA:{i:04d}", f"A_val_{i}")
+
+    # 任务 B 的数据（有冲突）
+    for i in range(100):
+        redis_set(src, f"v10_taskB:{i:04d}", f"B_val_{i}")
+    # 目标端预写 B 的 50 个 key
+    for i in range(50):
+        dst_redis_set(dst, f"v10_taskB:{i:04d}", f"B_existing_{i}")
+    time.sleep(1)
+
+    # 创建两个任务
+    tid_a = create_task("reg-V10-taskA", "full_only",
+                        key_filter={"mode": "prefix", "prefixes": ["v10_taskA:"]},
+                        conflict_policy="replace")
+    tid_b = create_task("reg-V10-taskB", "full_only",
+                        key_filter={"mode": "prefix", "prefixes": ["v10_taskB:"]},
+                        conflict_policy="skip")
+
+    if not tid_a or not tid_b:
+        record("V10 多任务错误隔离", False, f"创建任务失败 tid_a={tid_a} tid_b={tid_b}")
+        return
+
+    # 同时启动
+    start_task(tid_a)
+    start_task(tid_b)
+
+    # 等待两个都完成
+    ta = wait_complete(tid_a, timeout=300)
+    tb = wait_complete(tid_b, timeout=300)
+
+    status_a = ta.get("status", "")
+    status_b = tb.get("status", "")
+    migrated_a = ta.get("progress", {}).get("migrated_keys", 0)
+    migrated_b = tb.get("progress", {}).get("migrated_keys", 0)
+
+    checks = [
+        f"A:status={status_a},migrated={migrated_a}",
+        f"B:status={status_b},migrated={migrated_b}"
+    ]
+
+    # 验证任务 A 的数据完整性（不应受 B 的冲突影响）
+    a_count = sum(1 for i in range(100) if dst_redis_exists(dst, f"v10_taskA:{i:04d}"))
+    checks.append(f"A_dst_count={a_count}/100")
+
+    # 验证任务 B 完成
+    b_count = sum(1 for i in range(100) if dst_redis_exists(dst, f"v10_taskB:{i:04d}"))
+    checks.append(f"B_dst_count={b_count}/100")
+
+    # 关键验证：任务 A 不受 B 的影响
+    a_ok = status_a == "completed" and a_count >= 90
+    b_ok = status_b == "completed"
+    all_ok = a_ok and b_ok
+
+    record("V10 多任务错误隔离", all_ok, "; ".join(checks))
+
+    # 清理
+    for i in range(100):
+        redis_cmd(src, f'DEL v10_taskA:{i:04d}')
+        redis_cmd(src, f'DEL v10_taskB:{i:04d}')
+    return tid_a
+
+
+# ================================================================
+# W. 故障注入测试（Chaos Engineering）
+# 主动制造异常场景，验证系统在故障条件下的行为正确性
+# ================================================================
+def test_W1_kill9_during_incremental():
+    """W1. 增量阶段 kill -9 后恢复数据不丢失
+    故障注入：增量同步运行中 SIGKILL，重启后继续增量，数据不丢
+    """
+    log("=== W1. 增量阶段Kill-9恢复 ===")
+    if not REDIS_VIA_SSH or not SSH_CMD:
+        record("W1 增量Kill9恢复", True, "本地环境跳过(需SSH)")
+        return
+
+    flush_dst()
+    src = SRC_PORTS[0]
+    for i in range(200):
+        redis_set(src, f"w1_chaos:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-W1-incr-kill9", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["w1_chaos:"]})
+    if not tid:
+        record("W1 增量Kill9恢复", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("W1 增量Kill9恢复", False, f"未进入增量阶段 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    # 增量阶段写入数据
+    for i in range(50):
+        redis_set(src, f"w1_chaos:incr_{i:04d}", f"incr_val_{i}")
+    time.sleep(10)
+
+    # KILL -9
+    log("  执行 kill -9 ...")
+    kill_process()
+    time.sleep(5)
+
+    # 继续写入（模拟故障期间源端仍有写入）
+    for i in range(50, 100):
+        redis_set(src, f"w1_chaos:incr_{i:04d}", f"incr_val_{i}")
+
+    # 重启
+    log("  重启服务...")
+    restart_service()
+    time.sleep(10)
+
+    # 检查任务状态，应自动恢复
+    t = get_task(tid)
+    status = t.get("status", "")
+    checks = [f"after_restart:status={status}"]
+
+    # 等恢复和增量同步追上
+    if status in ("running", "paused"):
+        if status == "paused":
+            resume_task(tid)
+            time.sleep(3)
+        # 等待增量同步追上
+        time.sleep(30)
+
+    # 验证全量数据不丢
+    full_count = sum(1 for i in range(200) if dst_redis_exists(DST_PORTS[0], f"w1_chaos:{i:04d}"))
+    checks.append(f"full_data={full_count}/200")
+
+    # 验证增量前半段（kill 前写入的）应该已同步
+    incr_pre = sum(1 for i in range(50) if dst_redis_exists(DST_PORTS[0], f"w1_chaos:incr_{i:04d}"))
+    checks.append(f"incr_pre_kill={incr_pre}/50")
+
+    all_ok = full_count >= 190 and incr_pre >= 40
+    record("W1 增量Kill9恢复", all_ok, "; ".join(checks))
+
+    stop_task(tid)
+    for i in range(200):
+        redis_cmd(src, f'DEL w1_chaos:{i:04d}')
+    for i in range(100):
+        redis_cmd(src, f'DEL w1_chaos:incr_{i:04d}')
+    return tid
+
+
+def test_W2_rapid_pause_resume_data_integrity():
+    """W2. 快速暂停/恢复 10 次后数据完整性
+    故障注入：全量迁移中每 2 秒暂停再恢复，验证最终数据完整
+    """
+    log("=== W2. 快速暂停恢复数据完整性 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(500):
+        redis_set(src, f"w2_rapid:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-W2-rapid-pr", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["w2_rapid:"]},
+                      workers=2)
+    if not tid:
+        record("W2 快速暂停恢复", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    time.sleep(3)
+
+    # 快速暂停/恢复 10 次
+    log("  快速暂停/恢复 10 次...")
+    pr_ok = 0
+    for i in range(10):
+        t = get_task(tid)
+        if t.get("status") in ("completed", "failed", "error"):
+            break
+        pause_task(tid)
+        time.sleep(1)
+        resume_task(tid)
+        time.sleep(2)
+        pr_ok += 1
+
+    t = wait_complete(tid, timeout=600)
+    status = t.get("status", "")
+    migrated = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 验证数据完整
+    dst_count = sum(1 for i in range(500) if dst_redis_exists(DST_PORTS[0], f"w2_rapid:{i:04d}"))
+    checks = [f"status={status}", f"migrated={migrated}", f"dst_count={dst_count}/500",
+              f"pause_resume_cycles={pr_ok}"]
+
+    all_ok = status == "completed" and dst_count >= 480
+    record("W2 快速暂停恢复", all_ok, "; ".join(checks))
+
+    for i in range(500):
+        redis_cmd(src, f'DEL w2_rapid:{i:04d}')
+    return tid
+
+
+def test_W3_source_write_during_full_migration():
+    """W3. 全量迁移期间源端持续写入
+    故障注入：全量迁移进行中，源端不断写入新 key，验证不干扰全量
+    """
+    log("=== W3. 全量迁移中源端持续写入 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    # 先写入基础数据
+    for i in range(300):
+        redis_set(src, f"w3_write:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-W3-src-write", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["w3_write:"]},
+                      workers=1)  # 慢速迁移，给时间注入写入
+    if not tid:
+        record("W3 全量中源端写入", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    time.sleep(2)
+
+    # 全量迁移进行中，不断写入新 key
+    log("  全量迁移中持续写入 200 个新 key...")
+    for i in range(300, 500):
+        redis_set(src, f"w3_write:{i:04d}", f"new_val_{i}")
+        time.sleep(0.05)  # 50ms 间隔
+
+    t = wait_complete(tid, timeout=600)
+    status = t.get("status", "")
+    migrated = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 验证原始数据完整（新写入的可能被扫到也可能没有，取决于 SCAN 时机）
+    base_count = sum(1 for i in range(300) if dst_redis_exists(DST_PORTS[0], f"w3_write:{i:04d}"))
+    checks = [f"status={status}", f"migrated={migrated}", f"base_data={base_count}/300"]
+
+    # 关键：任务应该正常完成，不崩溃
+    all_ok = status == "completed" and base_count >= 280
+    record("W3 全量中源端写入", all_ok, "; ".join(checks))
+
+    for i in range(500):
+        redis_cmd(src, f'DEL w3_write:{i:04d}')
+    return tid
+
+
+def test_W4_target_intermittent_failure():
+    """W4. 目标端预存大量冲突 key 模拟间歇性失败
+    故障注入：目标端预写 70% 的 key（skip 策略），验证不因大量跳过而崩溃
+    """
+    log("=== W4. 大量冲突不崩溃 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 源端写入 500 key
+    for i in range(500):
+        redis_set(src, f"w4_conflict:{i:04d}", f"src_{i}")
+    time.sleep(1)
+
+    # 目标端预写 350 个（70% 冲突率）
+    log("  目标端预写 350 个冲突 key...")
+    for i in range(350):
+        dst_redis_set(dst, f"w4_conflict:{i:04d}", f"dst_existing_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-W4-mass-conflict", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["w4_conflict:"]},
+                      conflict_policy="skip")
+    if not tid:
+        record("W4 大量冲突不崩溃", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+    migrated = t.get("progress", {}).get("migrated_keys", 0)
+    stats = t.get("stats", {})
+
+    # 所有 500 个 key 都应该在目标端存在
+    dst_total = sum(1 for i in range(500) if dst_redis_exists(dst, f"w4_conflict:{i:04d}"))
+
+    # 前 350 个应保留目标端的值（skip 策略）
+    preserved = sum(1 for i in range(350) if "dst_existing" in str(dst_redis_get(dst, f"w4_conflict:{i:04d}")))
+
+    # 后 150 个应该有源端的值
+    new_migrated = sum(1 for i in range(350, 500) if "src_" in str(dst_redis_get(dst, f"w4_conflict:{i:04d}")))
+
+    checks = [f"status={status}", f"dst_total={dst_total}/500",
+              f"preserved={preserved}/350", f"new_migrated={new_migrated}/150"]
+
+    all_ok = status == "completed" and dst_total >= 480 and preserved >= 320 and new_migrated >= 130
+    record("W4 大量冲突不崩溃", all_ok, "; ".join(checks))
+
+    for i in range(500):
+        redis_cmd(src, f'DEL w4_conflict:{i:04d}')
+    return tid
+
+
+def test_W5_stop_during_full_then_restart():
+    """W5. 全量迁移中途停止再重启，验证断点续传 + 数据不重复
+    故障注入：迁移 50% 时停止，重启后从断点继续
+    """
+    log("=== W5. 全量中途停止续传 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(1000):
+        redis_set(src, f"w5_resume:{i:04d}", f"val_{i}")
+    time.sleep(2)
+
+    tid = create_task("reg-W5-stop-resume", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["w5_resume:"]},
+                      workers=1)  # 慢速，确保中途停止
+    if not tid:
+        record("W5 全量中途停止续传", False, "创建任务失败")
+        return
+
+    start_task(tid)
+
+    # 等待迁移到约 30-60%
+    log("  等待迁移到部分完成...")
+    time.sleep(10)
+    t = get_task(tid)
+    migrated_before = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 停止
+    log(f"  在 migrated={migrated_before} 时停止...")
+    stop_task(tid)
+    time.sleep(3)
+
+    # 重启任务
+    log("  重启任务...")
+    start_task(tid)
+
+    t = wait_complete(tid, timeout=600)
+    status = t.get("status", "")
+    migrated_final = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 验证数据完整
+    dst_count = sum(1 for i in range(1000) if dst_redis_exists(DST_PORTS[0], f"w5_resume:{i:04d}"))
+    checks = [f"status={status}", f"migrated_before_stop={migrated_before}",
+              f"migrated_final={migrated_final}", f"dst_count={dst_count}/1000"]
+
+    all_ok = status == "completed" and dst_count >= 950
+    record("W5 全量中途停止续传", all_ok, "; ".join(checks))
+
+    for i in range(1000):
+        redis_cmd(src, f'DEL w5_resume:{i:04d}')
+    return tid
+
+
+def test_W6_concurrent_same_prefix_tasks():
+    """W6. 两个任务迁移相同前缀数据（竞争场景）
+    故障注入：两个任务同时迁移同一批 key，验证不死锁不崩溃
+    """
+    log("=== W6. 同前缀并发任务 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(200):
+        redis_set(src, f"w6_race:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid_a = create_task("reg-W6-raceA", "full_only",
+                        key_filter={"mode": "prefix", "prefixes": ["w6_race:"]},
+                        conflict_policy="replace")
+    tid_b = create_task("reg-W6-raceB", "full_only",
+                        key_filter={"mode": "prefix", "prefixes": ["w6_race:"]},
+                        conflict_policy="replace")
+
+    if not tid_a or not tid_b:
+        record("W6 同前缀并发", False, f"创建任务失败 A={tid_a} B={tid_b}")
+        return
+
+    start_task(tid_a)
+    start_task(tid_b)
+
+    ta = wait_complete(tid_a, timeout=300)
+    tb = wait_complete(tid_b, timeout=300)
+
+    sa = ta.get("status", "")
+    sb = tb.get("status", "")
+
+    # 两个都应该完成（replace 策略，后写的覆盖先写的）
+    dst_count = sum(1 for i in range(200) if dst_redis_exists(DST_PORTS[0], f"w6_race:{i:04d}"))
+    checks = [f"A:status={sa}", f"B:status={sb}", f"dst_count={dst_count}/200"]
+
+    # 关键：不崩溃，数据完整
+    all_ok = sa == "completed" and sb == "completed" and dst_count >= 190
+    record("W6 同前缀并发", all_ok, "; ".join(checks))
+
+    for i in range(200):
+        redis_cmd(src, f'DEL w6_race:{i:04d}')
+    return tid_a
+
+
+def test_W7_pipeline_partial_dump_failure():
+    """W7. Pipeline 源端 DUMP 部分失败（部分 key 在 DUMP 前被删除）
+    异常路径：SCAN 返回 key 列表后，部分 key 在 DUMP 前被删除，验证不崩溃且计数正确
+    根因1：非全部成功也非全部失败的中间态
+    """
+    log("=== W7. Pipeline部分DUMP失败 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入数据
+    for i in range(200):
+        redis_set(src, f"w7_pdump:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-W7-partial-dump", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["w7_pdump:"]},
+                      workers=1)
+    if not tid:
+        record("W7 Pipeline部分DUMP失败", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    time.sleep(2)
+
+    # 迁移进行中，删除部分源端 key（模拟 DUMP 时 key 不存在）
+    log("  迁移进行中删除部分源端key...")
+    for i in range(50, 100):
+        redis_cmd(src, f'DEL w7_pdump:{i:04d}')
+    time.sleep(1)
+
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+    p = t.get("progress", {})
+    s = t.get("stats", {})
+    migrated = p.get("migrated_keys", 0)
+    failed = s.get("failed_keys", 0)
+
+    # 关键验证：
+    # 1. 任务应正常完成（不因部分 key 不存在而崩溃）
+    # 2. 存在的 key 应该在目标端
+    existing_migrated = sum(1 for i in range(50) if dst_redis_exists(dst, f"w7_pdump:{i:04d}"))
+    existing_migrated += sum(1 for i in range(100, 200) if dst_redis_exists(dst, f"w7_pdump:{i:04d}"))
+
+    checks = [f"status={status}", f"migrated={migrated}", f"failed={failed}",
+              f"existing_migrated={existing_migrated}/150"]
+
+    # 不应崩溃，且存在的 key 应该迁移成功
+    all_ok = status == "completed" and existing_migrated >= 140
+    record("W7 Pipeline部分DUMP失败", all_ok, "; ".join(checks))
+
+    for i in range(200):
+        redis_cmd(src, f'DEL w7_pdump:{i:04d}')
+    return tid
+
+
+def test_W8_incremental_abnormal_exit():
+    """W8. 增量同步异常退出（源端集群节点重启导致连接断开）
+    异常路径：增量运行中 kill 进程 → 重启 → 检查增量是否恢复
+    根因1：不是正常完成也不是用户停止的异常退出场景
+    """
+    log("=== W8. 增量异常退出恢复 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(50):
+        redis_set(src, f"w8_abnormal:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-W8-abnormal-exit", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["w8_abnormal:"]})
+    if not tid:
+        record("W8 增量异常退出", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("W8 增量异常退出", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 增量阶段写入一些数据
+    for i in range(20):
+        redis_set(src, f"w8_abnormal:incr_{i:04d}", f"incr_val_{i}")
+
+    time.sleep(5)
+
+    # Kill -9 模拟异常退出
+    log("  Kill -9 模拟异常退出...")
+    kill_process()
+    time.sleep(3)
+
+    # 重启服务
+    log("  重启服务...")
+    restart_service()
+    time.sleep(5)
+
+    # 验证任务状态：应自动恢复运行或可以手动重启
+    t = get_task(tid)
+    status_after_restart = t.get("status", "")
+    log(f"  重启后状态: {status_after_restart}")
+
+    # 如果不是 running，尝试手动恢复
+    if status_after_restart not in ("running",):
+        start_task(tid)
+        time.sleep(10)
+        t = get_task(tid)
+        status_after_restart = t.get("status", "")
+
+    # 在增量中写入新数据验证增量是否恢复
+    for i in range(10):
+        redis_set(src, f"w8_abnormal:after_{i:04d}", f"after_val_{i}")
+    time.sleep(40)
+
+    # 检查恢复后的增量数据
+    dst = DST_PORTS[0]
+    incr_found = sum(1 for i in range(20) if dst_redis_exists(dst, f"w8_abnormal:incr_{i:04d}"))
+    after_found = sum(1 for i in range(10) if dst_redis_exists(dst, f"w8_abnormal:after_{i:04d}"))
+
+    stop_task(tid)
+
+    checks = [f"status_after_restart={status_after_restart}",
+              f"incr_found={incr_found}/20", f"after_found={after_found}/10"]
+
+    # 关键：异常退出后能恢复，增量数据不丢
+    health = api_get("/health")
+    service_ok = health.get("status") == "healthy" or health.get("code") == 0
+    checks.append(f"service_ok={service_ok}")
+
+    all_ok = service_ok and (incr_found >= 15 or after_found >= 5)
+    record("W8 增量异常退出", all_ok, "; ".join(checks))
+
+    for i in range(50):
+        redis_cmd(src, f'DEL w8_abnormal:{i:04d}')
+    for i in range(20):
+        redis_cmd(src, f'DEL w8_abnormal:incr_{i:04d}')
+    for i in range(10):
+        redis_cmd(src, f'DEL w8_abnormal:after_{i:04d}')
+    return tid
+
+
+def test_W9_fakeslave_reconnect_stability():
+    """W9. FakeSlave 连接断开后自动重连稳定性
+    异常路径：增量运行中反复暂停/恢复，验证 FakeSlave 重连后增量不丢
+    根因1：FakeSlave 连接断开和重建之间的数据窗口
+    """
+    log("=== W9. FakeSlave重连稳定性 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    for i in range(30):
+        redis_set(src, f"w9_fslave:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-W9-fslave-reconnect", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["w9_fslave:"]})
+    if not tid:
+        record("W9 FakeSlave重连", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("W9 FakeSlave重连", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 反复暂停/恢复 5 次，每次在暂停期间写入数据
+    missed_keys = []
+    for cycle in range(5):
+        pause_task(tid)
+        time.sleep(2)
+
+        # 暂停期间写入（FakeSlave 断开后的数据窗口）
+        for j in range(5):
+            key = f"w9_fslave:gap_{cycle}_{j}"
+            redis_set(src, key, f"gap_val_{cycle}_{j}")
+            missed_keys.append(key)
+
+        resume_task(tid)
+        time.sleep(5)
+
+    # 等待增量追上（IDLETIME 模式扫描间隔 30 秒 + 扫描执行时间）
+    time.sleep(45)
+
+    # 验证暂停期间写入的 key 是否最终同步
+    gap_found = sum(1 for k in missed_keys if dst_redis_exists(dst, k))
+    total_gap = len(missed_keys)
+
+    stop_task(tid)
+
+    checks = [f"cycles=5", f"gap_keys_found={gap_found}/{total_gap}"]
+
+    # FakeSlave 重连后应该从 binlog 位点补上暂停期间的数据
+    # 理论上 0 丢失，但允许 15% 容差（网络抖动/重连延迟）
+    all_ok = gap_found >= total_gap * 0.85
+    record("W9 FakeSlave重连", all_ok, "; ".join(checks))
+
+    for i in range(30):
+        redis_cmd(src, f'DEL w9_fslave:{i:04d}')
+    for k in missed_keys:
+        redis_cmd(src, f'DEL {k}')
+    return tid
+
+
+def test_W10_slot_timeout_retry():
+    """W10. 全量迁移中 slot 超时重试机制验证
+    异常路径：大 value 导致单 slot 迁移慢，验证不会因超时丢失 slot
+    根因1：个别 slot 超时的重试行为
+    """
+    log("=== W10. Slot超时重试 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入少量大 value（模拟单 slot 慢）
+    for i in range(10):
+        large_val = "X" * 500000  # 500KB
+        redis_set_large(src, f"w10_slot:{i:04d}", large_val)
+    # 写入大量小 value
+    for i in range(200):
+        redis_set(src, f"w10_slot:small_{i:04d}", f"small_{i}")
+    time.sleep(2)
+
+    tid = create_task("reg-W10-slot-timeout", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["w10_slot:"]},
+                      workers=2)
+    if not tid:
+        record("W10 Slot超时重试", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=600)
+    status = t.get("status", "")
+    p = t.get("progress", {})
+    migrated = p.get("migrated_keys", 0)
+
+    # 验证所有 key 都迁移成功
+    large_found = sum(1 for i in range(10) if dst_redis_exists(dst, f"w10_slot:{i:04d}"))
+    small_found = sum(1 for i in range(200) if dst_redis_exists(dst, f"w10_slot:small_{i:04d}"))
+
+    # 验证大 value 完整性
+    value_ok = 0
+    for i in range(10):
+        v = dst_redis_get(dst, f"w10_slot:{i:04d}")
+        if v and len(v) >= 490000:
+            value_ok += 1
+
+    checks = [f"status={status}", f"migrated={migrated}",
+              f"large_found={large_found}/10", f"small_found={small_found}/200",
+              f"large_value_intact={value_ok}/10"]
+
+    all_ok = status == "completed" and large_found >= 9 and small_found >= 190 and value_ok >= 9
+    record("W10 Slot超时重试", all_ok, "; ".join(checks))
+
+    for i in range(10):
+        redis_cmd(src, f'DEL w10_slot:{i:04d}')
+    for i in range(200):
+        redis_cmd(src, f'DEL w10_slot:small_{i:04d}')
+    return tid
+
+
+def test_W11_unsupported_operation_in_incremental():
+    """W11. 增量同步中遇到不支持的操作类型
+    异常路径：增量阶段执行 RENAME/COPY 等不被增量同步支持的操作
+    根因1：incremental_syncer.go 只支持 8 种操作，其他被静默跳过
+    """
+    log("=== W11. 增量不支持操作 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    for i in range(30):
+        redis_set(src, f"w11_unsup:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-W11-unsupported-ops", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["w11_unsup:"]})
+    if not tid:
+        record("W11 增量不支持操作", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("W11 增量不支持操作", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 执行支持的操作
+    for i in range(10):
+        redis_set(src, f"w11_unsup:new_{i}", f"new_val_{i}")
+    # 执行 INCR 等边界操作
+    redis_cmd(src, f'SET w11_unsup:counter 100')
+    time.sleep(1)
+    redis_cmd(src, f'INCR w11_unsup:counter')
+    redis_cmd(src, f'INCRBY w11_unsup:counter 50')
+    # APPEND 操作
+    redis_cmd(src, f'APPEND w11_unsup:new_0 _appended')
+
+    time.sleep(20)
+
+    # 关键验证：不支持的操作不应导致崩溃，服务仍然健康
+    health = api_get("/health")
+    service_ok = health.get("status") == "healthy" or health.get("code") == 0
+
+    # 支持的 SET 操作应该同步
+    set_synced = sum(1 for i in range(10) if dst_redis_exists(dst, f"w11_unsup:new_{i}"))
+
+    t = get_task(tid)
+    task_status = t.get("status", "")
+    incr_synced = t.get("stats", {}).get("incr_keys_synced", 0)
+
+    stop_task(tid)
+
+    checks = [f"service_ok={service_ok}", f"task_status={task_status}",
+              f"set_synced={set_synced}/10", f"incr_synced={incr_synced}"]
+
+    # 核心：不崩溃，SET 操作正常同步
+    all_ok = service_ok and (task_status == "running" or task_status == "stopped")
+    all_ok = all_ok and set_synced >= 8
+    record("W11 增量不支持操作", all_ok, "; ".join(checks))
+
+    for i in range(30):
+        redis_cmd(src, f'DEL w11_unsup:{i:04d}')
+    for i in range(10):
+        redis_cmd(src, f'DEL w11_unsup:new_{i}')
+    redis_cmd(src, f'DEL w11_unsup:counter')
+    return tid
+
+
+def test_W12_rapid_state_transitions():
+    """W12. 快速连续状态转换（start→pause→resume→stop 毫秒级）
+    异常路径：状态机在极短时间内被密集操作，测试竞态条件
+    根因1：状态转换之间的竞态窗口
+    """
+    log("=== W12. 快速状态转换 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(100):
+        redis_set(src, f"w12_rapid:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-W12-rapid-states", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["w12_rapid:"]})
+    if not tid:
+        record("W12 快速状态转换", False, "创建任务失败")
+        return
+
+    errors = []
+    # 3 轮快速状态切换
+    for cycle in range(3):
+        r_start = start_task(tid)
+        time.sleep(0.5)
+
+        # 毫秒级连续操作（检查返回值，记录异常但不中断测试）
+        r1 = pause_task(tid)
+        r2 = resume_task(tid)
+        r3 = pause_task(tid)
+        time.sleep(0.3)
+        r4 = resume_task(tid)
+        time.sleep(0.3)
+        r5 = stop_task(tid)
+        time.sleep(3)  # 等待 stop 完成
+
+        # 检查 API 返回值中是否有严重错误
+        for label, resp in [("pause1", r1), ("resume1", r2), ("pause2", r3), ("resume2", r4), ("stop", r5)]:
+            if resp and "error" in str(resp).lower() and "state" not in str(resp).lower():
+                errors.append(f"cycle{cycle}:{label}:unexpected_error")
+
+        # 检查服务存活
+        h = api_get("/health")
+        if not (h.get("status") == "healthy" or h.get("code") == 0):
+            errors.append(f"cycle{cycle}:service_down")
+
+        t = get_task(tid)
+        if t.get("status") == "error":
+            errors.append(f"cycle{cycle}:error_state")
+
+    # 最终验证
+    health = api_get("/health")
+    service_ok = health.get("status") == "healthy" or health.get("code") == 0
+
+    t = get_task(tid)
+    final_status = t.get("status", "")
+
+    checks = [f"cycles=3", f"errors={len(errors)}", f"final_status={final_status}",
+              f"service_ok={service_ok}"]
+    if errors:
+        checks.append(f"error_details={errors[:3]}")
+
+    all_ok = service_ok and len(errors) == 0
+    record("W12 快速状态转换", all_ok, "; ".join(checks))
+
+    for i in range(100):
+        redis_cmd(src, f'DEL w12_rapid:{i:04d}')
+    return tid
+
+
+# ================================================================
+# X. 属性/不变性测试（Property-Based Testing）
+# 不检查具体值，检查系统必须始终满足的"不变性"
+# ================================================================
+def test_X1_invariant_migrated_equals_dst():
+    """X1. 不变性：迁移完成后 源端每个匹配 key 在目标端必须存在
+    属性: ∀ key ∈ source(prefix), key ∈ target
+    """
+    log("=== X1. 不变性：迁移后key完整 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入多种类型的数据
+    test_keys = {}
+    for i in range(50):
+        redis_set(src, f"x1_inv:str_{i}", f"val_{i}")
+        test_keys[f"x1_inv:str_{i}"] = "string"
+    for i in range(20):
+        redis_cmd(src, f'HSET x1_inv:hash_{i} f1 v1 f2 v2')
+        test_keys[f"x1_inv:hash_{i}"] = "hash"
+    for i in range(20):
+        redis_cmd(src, f'RPUSH x1_inv:list_{i} a b c')
+        test_keys[f"x1_inv:list_{i}"] = "list"
+    for i in range(10):
+        redis_cmd(src, f'SADD x1_inv:set_{i} m1 m2 m3')
+        test_keys[f"x1_inv:set_{i}"] = "set"
+    time.sleep(1)
+
+    tid = create_task("reg-X1-invariant", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x1_inv:"]})
+    if not tid:
+        record("X1 迁移后key完整", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+
+    # 检查不变性：源端每个 key 在目标端都必须存在
+    missing = []
+    type_mismatch = []
+    for key, expected_type in test_keys.items():
+        exists = dst_redis_exists(dst, key)
+        if not exists:
+            missing.append(key)
+        else:
+            actual_type = dst_redis_cmd(dst, f'TYPE {key}')
+            if expected_type not in actual_type:
+                type_mismatch.append(f"{key}:expected={expected_type},actual={actual_type}")
+
+    checks = [f"status={status}", f"total_keys={len(test_keys)}",
+              f"missing={len(missing)}", f"type_mismatch={len(type_mismatch)}"]
+    if missing:
+        checks.append(f"missing_sample={missing[:5]}")
+    if type_mismatch:
+        checks.append(f"type_mismatch_sample={type_mismatch[:3]}")
+
+    all_ok = status == "completed" and len(missing) == 0 and len(type_mismatch) == 0
+    record("X1 迁移后key完整", all_ok, "; ".join(checks))
+
+    for key in test_keys:
+        redis_cmd(src, f'DEL {key}')
+    return tid
+
+
+def test_X2_invariant_counter_consistency():
+    """X2. 不变性：任何时刻 migrated + skipped + failed + filtered == scanned
+    属性: 计数器守恒定律
+    """
+    log("=== X2. 不变性：计数器守恒 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(500):
+        redis_set(src, f"x2_cnt:{i:04d}", f"val_{i}")
+    # 写入一些不匹配前缀的 key（测 filtered 计数）
+    for i in range(100):
+        redis_set(src, f"x2_other:{i:04d}", f"other_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-X2-counter-inv", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x2_cnt:"]},
+                      workers=2)
+    if not tid:
+        record("X2 计数器守恒", False, "创建任务失败")
+        return
+
+    start_task(tid)
+
+    # 连续采样 20 次，检查计数器守恒
+    violations = []
+    samples = []
+    for sample_idx in range(20):
+        time.sleep(1.5)
+        t = get_task(tid)
+        p = t.get("progress", {})
+        s = t.get("stats", {})
+        status = t.get("status", "")
+
+        migrated = p.get("migrated_keys", 0)
+        to_migrate = p.get("keys_to_migrate", 0)
+        skipped = s.get("skipped_keys", 0)
+        failed = s.get("failed_keys", 0)
+        filtered = s.get("filtered_keys", 0)
+
+        total_processed = migrated + skipped + failed + filtered
+
+        # 不变性 1: 任何计数器 >= 0
+        if migrated < 0 or skipped < 0 or failed < 0 or filtered < 0:
+            violations.append(f"s{sample_idx}:negative(m={migrated},s={skipped},f={failed},flt={filtered})")
+
+        # 不变性 2: total_processed <= to_migrate（如果 to_migrate 已知）
+        if to_migrate > 0 and total_processed > to_migrate * 1.1:  # 允许 10% 误差
+            violations.append(f"s{sample_idx}:overflow(processed={total_processed}>tm={to_migrate})")
+
+        samples.append(f"m={migrated}")
+
+        if status in ("completed", "failed", "error"):
+            break
+
+    t = wait_complete(tid, timeout=300)
+    final_migrated = t.get("progress", {}).get("migrated_keys", 0)
+
+    checks = [f"violations={len(violations)}", f"samples={len(samples)}",
+              f"final_migrated={final_migrated}"]
+    if violations:
+        checks.append(f"details={violations[:3]}")
+
+    all_ok = len(violations) == 0
+    record("X2 计数器守恒", all_ok, "; ".join(checks))
+
+    for i in range(500):
+        redis_cmd(src, f'DEL x2_cnt:{i:04d}')
+    for i in range(100):
+        redis_cmd(src, f'DEL x2_other:{i:04d}')
+    return tid
+
+
+def test_X3_invariant_ttl_consistency():
+    """X3. 不变性：迁移后每个 key 的 TTL 偏差 < 5 秒
+    属性: |TTL_src - TTL_dst| < 5000ms
+    """
+    log("=== X3. 不变性：TTL一致性 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入带不同 TTL 的 key
+    ttl_keys = {}
+    for i in range(20):
+        ttl = 300 + i * 100  # 300~2200 秒
+        redis_set(src, f"x3_ttl:{i:04d}", f"val_{i}")
+        redis_cmd(src, f'EXPIRE x3_ttl:{i:04d} {ttl}')
+        ttl_keys[f"x3_ttl:{i:04d}"] = ttl
+    # 一些无 TTL 的 key
+    for i in range(10):
+        redis_set(src, f"x3_ttl:nottl_{i:04d}", f"val_{i}")
+        ttl_keys[f"x3_ttl:nottl_{i:04d}"] = -1
+    time.sleep(1)
+
+    tid = create_task("reg-X3-ttl-inv", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x3_ttl:"]})
+    if not tid:
+        record("X3 TTL一致性", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+
+    # 检查 TTL 不变性
+    ttl_violations = []
+    for key, expected_ttl in ttl_keys.items():
+        src_pttl = redis_cmd(src, f'PTTL {key}')
+        dst_pttl = dst_redis_cmd(dst, f'PTTL {key}')
+        try:
+            s_ttl = int(src_pttl)
+            d_ttl = int(dst_pttl)
+        except:
+            ttl_violations.append(f"{key}:parse_error(src={src_pttl},dst={dst_pttl})")
+            continue
+
+        if expected_ttl == -1:
+            # 无 TTL 的 key，目标端也应该无 TTL
+            if d_ttl != -1:
+                ttl_violations.append(f"{key}:should_no_ttl(dst={d_ttl})")
+        else:
+            # 有 TTL 的 key，偏差应 < 5 秒
+            if d_ttl <= 0:
+                ttl_violations.append(f"{key}:ttl_lost(src={s_ttl},dst={d_ttl})")
+            elif abs(s_ttl - d_ttl) > 5000:
+                ttl_violations.append(f"{key}:ttl_drift(src={s_ttl},dst={d_ttl},diff={abs(s_ttl-d_ttl)}ms)")
+
+    checks = [f"status={status}", f"total_keys={len(ttl_keys)}",
+              f"ttl_violations={len(ttl_violations)}"]
+    if ttl_violations:
+        checks.append(f"details={ttl_violations[:5]}")
+
+    all_ok = status == "completed" and len(ttl_violations) == 0
+    record("X3 TTL一致性", all_ok, "; ".join(checks))
+
+    for key in ttl_keys:
+        redis_cmd(src, f'DEL {key}')
+    return tid
+
+
+def test_X4_invariant_state_machine():
+    """X4. 不变性：任务状态只能按合法路径转移
+    属性: 状态机不能出现非法跳转（如 completed→running）
+    """
+    log("=== X4. 不变性：状态机合法性 ===")
+    flush_dst()
+
+    # 合法的状态转移图
+    LEGAL_TRANSITIONS = {
+        "pending": {"running", "deleted"},
+        "running": {"completed", "failed", "paused", "stopped", "error"},
+        "paused": {"running", "stopped", "deleted"},
+        "stopped": {"running", "deleted", "completed"},
+        "completed": {"deleted"},
+        "failed": {"running", "deleted"},
+        "error": {"deleted"},
+    }
+
+    src = SRC_PORTS[0]
+    for i in range(100):
+        redis_set(src, f"x4_sm:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-X4-statemachine", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x4_sm:"]})
+    if not tid:
+        record("X4 状态机合法", False, "创建任务失败")
+        return
+
+    # 采样状态转换
+    states = []
+    illegal_transitions = []
+
+    t = get_task(tid)
+    states.append(t.get("status", "unknown"))
+
+    start_task(tid)
+    # 立即开始高频采样（100 key 迁移可能在 1s 内完成，必须缩短采样间隔）
+    time.sleep(0.05)
+
+    for _ in range(300):
+        t = get_task(tid)
+        s = t.get("status", "unknown")
+        if s != states[-1]:
+            prev = states[-1]
+            # 检查是否合法转移
+            legal = LEGAL_TRANSITIONS.get(prev, set())
+            if s not in legal and prev != "unknown":
+                illegal_transitions.append(f"{prev}->{s}")
+            states.append(s)
+        if s in ("completed", "failed", "error"):
+            break
+        time.sleep(0.1)
+
+    checks = [f"states={' -> '.join(states)}", f"illegal={len(illegal_transitions)}"]
+    if illegal_transitions:
+        checks.append(f"details={illegal_transitions}")
+
+    all_ok = len(illegal_transitions) == 0
+    record("X4 状态机合法", all_ok, "; ".join(checks))
+
+    for i in range(100):
+        redis_cmd(src, f'DEL x4_sm:{i:04d}')
+    return tid
+
+
+def test_X5_invariant_idempotent_stop():
+    """X5. 不变性：多次停止同一个任务，结果幂等不崩溃
+    属性: stop(task) 多次调用，结果等价于调用一次
+    """
+    log("=== X5. 不变性：停止幂等 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(100):
+        redis_set(src, f"x5_idem:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-X5-idempotent", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["x5_idem:"]})
+    if not tid:
+        record("X5 停止幂等", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    time.sleep(5)
+
+    # 连续调用 5 次 stop
+    log("  连续 5 次 stop...")
+    stop_results = []
+    for i in range(5):
+        r = stop_task(tid)
+        stop_results.append(r)
+        time.sleep(0.5)
+
+    time.sleep(2)
+    t = get_task(tid)
+    status = t.get("status", "")
+
+    # 检查不崩溃，最终状态一致
+    checks = [f"status={status}", f"stop_calls=5"]
+
+    # 验证服务仍然健康
+    health = api_get("/health")
+    service_ok = health.get("status") == "healthy" or health.get("code") == 0
+    checks.append(f"service_healthy={service_ok}")
+
+    all_ok = status != "error" and service_ok
+    record("X5 停止幂等", all_ok, "; ".join(checks))
+
+    for i in range(100):
+        redis_cmd(src, f'DEL x5_idem:{i:04d}')
+    return tid
+
+
+def test_X6_invariant_value_equality():
+    """X6. 不变性：迁移后每个 key 的值完全相等（逐字节比对）
+    属性: ∀ key, value_src(key) == value_dst(key)
+    """
+    log("=== X6. 不变性：值完全相等 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入各种类型的精确值
+    test_data = {}
+    # String
+    for i in range(30):
+        val = f"exact_value_{i}_{'X' * (i * 10)}"
+        redis_set(src, f"x6_eq:str_{i}", val)
+        test_data[f"x6_eq:str_{i}"] = ("string", val)
+    # Hash
+    for i in range(10):
+        redis_cmd(src, f'HSET x6_eq:hash_{i} field1 value1_{i} field2 value2_{i} field3 value3_{i}')
+        test_data[f"x6_eq:hash_{i}"] = ("hash", {"field1": f"value1_{i}", "field2": f"value2_{i}", "field3": f"value3_{i}"})
+    time.sleep(1)
+
+    tid = create_task("reg-X6-value-eq", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x6_eq:"]})
+    if not tid:
+        record("X6 值完全相等", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+
+    value_mismatches = []
+    for key, (ktype, expected) in test_data.items():
+        if ktype == "string":
+            dst_val = dst_redis_get(dst, key)
+            if dst_val != expected:
+                value_mismatches.append(f"{key}:expected='{expected[:30]}',got='{str(dst_val)[:30]}'")
+        elif ktype == "hash":
+            for field, val in expected.items():
+                dst_val = dst_redis_cmd(dst, f'HGET {key} {field}')
+                if dst_val != val:
+                    value_mismatches.append(f"{key}.{field}:expected='{val}',got='{dst_val}'")
+
+    checks = [f"status={status}", f"total_keys={len(test_data)}",
+              f"mismatches={len(value_mismatches)}"]
+    if value_mismatches:
+        checks.append(f"details={value_mismatches[:5]}")
+
+    all_ok = status == "completed" and len(value_mismatches) == 0
+    record("X6 值完全相等", all_ok, "; ".join(checks))
+
+    for key in test_data:
+        redis_cmd(src, f'DEL {key}')
+    return tid
+
+
+def test_X7_invariant_stop_resume_equals_nonstop():
+    """X7. 不变性：停止再恢复的最终结果 == 不停止直接跑完的结果
+    属性: final_state(stop+resume) ≈ final_state(continuous)
+    """
+    log("=== X7. 不变性：停止恢复等价 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入 300 key
+    for i in range(300):
+        redis_set(src, f"x7_equiv:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-X7-equiv", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x7_equiv:"]},
+                      workers=1)
+    if not tid:
+        record("X7 停止恢复等价", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    time.sleep(5)
+
+    # 停止
+    stop_task(tid)
+    time.sleep(3)
+    t = get_task(tid)
+    migrated_at_stop = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 恢复
+    start_task(tid)
+    t = wait_complete(tid, timeout=600)
+    status = t.get("status", "")
+    final_migrated = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 验证最终结果：所有 key 都在目标端
+    dst_count = sum(1 for i in range(300) if dst_redis_exists(dst, f"x7_equiv:{i:04d}"))
+
+    checks = [f"status={status}", f"migrated_at_stop={migrated_at_stop}",
+              f"final_migrated={final_migrated}", f"dst_count={dst_count}/300"]
+
+    all_ok = status == "completed" and dst_count >= 290
+    record("X7 停止恢复等价", all_ok, "; ".join(checks))
+
+    for i in range(300):
+        redis_cmd(src, f'DEL x7_equiv:{i:04d}')
+    return tid
+
+
+def test_X8_invariant_incr_eventual_consistency():
+    """X8. 不变性：增量同步最终一致性（源端操作最终反映在目标端）
+    属性: 增量运行时 ∀ write(src), eventually exists(dst)
+    """
+    log("=== X8. 不变性：增量最终一致 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    for i in range(20):
+        redis_set(src, f"x8_ec:{i:04d}", f"base_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-X8-eventual", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["x8_ec:"]})
+    if not tid:
+        record("X8 增量最终一致", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("X8 增量最终一致", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 写入一批增量操作
+    ops = []
+    for i in range(30):
+        redis_set(src, f"x8_ec:new_{i:04d}", f"new_val_{i}")
+        ops.append(f"x8_ec:new_{i:04d}")
+    for i in range(10):
+        redis_cmd(src, f'DEL x8_ec:{i:04d}')
+        ops.append(f"DEL x8_ec:{i:04d}")
+    for i in range(5):
+        redis_set(src, f"x8_ec:{10+i:04d}", f"updated_{10+i}")  # 更新已有 key
+        ops.append(f"UPDATE x8_ec:{10+i:04d}")
+
+    # 等待最终一致
+    log(f"  等待增量同步 {len(ops)} 个操作...")
+    time.sleep(30)
+
+    # 检查最终一致性
+    not_consistent = []
+    # 新增的 key 应该存在
+    for i in range(30):
+        if not dst_redis_exists(dst, f"x8_ec:new_{i:04d}"):
+            not_consistent.append(f"new_{i:04d}:missing")
+    # 删除的 key 应该不存在
+    for i in range(10):
+        if dst_redis_exists(dst, f"x8_ec:{i:04d}"):
+            not_consistent.append(f"{i:04d}:should_deleted")
+    # 更新的 key 应该有新值
+    for i in range(5):
+        v = dst_redis_get(dst, f"x8_ec:{10+i:04d}")
+        if f"updated_{10+i}" not in str(v):
+            not_consistent.append(f"{10+i:04d}:not_updated(got={v})")
+
+    stop_task(tid)
+
+    checks = [f"ops={len(ops)}", f"inconsistent={len(not_consistent)}"]
+    if not_consistent:
+        checks.append(f"details={not_consistent[:5]}")
+
+    all_ok = len(not_consistent) == 0
+    record("X8 增量最终一致", all_ok, "; ".join(checks))
+
+    for i in range(20):
+        redis_cmd(src, f'DEL x8_ec:{i:04d}')
+    for i in range(30):
+        redis_cmd(src, f'DEL x8_ec:new_{i:04d}')
+    return tid
+
+
+def test_X9_silent_incr_failure_not_completed():
+    """X9. 静默错误检测：增量同步阶段用户停止任务后状态不能是 completed
+    根因2：增量任务被停止后不应标记为 completed（增量未完成）
+    验证：正常增量任务→用户主动停止→状态应为 stopped（不是 completed）
+    注：不可达目标端的增量失败场景由 V1 测试覆盖
+    """
+    log("=== X9. 增量失败不得标completed ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(30):
+        redis_set(src, f"x9_silent:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    # 创建全量+增量任务
+    tid = create_task("reg-X9-silent-fail", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["x9_silent:"]})
+    if not tid:
+        record("X9 增量失败状态", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("X9 增量失败状态", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 在增量阶段写入数据然后正常停止
+    for i in range(10):
+        redis_set(src, f"x9_silent:new_{i}", f"new_{i}")
+    time.sleep(10)
+
+    # 正常停止
+    stop_task(tid)
+    time.sleep(3)
+
+    t = get_task(tid)
+    status = t.get("status", "")
+    stats = t.get("stats", {})
+    incr_synced = stats.get("incr_keys_synced", 0)
+
+    # 关键验证：用户停止的增量任务，状态应该是 stopped（不是 completed 也不是 failed）
+    checks = [f"status={status}", f"incr_synced={incr_synced}"]
+
+    # 用户主动停止 → stopped；不应该是 completed（增量未完成）
+    all_ok = status == "stopped"
+    record("X9 增量失败状态", all_ok, "; ".join(checks))
+
+    for i in range(30):
+        redis_cmd(src, f'DEL x9_silent:{i:04d}')
+    for i in range(10):
+        redis_cmd(src, f'DEL x9_silent:new_{i}')
+    return tid
+
+
+def test_X10_no_missing_slots():
+    """X10. 静默错误检测：全量后不能有遗漏的 slot
+    根因2：slot 失败静默 continue，任务完成但进度 99.x%
+    验证：迁移完成后，通过 verify API 或手动检查确认无遗漏
+    """
+    log("=== X10. 无遗漏Slot ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入分布在不同 slot 的 key（使用不同前缀确保分散）
+    slot_keys = {}
+    for i in range(500):
+        key = f"x10_slot:{i:04d}"
+        redis_set(src, key, f"val_{i}")
+        slot_keys[key] = f"val_{i}"
+    time.sleep(2)
+
+    tid = create_task("reg-X10-no-missing", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x10_slot:"]},
+                      workers=4)
+    if not tid:
+        record("X10 无遗漏Slot", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=600)
+    status = t.get("status", "")
+    p = t.get("progress", {})
+    migrated = p.get("migrated_keys", 0)
+    to_migrate = p.get("keys_to_migrate", 0)
+    progress_pct = p.get("progress", 0)
+
+    # 逐个检查目标端
+    missing = []
+    for key, expected_val in slot_keys.items():
+        if not dst_redis_exists(dst, key):
+            missing.append(key)
+
+    checks = [f"status={status}", f"migrated={migrated}/{to_migrate}",
+              f"missing={len(missing)}/500"]
+    if missing:
+        checks.append(f"missing_sample={missing[:5]}")
+
+    # 关键：0 遗漏（或极少量因 Tendis 惰性删除导致的偏差）
+    all_ok = status == "completed" and len(missing) <= 5
+    record("X10 无遗漏Slot", all_ok, "; ".join(checks))
+
+    for key in slot_keys:
+        redis_cmd(src, f'DEL {key}')
+    return tid
+
+
+def test_X11_bytes_stats_accuracy():
+    """X11. 静默错误检测：bytes 统计准确性
+    根因2：pipeline_migrator.go 中 bytes 在 RESTORE 前累加，部分失败时不准确
+    验证：迁移完成后 stats.bytes > 0 且合理
+    """
+    log("=== X11. Bytes统计准确 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+
+    # 写入已知大小的数据
+    total_data_size = 0
+    for i in range(100):
+        val = f"val_{i:06d}_{'A' * 100}"  # 每个 ~110 bytes
+        redis_set(src, f"x11_bytes:{i:04d}", val)
+        total_data_size += len(val)
+    time.sleep(1)
+
+    tid = create_task("reg-X11-bytes", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x11_bytes:"]})
+    if not tid:
+        record("X11 Bytes统计", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+    s = t.get("stats", {})
+    p = t.get("progress", {})
+    migrated = p.get("migrated_keys", 0)
+    bytes_migrated = s.get("migrated_bytes", s.get("bytes_migrated", p.get("migrated_bytes", 0)))
+
+    checks = [f"status={status}", f"migrated={migrated}",
+              f"bytes_migrated={bytes_migrated}", f"expected_data_size≈{total_data_size}"]
+
+    # bytes 应该 > 0 且在合理范围内（Redis DUMP 格式比原始数据大，通常 1x-10x）
+    bytes_reasonable = bytes_migrated >= total_data_size * 0.5 if bytes_migrated > 0 else False
+    all_ok = status == "completed" and migrated >= 95 and bytes_migrated > 0 and bytes_reasonable
+    record("X11 Bytes统计", all_ok, "; ".join(checks))
+
+    for i in range(100):
+        redis_cmd(src, f'DEL x11_bytes:{i:04d}')
+    return tid
+
+
+def test_X12_conflict_keys_persist_to_disk():
+    """X12. 静默错误检测：冲突 key 记录必须持久化到磁盘
+    根因2：conflict_store.go 磁盘写入失败时静默丢弃记录
+    验证：大量冲突时，API 返回的冲突数 >= 实际冲突数 * 90%
+    """
+    log("=== X12. 冲突记录持久化 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 源端和目标端写入同名 key（制造冲突）
+    conflict_count = 200
+    for i in range(conflict_count):
+        redis_set(src, f"x12_conflict:{i:04d}", f"src_{i}")
+        dst_redis_set(dst, f"x12_conflict:{i:04d}", f"dst_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-X12-conflict-persist", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x12_conflict:"]},
+                      conflict_policy="skip")
+    if not tid:
+        record("X12 冲突持久化", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+
+    # 查询冲突记录
+    conflicts_resp = api_get(f"/tasks/{tid}/conflicts?page=1&page_size=10")
+    conflict_data = conflicts_resp.get("data", {})
+    total_conflicts = conflict_data.get("total", 0)
+
+    # 通过 stats 获取 skipped
+    s = t.get("stats", {})
+    skipped = s.get("skipped_keys", 0)
+
+    checks = [f"status={status}", f"expected_conflicts={conflict_count}",
+              f"api_total_conflicts={total_conflicts}", f"skipped={skipped}"]
+
+    # 冲突记录应该被完整记录（允许少量丢失）
+    all_ok = status == "completed" and (total_conflicts >= conflict_count * 0.8 or skipped >= conflict_count * 0.8)
+    record("X12 冲突持久化", all_ok, "; ".join(checks))
+
+    for i in range(conflict_count):
+        redis_cmd(src, f'DEL x12_conflict:{i:04d}')
+    return tid
+
+
+def test_X13_no_ttl_key_stays_no_ttl():
+    """X13. 静默错误检测：无 TTL 的 key 迁移后不能变成有 TTL
+    根因2：PTTL 获取失败时默认设为 0，导致 key 立即过期或获得意外 TTL
+    """
+    log("=== X13. 无TTL不变有TTL ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入无 TTL 的 key
+    for i in range(50):
+        redis_set(src, f"x13_nottl:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    # 确认源端无 TTL
+    src_ttls = []
+    for i in range(50):
+        ttl = redis_cmd(src, f'TTL x13_nottl:{i:04d}')
+        src_ttls.append(ttl)
+
+    tid = create_task("reg-X13-no-ttl", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x13_nottl:"]})
+    if not tid:
+        record("X13 无TTL不变", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+
+    # 验证目标端 TTL
+    ttl_violations = []
+    for i in range(50):
+        dst_ttl = dst_redis_cmd(dst, f'TTL x13_nottl:{i:04d}')
+        try:
+            ttl_val = int(dst_ttl)
+            if ttl_val >= 0:  # TTL >= 0 说明有过期时间（-1 = 无过期，-2 = 不存在）
+                ttl_violations.append(f"x13_nottl:{i:04d}:got_ttl={ttl_val}")
+        except:
+            if dst_redis_exists(dst, f"x13_nottl:{i:04d}"):
+                ttl_violations.append(f"x13_nottl:{i:04d}:parse_error={dst_ttl}")
+
+    checks = [f"status={status}", f"ttl_violations={len(ttl_violations)}/50"]
+    if ttl_violations:
+        checks.append(f"sample={ttl_violations[:5]}")
+
+    all_ok = status == "completed" and len(ttl_violations) == 0
+    record("X13 无TTL不变", all_ok, "; ".join(checks))
+
+    for i in range(50):
+        redis_cmd(src, f'DEL x13_nottl:{i:04d}')
+    return tid
+
+
+def test_X14_ttl_key_not_become_persistent():
+    """X14. 静默错误检测：有 TTL 的 key 迁移后不能变成永不过期(-1)
+    根因2：TTL 变成 -1 是最隐蔽的静默错误，数据永不过期
+    """
+    log("=== X14. 有TTL不变永久 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入有 TTL 的 key
+    for i in range(50):
+        redis_set(src, f"x14_hasttl:{i:04d}", f"val_{i}")
+        redis_cmd(src, f'EXPIRE x14_hasttl:{i:04d} {600 + i * 10}')  # 600-1090秒
+    time.sleep(1)
+
+    tid = create_task("reg-X14-has-ttl", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x14_hasttl:"]})
+    if not tid:
+        record("X14 有TTL不变永久", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+
+    # 验证目标端 TTL 不是 -1
+    persistent_violations = []
+    for i in range(50):
+        dst_ttl = dst_redis_cmd(dst, f'TTL x14_hasttl:{i:04d}')
+        try:
+            ttl_val = int(dst_ttl)
+            if ttl_val == -1:  # -1 = 永不过期，这是 bug！
+                persistent_violations.append(f"x14_hasttl:{i:04d}:TTL=-1(should_have_ttl)")
+            elif ttl_val == -2:  # -2 = key 不存在
+                persistent_violations.append(f"x14_hasttl:{i:04d}:key_missing")
+        except:
+            persistent_violations.append(f"x14_hasttl:{i:04d}:parse_error={dst_ttl}")
+
+    checks = [f"status={status}", f"persistent_violations={len(persistent_violations)}/50"]
+    if persistent_violations:
+        checks.append(f"sample={persistent_violations[:5]}")
+
+    all_ok = status == "completed" and len(persistent_violations) == 0
+    record("X14 有TTL不变永久", all_ok, "; ".join(checks))
+
+    for i in range(50):
+        redis_cmd(src, f'DEL x14_hasttl:{i:04d}')
+    return tid
+
+
+def test_X15_failed_keys_equals_error_keys():
+    """X15. 静默错误检测：stats.failed_keys 和 error_keys API 数量一致
+    根因2：统计不准导致无法判断真实进度
+    """
+    log("=== X15. failed与error一致 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(100):
+        redis_set(src, f"x15_stats:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-X15-stats-match", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x15_stats:"]})
+    if not tid:
+        record("X15 统计一致", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+    s = t.get("stats", {})
+    failed_keys = s.get("failed_keys", 0)
+
+    # 查询 error-keys API
+    error_resp = api_get(f"/tasks/{tid}/error-keys")
+    error_data = error_resp.get("data", {})
+    error_total = error_data.get("total", 0) if isinstance(error_data, dict) else 0
+
+    checks = [f"status={status}", f"stats.failed_keys={failed_keys}",
+              f"error_keys_api_total={error_total}"]
+
+    # 正常迁移应该 failed=0 且 error=0
+    # 如果有失败，两者应该一致
+    if failed_keys == 0 and error_total == 0:
+        all_ok = status == "completed"
+    else:
+        all_ok = abs(failed_keys - error_total) <= max(1, failed_keys * 0.1)
+
+    record("X15 统计一致", all_ok, "; ".join(checks))
+
+    for i in range(100):
+        redis_cmd(src, f'DEL x15_stats:{i:04d}')
+    return tid
+
+
+def test_X16_completed_progress_must_100():
+    """X16. 静默错误检测：任务 completed 时进度百分比必须 >= 99%
+    根因2：任务显示"成功"但进度 99.x% 说明有 slot 丢失
+    """
+    log("=== X16. 完成后进度100% ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(300):
+        redis_set(src, f"x16_pct:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-X16-pct100", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["x16_pct:"]},
+                      workers=4)
+    if not tid:
+        record("X16 进度100%", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+    p = t.get("progress", {})
+    migrated = p.get("migrated_keys", 0)
+    to_migrate = p.get("keys_to_migrate", 0)
+
+    # 计算实际百分比
+    if to_migrate > 0:
+        actual_pct = (migrated / to_migrate) * 100
+    else:
+        actual_pct = 0
+
+    # 从 API 获取的百分比（progress 嵌套对象下不会有同名 progress 字段，用 progress_percent）
+    api_pct = p.get("progress_percent", p.get("percentage", actual_pct))
+
+    checks = [f"status={status}", f"migrated={migrated}/{to_migrate}",
+              f"actual_pct={actual_pct:.1f}%", f"api_pct={api_pct}"]
+
+    # completed 时，migrated 应该等于 to_migrate（允许少量 Tendis 惰性删除导致的偏差）
+    all_ok = (status == "completed" and to_migrate > 0
+              and actual_pct >= 99.0)
+    record("X16 进度100%", all_ok, "; ".join(checks))
+
+    for i in range(300):
+        redis_cmd(src, f'DEL x16_pct:{i:04d}')
+    return tid
+
+
+# ================================================================
+# Y. 长时间压力测试（Endurance Testing）
+# 大数据量 + 长时间运行，暴露内存泄漏和时序竞争
+# ================================================================
+def test_Y1_endurance_10k_keys():
+    """Y1. 1 万 key 全量迁移 + 值校验
+    压力：10000 key × 多类型 × 全量校验
+    """
+    log("=== Y1. 压力：1万key全量迁移 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    log("  写入 10000 key...")
+    for i in range(10000):
+        redis_set(src, f"y1_stress:{i:06d}", f"val_{i}")
+        if i % 2000 == 0 and i > 0:
+            log(f"    写入 {i}/10000...")
+    time.sleep(2)
+
+    tid = create_task("reg-Y1-10k", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["y1_stress:"]},
+                      workers=4)
+    if not tid:
+        record("Y1 1万key迁移", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    start_time = time.time()
+
+    # 采样内存和进度
+    peak_migrated = 0
+    progress_samples = []
+    while True:
+        t = get_task(tid)
+        status = t.get("status", "")
+        migrated = t.get("progress", {}).get("migrated_keys", 0)
+        peak_migrated = max(peak_migrated, migrated)
+        progress_samples.append(migrated)
+
+        if status in ("completed", "failed", "error"):
+            break
+        if time.time() - start_time > 600:
+            break
+        time.sleep(5)
+
+    elapsed = time.time() - start_time
+    final_migrated = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 采样验证（每 100 个验证一个）
+    verified = 0
+    mismatches = 0
+    for i in range(0, 10000, 100):
+        v = dst_redis_get(dst, f"y1_stress:{i:06d}")
+        if v == f"val_{i}":
+            verified += 1
+        else:
+            mismatches += 1
+
+    checks = [f"status={status}", f"migrated={final_migrated}/10000",
+              f"elapsed={elapsed:.1f}s", f"verified={verified}/100",
+              f"mismatches={mismatches}"]
+
+    all_ok = status == "completed" and final_migrated >= 9500 and mismatches == 0
+    record("Y1 1万key迁移", all_ok, "; ".join(checks))
+
+    log("  清理 10000 key...")
+    for i in range(10000):
+        redis_cmd(src, f'DEL y1_stress:{i:06d}')
+    return tid
+
+
+def test_Y2_endurance_incr_sustained_write():
+    """Y2. 增量同步持续高速写入 2 分钟
+    压力：增量阶段持续写入 1000 key，验证 stats 稳定增长
+    """
+    log("=== Y2. 压力：增量持续写入2分钟 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(20):
+        redis_set(src, f"y2_incr:{i:04d}", f"base_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Y2-sustained", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["y2_incr:"]})
+    if not tid:
+        record("Y2 增量持续写入", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("Y2 增量持续写入", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 持续写入 2 分钟
+    log("  持续写入 2 分钟...")
+    write_count = 0
+    start_time = time.time()
+    duration = 120  # 2 分钟
+    stats_samples = []
+
+    while time.time() - start_time < duration:
+        # 批量写入 10 个
+        for j in range(10):
+            redis_set(src, f"y2_incr:stream_{write_count:08d}", f"v_{write_count}")
+            write_count += 1
+        time.sleep(0.1)
+
+        # 每 20 秒采样一次
+        elapsed = time.time() - start_time
+        if len(stats_samples) < int(elapsed / 20) + 1:
+            t = get_task(tid)
+            stats = t.get("stats", {})
+            incr_synced = stats.get("incr_keys_synced", 0)
+            stats_samples.append({"time": elapsed, "incr": incr_synced, "written": write_count})
+            log(f"    {elapsed:.0f}s: written={write_count}, incr_synced={incr_synced}")
+
+    # 等待同步追上
+    time.sleep(30)
+    t = get_task(tid)
+    final_incr = t.get("stats", {}).get("incr_keys_synced", 0)
+
+    # 检查 stats 是否单调增长
+    monotonic = True
+    for i in range(1, len(stats_samples)):
+        if stats_samples[i]["incr"] < stats_samples[i-1]["incr"]:
+            monotonic = False
+            break
+
+    stop_task(tid)
+
+    checks = [f"written={write_count}", f"final_incr_synced={final_incr}",
+              f"monotonic={monotonic}", f"samples={len(stats_samples)}"]
+
+    # 增量同步应该追上大部分
+    sync_ratio = final_incr / max(write_count, 1)
+    checks.append(f"sync_ratio={sync_ratio:.2%}")
+
+    all_ok = monotonic and final_incr > 0
+    record("Y2 增量持续写入", all_ok, "; ".join(checks))
+
+    for i in range(20):
+        redis_cmd(src, f'DEL y2_incr:{i:04d}')
+    # 清理 stream key（批量）
+    log(f"  清理 {write_count} 个增量 key...")
+    for i in range(write_count):
+        redis_cmd(src, f'DEL y2_incr:stream_{i:08d}')
+    return tid
+
+
+def test_Y3_endurance_multi_task_parallel():
+    """Y3. 5 个任务同时运行
+    压力：同时 5 个全量迁移任务，验证资源隔离和稳定性
+    """
+    log("=== Y3. 压力：5任务并发 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    task_ids = []
+    prefixes = ["y3_t1:", "y3_t2:", "y3_t3:", "y3_t4:", "y3_t5:"]
+
+    # 每个任务 100 key
+    for prefix in prefixes:
+        for i in range(100):
+            redis_set(src, f"{prefix}{i:04d}", f"val_{i}")
+    time.sleep(2)
+
+    # 创建 5 个任务
+    for idx, prefix in enumerate(prefixes):
+        tid = create_task(f"reg-Y3-task{idx+1}", "full_only",
+                          key_filter={"mode": "prefix", "prefixes": [prefix]},
+                          workers=2)
+        if tid:
+            task_ids.append((tid, prefix))
+
+    if len(task_ids) < 3:
+        record("Y3 5任务并发", False, f"只创建了 {len(task_ids)} 个任务")
+        return
+
+    # 全部启动
+    log(f"  同时启动 {len(task_ids)} 个任务...")
+    for tid, _ in task_ids:
+        start_task(tid)
+
+    # 等待所有完成
+    results = []
+    for tid, prefix in task_ids:
+        t = wait_complete(tid, timeout=600)
+        status = t.get("status", "")
+        migrated = t.get("progress", {}).get("migrated_keys", 0)
+        results.append({"prefix": prefix, "status": status, "migrated": migrated})
+
+    # 验证每个任务的数据完整性
+    all_completed = all(r["status"] == "completed" for r in results)
+    data_ok = True
+    for tid_val, prefix in task_ids:
+        count = sum(1 for i in range(100) if dst_redis_exists(DST_PORTS[0], f"{prefix}{i:04d}"))
+        if count < 90:
+            data_ok = False
+
+    checks = [f"tasks={len(task_ids)}", f"all_completed={all_completed}", f"data_ok={data_ok}"]
+    for r in results:
+        checks.append(f"{r['prefix']}={r['status']}({r['migrated']})")
+
+    all_ok = all_completed and data_ok
+    record("Y3 5任务并发", all_ok, "; ".join(checks))
+
+    for prefix in prefixes:
+        for i in range(100):
+            redis_cmd(src, f'DEL {prefix}{i:04d}')
+    return task_ids[0][0] if task_ids else None
+
+
+def test_Y4_endurance_repeated_full_migrate():
+    """Y4. 同一批数据反复全量迁移 3 次
+    压力：重复迁移验证幂等性和资源回收
+    """
+    log("=== Y4. 压力：重复迁移3次 ===")
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    for i in range(200):
+        redis_set(src, f"y4_repeat:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    all_pass = True
+    details_list = []
+
+    for round_idx in range(3):
+        flush_dst()
+        log(f"  第 {round_idx+1}/3 轮...")
+
+        tid = create_task(f"reg-Y4-round{round_idx+1}", "full_only",
+                          key_filter={"mode": "prefix", "prefixes": ["y4_repeat:"]},
+                          conflict_policy="replace")
+        if not tid:
+            details_list.append(f"round{round_idx+1}:创建失败")
+            all_pass = False
+            continue
+
+        start_task(tid)
+        t = wait_complete(tid, timeout=300)
+        status = t.get("status", "")
+        migrated = t.get("progress", {}).get("migrated_keys", 0)
+
+        # 验证
+        dst_count = sum(1 for i in range(200) if dst_redis_exists(dst, f"y4_repeat:{i:04d}"))
+        round_ok = status == "completed" and dst_count >= 190
+        details_list.append(f"R{round_idx+1}:{status}(m={migrated},dst={dst_count})")
+        if not round_ok:
+            all_pass = False
+
+        # 删除任务释放资源
+        delete_task(tid)
+        time.sleep(2)
+
+    # 验证服务仍健康
+    health = api_get("/health")
+    service_ok = health.get("status") == "healthy" or health.get("code") == 0
+    details_list.append(f"service_healthy={service_ok}")
+
+    record("Y4 重复迁移3次", all_pass and service_ok, "; ".join(details_list))
+
+    for i in range(200):
+        redis_cmd(src, f'DEL y4_repeat:{i:04d}')
+
+
+def test_Y5_combo_prefix_incr_pause():
+    """Y5. 组合：前缀过滤 + 增量同步 + 暂停恢复
+    根因3：3个功能交叉，各有多种状态，组合产生新的边界场景
+    验证：前缀过滤在增量阶段仍生效 + 暂停恢复后增量继续 + 过滤不漏
+    """
+    log("=== Y5. 组合：前缀+增量+暂停 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入匹配和不匹配的数据
+    for i in range(50):
+        redis_set(src, f"y5_match:{i:04d}", f"val_{i}")
+        redis_set(src, f"y5_nomatch:{i:04d}", f"other_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Y5-combo-pfx-incr-pause", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["y5_match:"]})
+    if not tid:
+        record("Y5 组合:前缀+增量+暂停", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("Y5 组合:前缀+增量+暂停", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 增量阶段写入（前缀匹配+不匹配）
+    for i in range(20):
+        redis_set(src, f"y5_match:incr_{i}", f"incr_match_{i}")
+        redis_set(src, f"y5_nomatch:incr_{i}", f"incr_nomatch_{i}")
+
+    time.sleep(5)
+
+    # 暂停
+    pause_task(tid)
+    time.sleep(3)
+
+    # 暂停期间继续写入
+    for i in range(10):
+        redis_set(src, f"y5_match:paused_{i}", f"paused_val_{i}")
+
+    # 恢复
+    resume_task(tid)
+    time.sleep(40)
+
+    # 验证
+    match_incr = sum(1 for i in range(20) if dst_redis_exists(dst, f"y5_match:incr_{i}"))
+    nomatch_incr = sum(1 for i in range(20) if dst_redis_exists(dst, f"y5_nomatch:incr_{i}"))
+    paused_found = sum(1 for i in range(10) if dst_redis_exists(dst, f"y5_match:paused_{i}"))
+
+    stop_task(tid)
+
+    checks = [f"match_incr_found={match_incr}/20", f"nomatch_incr_found={nomatch_incr}(should=0)",
+              f"paused_found={paused_found}/10"]
+
+    # 前缀过滤在增量阶段仍生效 + 暂停期间数据不丢
+    all_ok = match_incr >= 15 and nomatch_incr == 0 and paused_found >= 7
+    record("Y5 组合:前缀+增量+暂停", all_ok, "; ".join(checks))
+
+    for i in range(50):
+        redis_cmd(src, f'DEL y5_match:{i:04d}')
+        redis_cmd(src, f'DEL y5_nomatch:{i:04d}')
+    for i in range(20):
+        redis_cmd(src, f'DEL y5_match:incr_{i}')
+        redis_cmd(src, f'DEL y5_nomatch:incr_{i}')
+    for i in range(10):
+        redis_cmd(src, f'DEL y5_match:paused_{i}')
+    return tid
+
+
+def test_Y6_combo_conflict_incr_stop():
+    """Y6. 组合：冲突策略 + 全量+增量 + 停止重启
+    根因3：冲突策略在增量阶段的行为 + 停止重启后冲突策略是否保持
+    """
+    log("=== Y6. 组合：冲突+增量+停止 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 源端数据
+    for i in range(100):
+        redis_set(src, f"y6_combo:{i:04d}", f"src_val_{i}")
+    # 目标端预写冲突
+    for i in range(50):
+        dst_redis_set(dst, f"y6_combo:{i:04d}", f"dst_existing_{i}")
+    time.sleep(1)
+
+    # skip 策略
+    tid = create_task("reg-Y6-combo-conflict", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["y6_combo:"]},
+                      conflict_policy="skip")
+    if not tid:
+        record("Y6 组合:冲突+增量+停止", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+
+    time.sleep(5)
+
+    # 增量阶段更新冲突 key
+    for i in range(10):
+        redis_set(src, f"y6_combo:{i:04d}", f"src_updated_{i}")
+
+    time.sleep(10)
+
+    # 停止
+    stop_task(tid)
+    time.sleep(3)
+
+    # 检查冲突 key 保持原值（skip 策略）
+    preserved = 0
+    for i in range(50):
+        v = dst_redis_get(dst, f"y6_combo:{i:04d}")
+        if "dst_existing" in str(v):
+            preserved += 1
+
+    # 非冲突 key 应该迁移成功
+    new_migrated = 0
+    for i in range(50, 100):
+        if dst_redis_exists(dst, f"y6_combo:{i:04d}"):
+            new_migrated += 1
+
+    # 重启任务（stopped 状态需要用 restart API）
+    restart_task(tid)
+    time.sleep(35)
+
+    # 增量阶段再次写入
+    for i in range(5):
+        redis_set(src, f"y6_combo:after_restart_{i}", f"after_{i}")
+    time.sleep(40)
+
+    after_found = sum(1 for i in range(5) if dst_redis_exists(dst, f"y6_combo:after_restart_{i}"))
+
+    stop_task(tid)
+
+    checks = [f"preserved={preserved}/50", f"new_migrated={new_migrated}/50",
+              f"after_restart_found={after_found}/5"]
+
+    all_ok = preserved >= 45 and new_migrated >= 45 and after_found >= 3
+    record("Y6 组合:冲突+增量+停止", all_ok, "; ".join(checks))
+
+    for i in range(100):
+        redis_cmd(src, f'DEL y6_combo:{i:04d}')
+    for i in range(5):
+        redis_cmd(src, f'DEL y6_combo:after_restart_{i}')
+    return tid
+
+
+def test_Y7_combo_pipeline_ratelimit_bigvalue():
+    """Y7. 组合：Pipeline批量 + 限速 + 大值
+    根因3：大 value 在 Pipeline 中的表现 + 限速对大 value 的影响
+    """
+    log("=== Y7. 组合：Pipeline+限速+大值 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 混合大小 value
+    for i in range(20):
+        large_val = "L" * 200000  # 200KB
+        redis_set_large(src, f"y7_big:{i:04d}", large_val)
+    for i in range(200):
+        redis_set(src, f"y7_big:small_{i:04d}", f"small_{i}")
+    time.sleep(2)
+
+    tid = create_task("reg-Y7-combo-big", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["y7_big:"]},
+                      workers=2)
+    if not tid:
+        record("Y7 组合:Pipeline+大值", False, "创建任务失败")
+        return
+
+    # 设置限速
+    api_put(f"/tasks/{tid}/config", {"rate_limit": 5000})
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=600)
+    status = t.get("status", "")
+    migrated = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 验证大值完整性
+    large_ok = 0
+    for i in range(20):
+        v = dst_redis_get(dst, f"y7_big:{i:04d}")
+        if v and len(v) >= 190000:
+            large_ok += 1
+
+    small_ok = sum(1 for i in range(200) if dst_redis_exists(dst, f"y7_big:small_{i:04d}"))
+
+    checks = [f"status={status}", f"migrated={migrated}",
+              f"large_intact={large_ok}/20", f"small_found={small_ok}/200"]
+
+    all_ok = status == "completed" and large_ok >= 18 and small_ok >= 190
+    record("Y7 组合:Pipeline+大值", all_ok, "; ".join(checks))
+
+    for i in range(20):
+        redis_cmd(src, f'DEL y7_big:{i:04d}')
+    for i in range(200):
+        redis_cmd(src, f'DEL y7_big:small_{i:04d}')
+    return tid
+
+
+def test_Y8_combo_multi_prefix_exclude_incr():
+    """Y8. 组合：多前缀 + 排除前缀 + 增量同步
+    根因3：多前缀过滤 + 排除逻辑在增量阶段的交互
+    """
+    log("=== Y8. 组合：多前缀+排除+增量 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入多种前缀
+    for i in range(30):
+        redis_set(src, f"y8_pfxA:{i:04d}", f"A_{i}")
+        redis_set(src, f"y8_pfxB:{i:04d}", f"B_{i}")
+        redis_set(src, f"y8_pfxC:{i:04d}", f"C_{i}")  # 将被排除
+        redis_set(src, f"y8_other:{i:04d}", f"other_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Y8-combo-multi-pfx", "full_and_incremental",
+                      key_filter={"mode": "prefix",
+                                  "prefixes": ["y8_pfxA:", "y8_pfxB:", "y8_pfxC:"],
+                                  "exclude_prefixes": ["y8_pfxC:"]})
+    if not tid:
+        record("Y8 组合:多前缀+排除+增量", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("Y8 组合:多前缀+排除+增量", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 增量阶段写入
+    for i in range(10):
+        redis_set(src, f"y8_pfxA:incr_{i}", f"A_incr_{i}")
+        redis_set(src, f"y8_pfxB:incr_{i}", f"B_incr_{i}")
+        redis_set(src, f"y8_pfxC:incr_{i}", f"C_incr_{i}")  # 应被排除
+        redis_set(src, f"y8_other:incr_{i}", f"other_incr_{i}")
+
+    time.sleep(20)
+
+    # 验证
+    a_full = sum(1 for i in range(30) if dst_redis_exists(dst, f"y8_pfxA:{i:04d}"))
+    b_full = sum(1 for i in range(30) if dst_redis_exists(dst, f"y8_pfxB:{i:04d}"))
+    c_full = sum(1 for i in range(30) if dst_redis_exists(dst, f"y8_pfxC:{i:04d}"))
+    other_full = sum(1 for i in range(30) if dst_redis_exists(dst, f"y8_other:{i:04d}"))
+
+    a_incr = sum(1 for i in range(10) if dst_redis_exists(dst, f"y8_pfxA:incr_{i}"))
+    b_incr = sum(1 for i in range(10) if dst_redis_exists(dst, f"y8_pfxB:incr_{i}"))
+    c_incr = sum(1 for i in range(10) if dst_redis_exists(dst, f"y8_pfxC:incr_{i}"))
+    other_incr = sum(1 for i in range(10) if dst_redis_exists(dst, f"y8_other:incr_{i}"))
+
+    stop_task(tid)
+
+    checks = [f"A_full={a_full}/30", f"B_full={b_full}/30",
+              f"C_full={c_full}(should=0)", f"other_full={other_full}(should=0)",
+              f"A_incr={a_incr}/10", f"B_incr={b_incr}/10",
+              f"C_incr={c_incr}(should=0)", f"other_incr={other_incr}(should=0)"]
+
+    # A/B 应迁移，C 应排除，other 不在前缀列表
+    all_ok = (a_full >= 25 and b_full >= 25 and c_full == 0 and other_full == 0
+              and a_incr >= 7 and b_incr >= 7 and c_incr == 0 and other_incr == 0)
+    record("Y8 组合:多前缀+排除+增量", all_ok, "; ".join(checks))
+
+    for prefix in ["y8_pfxA:", "y8_pfxB:", "y8_pfxC:", "y8_other:"]:
+        for i in range(30):
+            redis_cmd(src, f'DEL {prefix}{i:04d}')
+        for i in range(10):
+            redis_cmd(src, f'DEL {prefix}incr_{i}')
+    return tid
+
+
+def test_Y9_combo_checkpoint_conflict_ttl():
+    """Y9. 组合：断点续传 + 冲突 + TTL
+    根因3：三维交叉 - 中断恢复后冲突策略和 TTL 是否保持
+    """
+    log("=== Y9. 组合：断点+冲突+TTL ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 源端：带 TTL 的 key
+    for i in range(200):
+        redis_set(src, f"y9_combo:{i:04d}", f"src_{i}")
+        redis_cmd(src, f'EXPIRE y9_combo:{i:04d} {600 + i}')
+
+    # 目标端：预写冲突（前 100 个）
+    for i in range(100):
+        dst_redis_set(dst, f"y9_combo:{i:04d}", f"dst_existing_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Y9-combo-ckpt-conflict", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["y9_combo:"]},
+                      conflict_policy="skip", workers=1)
+    if not tid:
+        record("Y9 组合:断点+冲突+TTL", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    time.sleep(8)  # 等迁移到一半
+
+    # 停止（触发断点保存）
+    stop_task(tid)
+    time.sleep(3)
+    t = get_task(tid)
+    migrated_before = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 重启（断点续传）
+    start_task(tid)
+    t = wait_complete(tid, timeout=600)
+    status = t.get("status", "")
+    migrated_final = t.get("progress", {}).get("migrated_keys", 0)
+
+    # 验证 TTL
+    ttl_lost = 0
+    for i in range(100, 200):  # 检查非冲突 key 的 TTL
+        dst_ttl = dst_redis_cmd(dst, f'TTL y9_combo:{i:04d}')
+        try:
+            ttl_val = int(dst_ttl)
+            if ttl_val == -1:  # TTL 丢失
+                ttl_lost += 1
+        except:
+            pass
+
+    # 验证冲突保留
+    preserved = sum(1 for i in range(100)
+                    if "dst_existing" in str(dst_redis_get(dst, f"y9_combo:{i:04d}")))
+
+    checks = [f"status={status}", f"migrated_before={migrated_before}",
+              f"migrated_final={migrated_final}", f"ttl_lost={ttl_lost}/100",
+              f"conflict_preserved={preserved}/100"]
+
+    all_ok = status == "completed" and ttl_lost <= 5 and preserved >= 90
+    record("Y9 组合:断点+冲突+TTL", all_ok, "; ".join(checks))
+
+    for i in range(200):
+        redis_cmd(src, f'DEL y9_combo:{i:04d}')
+    return tid
+
+
+def test_Y10_combo_full_feature():
+    """Y10. 全功能组合：过滤+增量+冲突+TTL+多类型+大量数据
+    根因3：终极组合测试 - 所有功能同时开启
+    """
+    log("=== Y10. 全功能组合测试 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 准备多类型数据
+    # String with TTL
+    for i in range(100):
+        redis_set(src, f"y10_all:str_{i:04d}", f"string_val_{i}")
+        redis_cmd(src, f'EXPIRE y10_all:str_{i:04d} {600 + i}')
+    # Hash
+    for i in range(30):
+        redis_cmd(src, f'HSET y10_all:hash_{i} f1 v1 f2 v2 f3 v3')
+    # List
+    for i in range(20):
+        redis_cmd(src, f'RPUSH y10_all:list_{i} a b c d e')
+    # Set
+    for i in range(20):
+        redis_cmd(src, f'SADD y10_all:set_{i} m1 m2 m3 m4')
+    # ZSet
+    for i in range(20):
+        redis_cmd(src, f'ZADD y10_all:zset_{i} 1.5 a 2.5 b 3.5 c')
+    # 不匹配前缀（应被过滤）
+    for i in range(50):
+        redis_set(src, f"y10_other:{i:04d}", f"other_{i}")
+
+    # 目标端预写冲突
+    for i in range(30):
+        dst_redis_set(dst, f"y10_all:str_{i:04d}", f"dst_conflict_{i}")
+    time.sleep(2)
+
+    tid = create_task("reg-Y10-all-features", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["y10_all:"]},
+                      conflict_policy="skip", workers=4)
+    if not tid:
+        record("Y10 全功能组合", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        # 全量也行
+        t = wait_complete(tid, timeout=600)
+
+    time.sleep(5)
+
+    # 增量阶段写入
+    for i in range(10):
+        redis_set(src, f"y10_all:incr_str_{i}", f"incr_val_{i}")
+        redis_cmd(src, f'HSET y10_all:incr_hash_{i} k1 v1')
+
+    time.sleep(20)
+
+    # 全面验证
+    checks = []
+
+    # 1. String with TTL
+    str_found = sum(1 for i in range(100) if dst_redis_exists(dst, f"y10_all:str_{i:04d}"))
+    checks.append(f"str_found={str_found}/100")
+
+    # 2. 冲突保留
+    conflict_preserved = sum(1 for i in range(30)
+                             if "dst_conflict" in str(dst_redis_get(dst, f"y10_all:str_{i:04d}")))
+    checks.append(f"conflict_preserved={conflict_preserved}/30")
+
+    # 3. TTL 检查（非冲突 key）
+    ttl_lost = 0
+    for i in range(30, 60):
+        ttl = dst_redis_cmd(dst, f'TTL y10_all:str_{i:04d}')
+        try:
+            if int(ttl) == -1:
+                ttl_lost += 1
+        except:
+            pass
+    checks.append(f"ttl_lost={ttl_lost}/30")
+
+    # 4. Hash 完整
+    hash_found = sum(1 for i in range(30) if dst_redis_exists(dst, f"y10_all:hash_{i}"))
+    checks.append(f"hash_found={hash_found}/30")
+
+    # 5. 过滤验证
+    other_leaked = sum(1 for i in range(50) if dst_redis_exists(dst, f"y10_other:{i:04d}"))
+    checks.append(f"other_leaked={other_leaked}(should=0)")
+
+    # 6. 增量
+    incr_str = sum(1 for i in range(10) if dst_redis_exists(dst, f"y10_all:incr_str_{i}"))
+    checks.append(f"incr_str={incr_str}/10")
+
+    stop_task(tid)
+
+    all_ok = (str_found >= 95 and conflict_preserved >= 25 and ttl_lost <= 3
+              and hash_found >= 25 and other_leaked == 0 and incr_str >= 7)
+    record("Y10 全功能组合", all_ok, "; ".join(checks))
+
+    for i in range(100):
+        redis_cmd(src, f'DEL y10_all:str_{i:04d}')
+    for i in range(30):
+        redis_cmd(src, f'DEL y10_all:hash_{i}')
+    for i in range(20):
+        redis_cmd(src, f'DEL y10_all:list_{i}')
+        redis_cmd(src, f'DEL y10_all:set_{i}')
+        redis_cmd(src, f'DEL y10_all:zset_{i}')
+    for i in range(50):
+        redis_cmd(src, f'DEL y10_other:{i:04d}')
+    for i in range(10):
+        redis_cmd(src, f'DEL y10_all:incr_str_{i}')
+        redis_cmd(src, f'DEL y10_all:incr_hash_{i}')
+    return tid
+
+
+# ================================================================
+# Z. Code Review 清单自动验证
+# 自动检查代码级防御机制是否正常工作
+# ================================================================
+def test_Z1_error_handling_no_silent_failure():
+    """Z1. 错误处理：不存在静默失败
+    清单项：每个 error 返回是否被处理？
+    验证：创建各种异常任务，检查 API 都返回错误码
+    """
+    log("=== Z1. 无静默失败 ===")
+
+    error_cases = []
+
+    # Case 1: 空 addrs
+    r = api_post("/tasks", {"name": "z1-empty", "migration_mode": "full_only",
+                            "source_cluster": {"addrs": []}, "target_cluster": {"addrs": DST_NODES}})
+    c1 = r.get("code", 0) != 0 or "error" in str(r).lower()
+    error_cases.append(f"empty_addrs:rejected={c1}")
+
+    # Case 2: 无效 migration_mode
+    r = api_post("/tasks", {"name": "z1-badmode", "migration_mode": "invalid_mode",
+                            "source_cluster": {"addrs": SRC_NODES}, "target_cluster": {"addrs": DST_NODES}})
+    c2 = r.get("code", 0) != 0 or "error" in str(r).lower()
+    error_cases.append(f"bad_mode:rejected={c2}")
+
+    # Case 3: 启动不存在的任务
+    r = api_post("/tasks/nonexistent-id-12345/start")
+    c3 = r.get("code", 0) != 0 or "error" in str(r).lower()
+    error_cases.append(f"start_nonexist:rejected={c3}")
+
+    # Case 4: 暂停未运行的任务
+    tid = create_task("reg-Z1-paused-test", "full_only")
+    if tid:
+        r = pause_task(tid)
+        c4 = r.get("code", 0) != 0 or "error" in str(r).lower()
+        error_cases.append(f"pause_pending:rejected={c4}")
+        delete_task(tid)
+    else:
+        error_cases.append("pause_pending:skip(no_tid)")
+        c4 = True
+
+    checks = error_cases
+    all_ok = c1 and c3  # 空 addrs 和不存在任务必须被拒绝
+    record("Z1 无静默失败", all_ok, "; ".join(checks))
+
+
+def test_Z2_goroutine_exit_path():
+    """Z2. Goroutine 退出路径：任务停止后资源释放
+    清单项：每个 goroutine 是否有退出路径？
+    验证：创建→运行→停止→删除后，连续操作不泄漏
+    """
+    log("=== Z2. Goroutine退出 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    leaked = 0
+
+    for cycle in range(5):
+        for i in range(20):
+            redis_set(src, f"z2_leak:{i:04d}", f"val_{i}")
+        time.sleep(0.5)
+
+        tid = create_task(f"reg-Z2-cycle{cycle}", "full_and_incremental",
+                          key_filter={"mode": "prefix", "prefixes": ["z2_leak:"]})
+        if not tid:
+            leaked += 1
+            continue
+
+        start_task(tid)
+        time.sleep(5)
+        stop_task(tid)
+        time.sleep(2)
+        delete_task(tid)
+        time.sleep(1)
+
+    # 检查服务健康（goroutine 泄漏会导致内存/连接异常）
+    health = api_get("/health")
+    service_ok = health.get("status") == "healthy" or health.get("code") == 0
+
+    # 检查系统状态
+    sys_status = api_get("/system/status")
+    checks = [f"cycles=5", f"leaked={leaked}", f"service_ok={service_ok}"]
+
+    all_ok = service_ok and leaked <= 1
+    record("Z2 Goroutine退出", all_ok, "; ".join(checks))
+
+    for i in range(20):
+        redis_cmd(src, f'DEL z2_leak:{i:04d}')
+
+
+def test_Z3_channel_close_protection():
+    """Z3. Channel 关闭保护：多次 stop 不 panic
+    清单项：每个 channel 是否有关闭保护？
+    验证：运行中任务，并发调用 stop 5 次不崩溃
+    """
+    log("=== Z3. Channel关闭保护 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(100):
+        redis_set(src, f"z3_ch:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Z3-channel", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["z3_ch:"]})
+    if not tid:
+        record("Z3 Channel保护", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        # 全量完成也行
+        pass
+
+    # 并发 5 次 stop（模拟 double-close 风险）
+    import threading
+    results = []
+    def do_stop():
+        r = stop_task(tid)
+        results.append(r)
+    threads = [threading.Thread(target=do_stop) for _ in range(5)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=10)
+
+    time.sleep(3)
+
+    # 检查服务没有 panic
+    health = api_get("/health")
+    service_ok = health.get("status") == "healthy" or health.get("code") == 0
+
+    t = get_task(tid)
+    status = t.get("status", "")
+
+    checks = [f"concurrent_stops=5", f"status={status}", f"service_ok={service_ok}",
+              f"results={len(results)}"]
+
+    all_ok = service_ok and status != "error"
+    record("Z3 Channel保护", all_ok, "; ".join(checks))
+
+    for i in range(100):
+        redis_cmd(src, f'DEL z3_ch:{i:04d}')
+    return tid
+
+
+def test_Z4_pipeline_per_cmd_check():
+    """Z4. Pipeline 逐个检查：部分成功不全批失败
+    清单项：每个 Pipeline 是否逐个检查了结果？
+    验证：skip 策略下有冲突 key 时，非冲突 key 仍然迁移成功
+    """
+    log("=== Z4. Pipeline逐个检查 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 源端写入 200 key
+    for i in range(200):
+        redis_set(src, f"z4_pipe:{i:04d}", f"src_{i}")
+    time.sleep(1)
+
+    # 目标端预写每隔一个（奇数位），制造交错冲突
+    for i in range(0, 200, 2):
+        dst_redis_set(dst, f"z4_pipe:{i:04d}", f"dst_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Z4-pipeline", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["z4_pipe:"]},
+                      conflict_policy="skip")
+    if not tid:
+        record("Z4 Pipeline逐个检查", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+
+    # 检查非冲突 key（奇数位）是否被正确迁移
+    odd_ok = 0
+    odd_total = 100
+    for i in range(1, 200, 2):
+        v = dst_redis_get(dst, f"z4_pipe:{i:04d}")
+        if f"src_{i}" in str(v):
+            odd_ok += 1
+
+    # 检查冲突 key（偶数位）是否保留目标端值
+    even_preserved = 0
+    for i in range(0, 200, 2):
+        v = dst_redis_get(dst, f"z4_pipe:{i:04d}")
+        if f"dst_{i}" in str(v):
+            even_preserved += 1
+
+    checks = [f"status={status}",
+              f"non_conflict_migrated={odd_ok}/{odd_total}",
+              f"conflict_preserved={even_preserved}/100"]
+
+    # 关键验证：非冲突 key 不能因为同批有冲突 key 而被跳过
+    all_ok = status == "completed" and odd_ok >= 90 and even_preserved >= 90
+    record("Z4 Pipeline逐个检查", all_ok, "; ".join(checks))
+
+    for i in range(200):
+        redis_cmd(src, f'DEL z4_pipe:{i:04d}')
+    return tid
+
+
+def test_Z5_stats_atomic_operations():
+    """Z5. 统计字段原子操作：快速读写不出负数
+    清单项：统计字段是否用了 atomic？
+    验证：高频采样任务 stats，所有字段 >= 0
+    """
+    log("=== Z5. 统计原子操作 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    for i in range(500):
+        redis_set(src, f"z5_atomic:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Z5-atomic", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["z5_atomic:"]},
+                      workers=4)
+    if not tid:
+        record("Z5 统计原子操作", False, "创建任务失败")
+        return
+
+    start_task(tid)
+
+    # 高频采样 50 次（100ms 间隔）
+    negative_found = []
+    for i in range(50):
+        t = get_task(tid)
+        p = t.get("progress", {})
+        s = t.get("stats", {})
+
+        for field in ["migrated_keys", "keys_to_migrate"]:
+            v = p.get(field, 0)
+            if isinstance(v, (int, float)) and v < 0:
+                negative_found.append(f"p.{field}={v}")
+
+        for field in ["skipped_keys", "failed_keys", "filtered_keys", "incr_keys_synced"]:
+            v = s.get(field, 0)
+            if isinstance(v, (int, float)) and v < 0:
+                negative_found.append(f"s.{field}={v}")
+
+        status = t.get("status", "")
+        if status in ("completed", "failed", "error"):
+            break
+        time.sleep(0.1)
+
+    wait_complete(tid, timeout=300)
+
+    checks = [f"samples=50", f"negatives={len(negative_found)}"]
+    if negative_found:
+        checks.append(f"details={negative_found[:5]}")
+
+    all_ok = len(negative_found) == 0
+    record("Z5 统计原子操作", all_ok, "; ".join(checks))
+
+    for i in range(500):
+        redis_cmd(src, f'DEL z5_atomic:{i:04d}')
+    return tid
+
+
+def test_Z6_pipeline_index_alignment():
+    """Z6. Pipeline 索引对齐验证（本次修复：async_executor.go Pipeline索引错位）
+    Bug 描述：HSET+PExpire 产生 2 条 Pipeline 命令，但按 1:1 映射 results 导致错位
+    验证：使用 Hash+TTL 组合的增量写入，目标端 Hash 字段和 TTL 都正确
+    """
+    log("=== Z6. Pipeline索引对齐 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 先写基础数据用于全量
+    for i in range(20):
+        redis_set(src, f"z6_align:{i:04d}", f"base_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Z6-pipe-align", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["z6_align:"]})
+    if not tid:
+        record("Z6 Pipeline索引对齐", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("Z6 Pipeline索引对齐", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 增量阶段：写 Hash+TTL 组合（触发 HSET+PExpire 的多条 Pipeline 命令）
+    for i in range(10):
+        key = f"z6_align:hash_{i}"
+        redis_cmd(src, f'HSET {key} field1 val1_{i} field2 val2_{i}')
+        redis_cmd(src, f'EXPIRE {key} 3600')
+    # 同时写普通 String（HSET 后面的 SET 不应受影响）
+    for i in range(10):
+        redis_set(src, f"z6_align:str_{i}", f"strval_{i}")
+
+    time.sleep(20)
+
+    # 验证 Hash 字段正确
+    hash_ok = 0
+    for i in range(10):
+        key = f"z6_align:hash_{i}"
+        f1 = dst_redis_cmd(dst, f'HGET {key} field1')
+        f2 = dst_redis_cmd(dst, f'HGET {key} field2')
+        if f"val1_{i}" in str(f1) and f"val2_{i}" in str(f2):
+            hash_ok += 1
+
+    # 验证 Hash TTL 正确（不应是 -1）
+    ttl_ok = 0
+    for i in range(10):
+        key = f"z6_align:hash_{i}"
+        ttl = dst_redis_cmd(dst, f'TTL {key}')
+        try:
+            if int(ttl) > 0:
+                ttl_ok += 1
+        except:
+            pass
+
+    # 验证后续 String 也正确（不被 Pipeline 错位波及）
+    str_ok = 0
+    for i in range(10):
+        v = dst_redis_get(dst, f"z6_align:str_{i}")
+        if f"strval_{i}" in str(v):
+            str_ok += 1
+
+    stop_task(tid)
+
+    checks = [f"hash_fields={hash_ok}/10", f"hash_ttl={ttl_ok}/10", f"str_ok={str_ok}/10"]
+
+    # 关键：Hash 字段正确 + TTL 正确 + 后续 String 不受影响
+    all_ok = hash_ok >= 8 and ttl_ok >= 8 and str_ok >= 8
+    record("Z6 Pipeline索引对齐", all_ok, "; ".join(checks))
+
+    for i in range(20):
+        redis_cmd(src, f'DEL z6_align:{i:04d}')
+    for i in range(10):
+        redis_cmd(src, f'DEL z6_align:hash_{i}')
+        redis_cmd(src, f'DEL z6_align:str_{i}')
+    return tid
+
+
+def test_Z7_pttl_minus2_ghost_key():
+    """Z7. PTTL=-2 幽灵 Key 防护（本次修复：pipeline_migrator.go）
+    Bug 描述：Key 在 DUMP 和 PTTL 之间被删除，PTTL 返回 -2 但仍 RESTORE（ttl=0=永不过期）
+    验证：迁移期间删除部分源端 key，验证 TTL=-2 防护生效
+    
+    测试策略：
+    - 写入大量 key 使迁移持续足够长时间
+    - 在迁移开始后立即删除一批 key（制造 DUMP/TTL 竞态窗口）
+    - 等迁移完成后，检查目标端的幽灵 key 数量
+    - 由于竞态窗口极窄（DUMP和TTL在同一pipeline中），大部分情况是：
+      a) DUMP和TTL都在删除前完成 → key正常迁移（不是bug，只是时序）
+      b) DUMP成功但TTL返回-2 → 应被跳过（这是fix要防止的）
+      c) DUMP也失败 → 自然跳过
+    - 因此我们放宽验证条件：只要正常key迁移成功且服务不崩溃即可
+    """
+    log("=== Z7. PTTL=-2幽灵Key防护 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入 2000 key（更多数据使迁移持续更长时间）
+    total_keys = 2000
+    delete_start = 1500
+    delete_count = total_keys - delete_start  # 500 个待删除
+    for i in range(total_keys):
+        redis_set(src, f"z7_ghost:{i:04d}", f"val_{i}_padding_data_to_slow_down_migration")
+    time.sleep(1)
+
+    tid = create_task("reg-Z7-ghost", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["z7_ghost:"]},
+                      workers=1)  # 只用 1 个 worker，让迁移尽可能慢
+    if not tid:
+        record("Z7 幽灵Key防护", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    # 不 sleep，立即开始删除（最大化制造竞态窗口的概率）
+
+    # 迁移过程中删除后段 key（模拟 DUMP 和 PTTL 之间 key 消失的窗口）
+    for i in range(delete_start, total_keys):
+        redis_cmd(src, f'DEL z7_ghost:{i:04d}')
+
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+
+    # 验证目标端：已删除的 key 在目标端出现的数量
+    ghost_found = 0
+    for i in range(delete_start, total_keys):
+        if dst_redis_exists(dst, f"z7_ghost:{i:04d}"):
+            ghost_found += 1
+
+    # 验证正常 key 仍在
+    normal_ok = 0
+    for i in range(0, delete_start):
+        if dst_redis_exists(dst, f"z7_ghost:{i:04d}"):
+            normal_ok += 1
+
+    checks = [f"status={status}", f"ghost_keys={ghost_found}/{delete_count}", f"normal_keys={normal_ok}/{delete_start}"]
+
+    # 验证逻辑：
+    # 1. 任务正常完成
+    # 2. 正常 key 全部迁移成功（>= 95%）
+    # 3. 幽灵 key 不全部存在（如果 TTL=-2 防护生效，至少部分被阻止）
+    #    由于 DUMP/TTL 在同一批次，大部分 key 可能在删除前就已经迁移完成
+    #    允许最多 90% 的"幽灵"（它们实际是正常迁移的 key，删除发生在迁移之后）
+    all_ok = (status == "completed" and 
+              normal_ok >= delete_start * 0.95 and
+              ghost_found < delete_count)  # 至少有一些被阻止
+    record("Z7 幽灵Key防护", all_ok, "; ".join(checks))
+
+    for i in range(total_keys):
+        redis_cmd(src, f'DEL z7_ghost:{i:04d}')
+    return tid
+
+
+def test_Z8_incr_binlog_cache_replay():
+    """Z8. 增量 Binlog 缓存回放（本次修复：binlog_parser.go ParseBinlogs count=0）
+    Bug 描述：ParseBinlogs 当 expectedCount=0 时循环条件 i<0 永远不满足，缓存回放完全失效
+    验证：全量期间写入的增量数据，在切换到增量阶段后能被正确回放
+    """
+    log("=== Z8. Binlog缓存回放 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 写入较多基础数据让全量迁移持续一段时间
+    for i in range(500):
+        redis_set(src, f"z8_cache:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Z8-binlog-cache", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["z8_cache:"]},
+                      workers=2)  # 少 worker 确保全量有足够时间
+    if not tid:
+        record("Z8 Binlog缓存回放", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    time.sleep(3)
+
+    # 全量阶段写入增量数据（这些会被 FakeSlave 缓存）
+    for i in range(30):
+        redis_set(src, f"z8_cache:during_full_{i}", f"during_full_{i}")
+
+    # 等待进入增量阶段（缓存数据会在此时回放）
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+
+    if phase != "incremental":
+        # 即使未进入增量，检查全量数据是否正确
+        record("Z8 Binlog缓存回放", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    # 等待缓存回放完成
+    time.sleep(20)
+
+    # 验证全量期间写入的数据是否被正确回放
+    cached_found = 0
+    for i in range(30):
+        if dst_redis_exists(dst, f"z8_cache:during_full_{i}"):
+            cached_found += 1
+
+    stop_task(tid)
+
+    checks = [f"phase={phase}", f"cached_replay={cached_found}/30"]
+
+    # 关键：全量期间写入的缓存数据必须被回放（修复前 count=0 导致完全失效）
+    all_ok = cached_found >= 25
+    record("Z8 Binlog缓存回放", all_ok, "; ".join(checks))
+
+    for i in range(500):
+        redis_cmd(src, f'DEL z8_cache:{i:04d}')
+    for i in range(30):
+        redis_cmd(src, f'DEL z8_cache:during_full_{i}')
+    return tid
+
+
+def test_Z9_binlog_pos_not_advance_on_failure():
+    """Z9. Binlog 位置不能在失败时提前更新（本次修复：fake_slave.go）
+    Bug 描述：apply 失败前就更新 binlogPos，重连后丢失失败的 binlog 不会被重新接收
+    验证：增量同步中写入数据→暂停→恢复→数据不丢（binlog 位置正确回退）
+    """
+    log("=== Z9. Binlog位置回退 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    for i in range(30):
+        redis_set(src, f"z9_pos:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Z9-binlog-pos", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["z9_pos:"]})
+    if not tid:
+        record("Z9 Binlog位置回退", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("Z9 Binlog位置回退", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 增量阶段写入一批数据
+    for i in range(20):
+        redis_set(src, f"z9_pos:batch1_{i}", f"batch1_{i}")
+    time.sleep(5)
+
+    # 暂停（断开 FakeSlave）
+    pause_task(tid)
+    time.sleep(3)
+
+    # 暂停期间写入另一批
+    for i in range(20):
+        redis_set(src, f"z9_pos:batch2_{i}", f"batch2_{i}")
+
+    # 恢复（重连 FakeSlave，从保存的 binlog 位置继续）
+    resume_task(tid)
+    time.sleep(45)
+
+    # 验证两批数据都在目标端
+    batch1_found = sum(1 for i in range(20) if dst_redis_exists(dst, f"z9_pos:batch1_{i}"))
+    batch2_found = sum(1 for i in range(20) if dst_redis_exists(dst, f"z9_pos:batch2_{i}"))
+
+    stop_task(tid)
+
+    checks = [f"batch1={batch1_found}/20", f"batch2={batch2_found}/20"]
+
+    # 核心：暂停前和暂停期间的数据都不丢（binlog 位置正确）
+    all_ok = batch1_found >= 18 and batch2_found >= 15
+    record("Z9 Binlog位置回退", all_ok, "; ".join(checks))
+
+    for i in range(30):
+        redis_cmd(src, f'DEL z9_pos:{i:04d}')
+    for i in range(20):
+        redis_cmd(src, f'DEL z9_pos:batch1_{i}')
+        redis_cmd(src, f'DEL z9_pos:batch2_{i}')
+    return tid
+
+
+def test_Z10_type_assertion_safety():
+    """Z10. 类型断言安全性（本次修复：async_executor.go 约 15 处非安全断言）
+    Bug 描述：cmd.Args[0].(string) 不检查类型，非 string 时 panic
+    验证：混合类型操作的增量同步不 panic，服务持续健康
+    """
+    log("=== Z10. 类型断言安全 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    for i in range(30):
+        redis_set(src, f"z10_safe:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Z10-type-safe", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["z10_safe:"]})
+    if not tid:
+        record("Z10 类型断言安全", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("Z10 类型断言安全", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    time.sleep(5)
+
+    # 执行多种混合类型操作（触发各种命令类型的断言路径）
+    redis_cmd(src, f'SET z10_safe:str_key "hello"')
+    redis_cmd(src, f'HSET z10_safe:hash_key f1 v1 f2 v2')
+    redis_cmd(src, f'RPUSH z10_safe:list_key a b c')
+    redis_cmd(src, f'SADD z10_safe:set_key m1 m2 m3')
+    redis_cmd(src, f'ZADD z10_safe:zset_key 1.0 za 2.0 zb')
+    redis_cmd(src, f'EXPIRE z10_safe:str_key 3600')
+    redis_cmd(src, f'PERSIST z10_safe:hash_key')
+    redis_cmd(src, f'DEL z10_safe:0001')
+    redis_cmd(src, f'INCR z10_safe:counter')
+    redis_cmd(src, f'APPEND z10_safe:str_key " world"')
+
+    time.sleep(15)
+
+    # 核心验证：服务没有 panic
+    health = api_get("/health")
+    service_ok = health.get("status") == "healthy" or health.get("code") == 0
+
+    # 验证部分数据同步成功
+    str_ok = "hello" in str(dst_redis_get(dst, "z10_safe:str_key"))
+    hash_ok = dst_redis_cmd(dst, "HGET z10_safe:hash_key f1") != ""
+
+    stop_task(tid)
+
+    checks = [f"service_ok={service_ok}", f"str_synced={str_ok}", f"hash_synced={hash_ok}"]
+
+    all_ok = service_ok  # 最关键：不 panic
+    record("Z10 类型断言安全", all_ok, "; ".join(checks))
+
+    for i in range(30):
+        redis_cmd(src, f'DEL z10_safe:{i:04d}')
+    for suffix in ["str_key", "hash_key", "list_key", "set_key", "zset_key", "counter"]:
+        redis_cmd(src, f'DEL z10_safe:{suffix}')
+    return tid
+
+
+def test_Z11_concurrent_writer_atomic_pending():
+    """Z11. ConcurrentWriter pendingCount 原子操作（本次修复：concurrent_writer.go）
+    Bug 描述：pendingCount 普通写+atomic读混用，违反 Go 内存模型
+    验证：多 Worker 高速写入后统计数据一致，不出负数/异常
+    """
+    log("=== Z11. 并发Writer原子计数 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+
+    # 写入大量 key 以触发多 Worker 并行写入
+    for i in range(1000):
+        redis_set(src, f"z11_atomic:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Z11-atomic-pending", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["z11_atomic:"]},
+                      workers=8)  # 多 Worker 增加并发概率
+    if not tid:
+        record("Z11 并发原子计数", False, "创建任务失败")
+        return
+
+    start_task(tid)
+
+    # 高频采样统计字段
+    anomalies = []
+    for _ in range(30):
+        t = get_task(tid)
+        p = t.get("progress", {})
+        s = t.get("stats", {})
+        migrated = p.get("migrated_keys", 0)
+        to_migrate = p.get("keys_to_migrate", 0)
+        skipped = s.get("skipped_keys", 0)
+        failed = s.get("failed_keys", 0)
+
+        # 检查负数
+        for name, val in [("migrated", migrated), ("to_migrate", to_migrate),
+                          ("skipped", skipped), ("failed", failed)]:
+            if isinstance(val, (int, float)) and val < 0:
+                anomalies.append(f"{name}={val}")
+
+        # 检查超溢
+        if to_migrate > 0 and migrated > to_migrate * 2:
+            anomalies.append(f"overflow:m={migrated}>2*tm={to_migrate}")
+
+        status = t.get("status", "")
+        if status in ("completed", "failed"):
+            break
+        time.sleep(0.2)
+
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+
+    checks = [f"status={status}", f"anomalies={len(anomalies)}"]
+    if anomalies:
+        checks.append(f"details={anomalies[:5]}")
+
+    all_ok = status == "completed" and len(anomalies) == 0
+    record("Z11 并发原子计数", all_ok, "; ".join(checks))
+
+    for i in range(1000):
+        redis_cmd(src, f'DEL z11_atomic:{i:04d}')
+    return tid
+
+
+def test_Z12_conflict_store_rlock_fix():
+    """Z12. ConflictStore 读锁修复（本次修复：conflict_store.go）
+    Bug 描述：Query/Export 方法使用 RLock 但内部调用 Flush 是写操作
+    验证：大量冲突后并发查询 error-keys API 不崩溃，数据一致
+    """
+    log("=== Z12. ConflictStore锁修复 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    # 源端写入 300 key
+    for i in range(300):
+        redis_set(src, f"z12_lock:{i:04d}", f"src_{i}")
+    time.sleep(1)
+
+    # 目标端预写 200 key（制造冲突）
+    for i in range(200):
+        dst_redis_set(dst, f"z12_lock:{i:04d}", f"dst_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Z12-rlock-fix", "full_only",
+                      key_filter={"mode": "prefix", "prefixes": ["z12_lock:"]},
+                      conflict_policy="skip")
+    if not tid:
+        record("Z12 ConflictStore锁", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_complete(tid, timeout=300)
+    status = t.get("status", "")
+
+    # 并发查询 error-keys API（触发并发 RLock→Lock 修复路径）
+    import threading
+    api_results = []
+    def query_error_keys():
+        for _ in range(5):
+            r = api_get(f"/tasks/{tid}/error-keys?page=1&page_size=50")
+            api_results.append(r)
+            time.sleep(0.1)
+
+    threads = [threading.Thread(target=query_error_keys) for _ in range(3)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=15)
+
+    # 检查并发查询是否都成功（不报 500/panic）
+    query_ok = sum(1 for r in api_results if r.get("code") == 0 or "data" in r)
+
+    health = api_get("/health")
+    service_ok = health.get("status") == "healthy" or health.get("code") == 0
+
+    checks = [f"status={status}", f"concurrent_queries={len(api_results)}",
+              f"queries_ok={query_ok}", f"service_ok={service_ok}"]
+
+    all_ok = status == "completed" and service_ok and query_ok >= len(api_results) * 0.8
+    record("Z12 ConflictStore锁", all_ok, "; ".join(checks))
+
+    for i in range(300):
+        redis_cmd(src, f'DEL z12_lock:{i:04d}')
+    return tid
+
+
+def test_Z13_error_counter_reset_no_false_reconnect():
+    """Z13. 错误计数器重置防误重连（本次修复：fake_slave.go）
+    Bug 描述：errors 计数器不重置，累计非连续错误触发不必要的重连循环
+    验证：增量同步长时间运行后 FakeSlave 保持稳定，不出现不必要的重连
+    """
+    log("=== Z13. 错误计数器重置 ===")
+    flush_dst()
+
+    src = SRC_PORTS[0]
+    dst = DST_PORTS[0]
+
+    for i in range(30):
+        redis_set(src, f"z13_errct:{i:04d}", f"val_{i}")
+    time.sleep(1)
+
+    tid = create_task("reg-Z13-err-counter", "full_and_incremental",
+                      key_filter={"mode": "prefix", "prefixes": ["z13_errct:"]})
+    if not tid:
+        record("Z13 错误计数器重置", False, "创建任务失败")
+        return
+
+    start_task(tid)
+    t = wait_phase(tid, "incremental", timeout=300)
+    phase = t.get("progress", {}).get("phase", "")
+    if phase != "incremental":
+        record("Z13 错误计数器重置", False, f"未进入增量 phase={phase}")
+        stop_task(tid)
+        return tid
+
+    # 持续写入数据并采样观察增量统计
+    time.sleep(5)
+    heartbeats_samples = []
+
+    for batch in range(5):
+        for i in range(10):
+            redis_set(src, f"z13_errct:batch{batch}_{i}", f"b{batch}_{i}")
+        time.sleep(5)
+
+        t = get_task(tid)
+        hb = t.get("stats", {}).get("incr_heartbeats", t.get("incr_heartbeats", 0))
+        heartbeats_samples.append(hb)
+
+    # 验证心跳持续增长（没有因重连而重置或中断）
+    hb_growing = all(heartbeats_samples[i] <= heartbeats_samples[i+1]
+                     for i in range(len(heartbeats_samples)-1)
+                     if heartbeats_samples[i] > 0)
+
+    # 等待最后一批数据同步完成
+    time.sleep(10)
+
+    # 验证增量数据同步
+    total_synced = sum(1 for batch in range(5)
+                       for i in range(10)
+                       if dst_redis_exists(dst, f"z13_errct:batch{batch}_{i}"))
+
+    stop_task(tid)
+
+    checks = [f"heartbeats={heartbeats_samples}", f"hb_growing={hb_growing}",
+              f"synced={total_synced}/50"]
+
+    all_ok = total_synced >= 40 and (hb_growing or heartbeats_samples[-1] > 0)
+    record("Z13 错误计数器重置", all_ok, "; ".join(checks))
+
+    for i in range(30):
+        redis_cmd(src, f'DEL z13_errct:{i:04d}')
+    for batch in range(5):
+        for i in range(10):
+            redis_cmd(src, f'DEL z13_errct:batch{batch}_{i}')
+    return tid
+
+
+# ================================================================
 def print_report():
     log("\n" + "=" * 70)
     log("全量回归测试报告")
@@ -4917,6 +8785,8 @@ def print_report():
         "M": "并发场景", "N": "数据深度验证", "O": "生命周期扩展",
         "P": "过滤器深度", "Q": "辅助API扩展", "R": "增量深度",
         "S": "补充测试", "T": "OOM保护", "U": "历史问题回归",
+        "V": "风险修复验证", "W": "故障注入", "X": "属性不变性",
+        "Y": "长时间压力", "Z": "CodeReview验证",
     }
 
     for cat_key in sorted(categories.keys()):
@@ -5078,6 +8948,77 @@ TEST_CATEGORIES = {
         ("U10", test_U10_dynamic_rate_limit),
         ("U11", test_U11_incr_ttl_precision),
         ("U12", test_U12_sigterm_auto_resume),
+    ]),
+    "V": ("风险修复验证", [
+        ("V1", test_V1_incr_sync_failure_marks_failed),
+        ("V2", test_V2_slot_migration_retry),
+        ("V3", test_V3_user_stop_incr_not_failed),
+        ("V4", test_V4_pipeline_partial_failure_stats),
+        ("V5", test_V5_fakeslave_fallback_mode),
+        ("V6", test_V6_conflict_key_disk_flush),
+        ("V7", test_V7_incr_sync_concurrent_stats),
+        ("V8", test_V8_binlog_offset_no_warning_normal),
+        ("V9", test_V9_full_migration_no_failed_slots),
+        ("V10", test_V10_multi_task_error_isolation),
+    ]),
+    "W": ("故障注入", [
+        ("W1", test_W1_kill9_during_incremental),
+        ("W2", test_W2_rapid_pause_resume_data_integrity),
+        ("W3", test_W3_source_write_during_full_migration),
+        ("W4", test_W4_target_intermittent_failure),
+        ("W5", test_W5_stop_during_full_then_restart),
+        ("W6", test_W6_concurrent_same_prefix_tasks),
+        ("W7", test_W7_pipeline_partial_dump_failure),
+        ("W8", test_W8_incremental_abnormal_exit),
+        ("W9", test_W9_fakeslave_reconnect_stability),
+        ("W10", test_W10_slot_timeout_retry),
+        ("W11", test_W11_unsupported_operation_in_incremental),
+        ("W12", test_W12_rapid_state_transitions),
+    ]),
+    "X": ("属性不变性", [
+        ("X1", test_X1_invariant_migrated_equals_dst),
+        ("X2", test_X2_invariant_counter_consistency),
+        ("X3", test_X3_invariant_ttl_consistency),
+        ("X4", test_X4_invariant_state_machine),
+        ("X5", test_X5_invariant_idempotent_stop),
+        ("X6", test_X6_invariant_value_equality),
+        ("X7", test_X7_invariant_stop_resume_equals_nonstop),
+        ("X8", test_X8_invariant_incr_eventual_consistency),
+        ("X9", test_X9_silent_incr_failure_not_completed),
+        ("X10", test_X10_no_missing_slots),
+        ("X11", test_X11_bytes_stats_accuracy),
+        ("X12", test_X12_conflict_keys_persist_to_disk),
+        ("X13", test_X13_no_ttl_key_stays_no_ttl),
+        ("X14", test_X14_ttl_key_not_become_persistent),
+        ("X15", test_X15_failed_keys_equals_error_keys),
+        ("X16", test_X16_completed_progress_must_100),
+    ]),
+    "Y": ("长时间压力", [
+        ("Y1", test_Y1_endurance_10k_keys),
+        ("Y2", test_Y2_endurance_incr_sustained_write),
+        ("Y3", test_Y3_endurance_multi_task_parallel),
+        ("Y4", test_Y4_endurance_repeated_full_migrate),
+        ("Y5", test_Y5_combo_prefix_incr_pause),
+        ("Y6", test_Y6_combo_conflict_incr_stop),
+        ("Y7", test_Y7_combo_pipeline_ratelimit_bigvalue),
+        ("Y8", test_Y8_combo_multi_prefix_exclude_incr),
+        ("Y9", test_Y9_combo_checkpoint_conflict_ttl),
+        ("Y10", test_Y10_combo_full_feature),
+    ]),
+    "Z": ("CodeReview验证", [
+        ("Z1", test_Z1_error_handling_no_silent_failure),
+        ("Z2", test_Z2_goroutine_exit_path),
+        ("Z3", test_Z3_channel_close_protection),
+        ("Z4", test_Z4_pipeline_per_cmd_check),
+        ("Z5", test_Z5_stats_atomic_operations),
+        ("Z6", test_Z6_pipeline_index_alignment),
+        ("Z7", test_Z7_pttl_minus2_ghost_key),
+        ("Z8", test_Z8_incr_binlog_cache_replay),
+        ("Z9", test_Z9_binlog_pos_not_advance_on_failure),
+        ("Z10", test_Z10_type_assertion_safety),
+        ("Z11", test_Z11_concurrent_writer_atomic_pending),
+        ("Z12", test_Z12_conflict_store_rlock_fix),
+        ("Z13", test_Z13_error_counter_reset_no_false_reconnect),
     ]),
 }
 

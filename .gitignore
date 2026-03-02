@@ -52,3 +52,4 @@ __pycache__/
 # Test files
 snake-game/
 test_cluster_slots.go
+tendis-migrate-package/

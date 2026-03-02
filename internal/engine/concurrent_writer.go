@@ -182,11 +182,12 @@ func (w *ConcurrentWriter) Write(ctx context.Context, cmd *WriteCommand) error {
 		return err
 	}
 	
-	w.pendingCount[idx]++
+	// 【BUG-FIX】使用 atomic 写入 pendingCount，与 GetPendingCount 的 atomic 读保持一致
+	atomic.AddInt64(&w.pendingCount[idx], 1)
 	w.stats.totalCommands.Add(1)
 	
 	// 达到批量阈值时刷新
-	if w.pendingCount[idx] >= int64(w.batchSize) {
+	if atomic.LoadInt64(&w.pendingCount[idx]) >= int64(w.batchSize) {
 		w.flushPipeline(ctx, idx)
 	}
 	
@@ -215,18 +216,23 @@ func (w *ConcurrentWriter) WriteBatch(ctx context.Context, cmds []*WriteCommand)
 			
 			w.pipelineMu[idx].Lock()
 			
+			var addErrors int
 			for _, cmd := range commands {
 				if err := w.addCommand(ctx, w.pipelines[idx], cmd); err != nil {
 					w.stats.errors.Add(1)
+					addErrors++
+					log.Printf("[ConcurrentWriter] addCommand failed for key=%s type=%s: %v", cmd.Key, cmd.Type, err)
 					continue
 				}
-				w.pendingCount[idx]++
+				atomic.AddInt64(&w.pendingCount[idx], 1)
 				w.stats.totalCommands.Add(1)
 			}
 			
 			// 立即刷新这一批
 			if err := w.flushPipelineUnlocked(ctx, idx); err != nil {
 				errChan <- err
+			} else if addErrors > 0 {
+				errChan <- fmt.Errorf("%d commands failed to add to pipeline", addErrors)
 			}
 			
 			w.pipelineMu[idx].Unlock()
@@ -236,21 +242,29 @@ func (w *ConcurrentWriter) WriteBatch(ctx context.Context, cmds []*WriteCommand)
 	wg.Wait()
 	close(errChan)
 	
-	// 收集错误
-	var lastErr error
+	// 收集所有错误
+	var allErrors []error
 	for err := range errChan {
 		if err != nil {
-			lastErr = err
+			allErrors = append(allErrors, err)
 		}
 	}
 	
-	return lastErr
+	if len(allErrors) > 0 {
+		return fmt.Errorf("%d slot groups had errors, first: %w", len(allErrors), allErrors[0])
+	}
+	
+	return nil
 }
 
 // addCommand 添加命令到 Pipeline
 func (w *ConcurrentWriter) addCommand(ctx context.Context, pipe redis.Pipeliner, cmd *WriteCommand) error {
 	switch cmd.Type {
 	case "SET":
+		// 【BUG-FIX】检查 Args 长度，防止 index out of range panic
+		if len(cmd.Args) < 1 {
+			return fmt.Errorf("SET command requires at least 1 arg (value), got %d", len(cmd.Args))
+		}
 		if cmd.TTL > 0 {
 			pipe.Set(ctx, cmd.Key, cmd.Args[0], cmd.TTL)
 		} else {
@@ -344,21 +358,41 @@ func (w *ConcurrentWriter) flushPipeline(ctx context.Context, idx int) error {
 
 // flushPipelineUnlocked 刷新 Pipeline（调用者需持有锁）
 func (w *ConcurrentWriter) flushPipelineUnlocked(ctx context.Context, idx int) error {
-	if w.pendingCount[idx] == 0 {
+	if atomic.LoadInt64(&w.pendingCount[idx]) == 0 {
 		return nil
 	}
 	
-	_, err := w.pipelines[idx].Exec(ctx)
+	results, err := w.pipelines[idx].Exec(ctx)
 	if err != nil && err != redis.Nil {
-		w.stats.errors.Add(1)
-		log.Printf("[ConcurrentWriter] Pipeline %d exec error: %v", idx, err)
+		// 逐个检查结果，统计成功和失败数量
+		var successCount, failCount int64
+		for _, result := range results {
+			if result.Err() != nil {
+				failCount++
+			} else {
+				successCount++
+			}
+		}
+		
+		if failCount > 0 {
+			w.stats.errors.Add(failCount)
+			log.Printf("[ConcurrentWriter] Pipeline %d exec: %d succeeded, %d failed, err: %v", idx, successCount, failCount, err)
+		}
+		
 		// 重新创建 Pipeline
+		atomic.StoreInt64(&w.pendingCount[idx], 0)
 		w.pipelines[idx] = w.client.Pipeline()
-		return err
+		
+		// 如果全部失败，返回错误
+		if successCount == 0 {
+			return fmt.Errorf("pipeline %d all %d commands failed: %w", idx, failCount, err)
+		}
+		// 部分成功：记录但不返回错误（已成功的不可回退）
+		return nil
 	}
 	
 	w.stats.flushedBatches.Add(1)
-	w.pendingCount[idx] = 0
+	atomic.StoreInt64(&w.pendingCount[idx], 0)
 	
 	// 重新创建 Pipeline
 	w.pipelines[idx] = w.client.Pipeline()

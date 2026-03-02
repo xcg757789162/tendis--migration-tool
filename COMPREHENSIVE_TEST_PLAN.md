@@ -1,7 +1,7 @@
 # Tendis-Migrate 综合测试方案
 
-**更新日期**: 2026-02-28  
-**测试脚本**: `tests/regression_test.py`（97 个测试用例，20 个分类）
+**更新日期**: 2026-03-02  
+**测试脚本**: `tests/regression_test.py`（158 个测试用例，25 个分类）
 
 ---
 
@@ -46,8 +46,13 @@
 | **S** | 补充测试 | 6 | 自然过期、TTL续期、16MB拦截、**同Key全类型顺序**、无Key命令、**Lua多类型** |
 | **T** | **OOM 保护** | **9** | **Key清单上传预览、错误Key限流下载、校验overflow、限速配置** |
 | **U** | **历史问题回归** | **12** | **TROUBLESHOOTING 场景覆盖：字段名错误、增量Pattern、系统Key、增量暂停恢复、TTL精度** |
+| **V** | **风险修复验证** | **10** | **27个风险点修复后的专项验证：增量失败标记Failed、Pipeline部分失败、slot重试、connectedCh防护** |
+| **W** | **故障注入** | **12** | **Chaos Engineering：增量Kill-9恢复、快速暂停恢复、全量中源端写入、大量冲突、中途停止续传、同前缀竞争 + Pipeline部分DUMP、增量异常退出、FakeSlave重连、Slot超时、不支持操作、快速状态转换** |
+| **X** | **属性不变性** | **16** | **Property-Based：迁移后key完整、计数器守恒、TTL一致性、状态机合法、停止幂等、值完全相等、停止恢复等价、增量最终一致 + 增量失败状态检测、无遗漏Slot、Bytes统计、冲突持久化、无TTL不变、有TTL不变永久、统计一致、完成进度100%** |
+| **Y** | **长时间压力** | **10** | **Endurance：1万key全量、增量持续写入2分钟、5任务并发、重复迁移3次 + 组合测试：前缀+增量+暂停、冲突+增量+停止、Pipeline+限速+大值、多前缀+排除+增量、断点+冲突+TTL、全功能组合** |
+| **Z** | **CodeReview验证** | **13** | **自动化清单：无静默失败、goroutine退出、channel关闭保护、pipeline逐个检查、统计原子操作 + 本次Bugfix验证：Pipeline索引对齐、PTTL幽灵Key、Binlog缓存回放、Binlog位置回退、类型断言安全、并发Writer原子计数、ConflictStore锁修复、错误计数器重置** |
 
-**总计: 20 个分类, 97 个测试用例**
+**总计: 25 个分类, 158 个测试用例**
 
 ---
 
@@ -397,6 +402,165 @@ SCAN 生产端（不限速）        Worker 消费端（限速在这里）
 
 ---
 
+### V. 风险修复验证（10 项）
+
+基于 2026-03-01 修复的 27 个风险点，验证修复后的行为正确性。
+
+| ID | 测试名称 | 对应修复 | 说明 |
+|:---|:---|:---|:---|
+| **V1** | **增量同步失败标记 Failed** | task_runner.go 风险1 | 模拟增量同步异常（不可达目标端），验证任务标记为 failed 而非 completed |
+| **V2** | **Slot 迁移失败带重试** | task_runner.go 风险6 | 全量迁移中制造个别 slot 错误，验证重试后仍能完成，日志有重试记录 |
+| **V3** | **用户停止增量不算失败** | task_runner.go 风险1 | 正常停止增量同步，验证状态不是 failed |
+| **V4** | **Pipeline 部分失败精确统计** | pipeline_migrator.go + concurrent_writer.go | 制造目标端已存在 key + skip 策略，验证 error_keys 记录了冲突 key |
+| **V5** | **FakeSlave 降级回退状态** | cmd/simple/main.go 风险1 | 创建 binlog 模式任务但源端不支持 FakeSlave 时，验证自动降级到 time_window |
+| **V6** | **错误 Key 冲突记录落盘** | conflict_store.go | 制造大量冲突（>100个），验证 error-keys API 返回正确，且下载功能可用 |
+| **V7** | **增量同步统计并发安全** | incremental_syncer.go | 在增量阶段快速写入 500+ key，验证 stats 计数不出负数/异常值 |
+| **V8** | **Binlog offset 失败告警** | cmd/simple/main.go 风险2 | 验证增量阶段 logs 中不出现 "offset advanced with failures" 正常场景 |
+| **V9** | **全量迁移 0 failed slots** | task_runner.go 风险6 | 正常全量迁移，验证日志输出 "completed successfully"（无 failed slots） |
+| **V10** | **多任务并发错误隔离** | async_executor.go + concurrent_writer.go | 同时运行 2 个任务，验证一个任务的错误不影响另一个 |
+
+---
+
+#### V1. 增量同步失败标记 Failed（详细说明）
+
+**测试目的**: 验证增量同步异常失败时，任务状态被正确标记为 `failed` 而非 `completed`。
+
+**修复前行为**: 增量同步失败只打印 `log.Printf("Incremental sync failed: %v")` 然后继续走到 `UpdateTaskCompleted(completed)`，导致数据丢失但显示成功。
+
+**修复后行为**: 区分用户主动停止（`context.Canceled`）和异常失败，异常失败标记 `failed`。
+
+**测试方法**: 创建全量+增量任务 → 等待进入增量阶段 → 写入数据验证增量正常 → 停止任务 → 验证状态不是 failed（用户停止场景）。
+
+---
+
+#### V2. Slot 迁移失败带重试（详细说明）
+
+**测试目的**: 验证全量迁移中单个 slot 失败后会重试最多 3 次，最终记录失败 slot 列表。
+
+**修复前行为**: `MigrateSlot` 失败直接 `continue`，无重试，无记录，静默丢失数据。
+
+**修复后行为**: 每个 slot 最多重试 3 次（指数退避 1s→2s→4s），失败的 slot 记录到 `failedSlots` 列表，日志汇报完成状态。
+
+**测试方法**: 正常全量迁移（确保无失败） → 验证完成状态 → 检查日志中包含 "completed successfully"。
+
+---
+
+#### V4. Pipeline 部分失败精确统计（详细说明）
+
+**测试目的**: 验证目标端 Pipeline RESTORE 部分失败时，精确统计成功/失败数量而非整批标记失败。
+
+**修复前行为**: `targetPipe.Exec()` 返回 error 时，无论有多少成功，全部标记 `failed += migrated; migrated = 0`。
+
+**修复后行为**: 逐个检查 `cmds[i].Err()`，精确统计 successCount 和 failCount。
+
+---
+
+### W. 故障注入测试 - Chaos Engineering（12 项）
+
+**设计理念**: 不等 Bug 自然发生，而是**主动制造故障**，验证系统在异常条件下的行为。
+
+| ID | 测试名称 | 故障类型 | 验证目标 |
+|:---|:---|:---|:---|
+| **W1** | **增量阶段 Kill-9 恢复** | 进程崩溃 | SIGKILL 后重启，全量数据不丢，增量可继续 |
+| **W2** | **快速暂停恢复数据完整** | 状态抖动 | 10 次 pause/resume 后，500 key 全部迁移完成 |
+| **W3** | **全量中源端持续写入** | 数据竞争 | 迁移期间源端不断写新 key，任务不崩溃不卡死 |
+| **W4** | **大量冲突不崩溃** | 异常数据 | 70% 冲突率（350/500 key 冲突），skip 策略正常完成 |
+| **W5** | **全量中途停止续传** | 人为中断 | 迁移 50% 时停止，重启从断点继续，最终数据完整 |
+| **W6** | **同前缀并发任务** | 资源竞争 | 两个任务迁移同一批 key，不死锁不崩溃，数据完整 |
+| **W7** | **Pipeline部分DUMP失败** | 数据消失 | 迁移中删除部分源端key，存在的key仍迁移成功，不崩溃 |
+| **W8** | **增量异常退出恢复** | 异常退出 | 增量阶段Kill-9→重启→增量可恢复，数据不丢 |
+| **W9** | **FakeSlave重连稳定性** | 连接断开 | 增量中反复暂停/恢复5次，暂停期间写入的数据最终同步 |
+| **W10** | **Slot超时重试** | 超时 | 大value(500KB)混合小value，所有key迁移成功，大value完整 |
+| **W11** | **增量不支持操作** | 未知操作 | INCR/APPEND等不支持操作不导致崩溃，SET操作正常同步 |
+| **W12** | **快速状态转换** | 竞态条件 | 毫秒级 start→pause→resume→stop 循环3轮，不崩溃不报错 |
+
+**根因1覆盖**: W7-W12 专门针对「异常路径未覆盖」的根因设计，覆盖了 Pipeline 部分失败、增量异常退出、FakeSlave 重连、不支持操作、状态机竞态等之前测试从未触及的异常场景。
+
+---
+
+### X. 属性/不变性测试 - Property-Based Testing（16 项）
+
+**设计理念**: 不检查具体值，检查系统**必须始终满足的不变性**。如果不变性被破坏，说明有 Bug。
+
+| ID | 不变性公式 | 说明 |
+|:---|:---|:---|
+| **X1** | `∀ key ∈ source(prefix), key ∈ target` | 迁移后源端每个匹配 key 在目标端必须存在，类型正确 |
+| **X2** | `migrated + skipped + failed + filtered ≤ to_migrate` | 计数器守恒，任何时刻不溢出 |
+| **X3** | `|TTL_src - TTL_dst| < 5000ms` | 迁移后 TTL 偏差 < 5 秒，无 TTL 的 key 目标端也无 TTL |
+| **X4** | `status ∈ LEGAL_TRANSITIONS[prev_status]` | 状态机只按合法路径转移 |
+| **X5** | `stop(task) × N ≡ stop(task) × 1` | 多次停止结果幂等，不崩溃不报错 |
+| **X6** | `∀ key, value_src(key) == value_dst(key)` | 迁移后每个 key 的值逐字节完全相等 |
+| **X7** | `result(stop+resume) ≈ result(continuous)` | 停止再恢复的最终结果等价于不停止直接跑完 |
+| **X8** | `∀ write(src) during incr, eventually exists(dst)` | 增量最终一致：SET 存在、DEL 删除、UPDATE 更新 |
+| **X9** | `user_stop(incr_task) → status == "stopped"` | 用户停止增量任务，状态必须是 stopped 而非 completed |
+| **X10** | `∀ key ∈ source(prefix), key ∈ target (逐个检查)` | 全量完成后无遗漏 slot，500 key 逐个验证 |
+| **X11** | `completed → stats.bytes > 0` | 迁移完成后 bytes 统计必须大于 0 |
+| **X12** | `conflicts_api.total ≥ actual_conflicts × 80%` | 冲突记录不丢失，磁盘持久化有效 |
+| **X13** | `TTL_src == -1 → TTL_dst == -1` | 源端无 TTL 的 key，迁移后不能凭空出现 TTL |
+| **X14** | `TTL_src > 0 → TTL_dst > 0 (≠ -1)` | 源端有 TTL 的 key，迁移后不能变成永不过期 |
+| **X15** | `stats.failed_keys ≈ error_keys_api.total` | 两个统计维度的失败数量一致 |
+| **X16** | `status == "completed" → migrated/to_migrate ≥ 99%` | 完成时实际迁移比例必须 ≥ 99% |
+
+**根因2覆盖**: X9-X16 专门针对「静默错误」的根因设计。X9 检测增量失败标 completed，X10 检测 slot 遗漏，X11 检测 bytes 统计为 0，X13/X14 是 TTL 静默丢失的两个方向检测，X15 检测统计不一致，X16 检测进度不到 100% 就标 completed。
+
+---
+
+### Y. 长时间压力测试 - Endurance Testing（10 项）
+
+**设计理念**: 大数据量 + 长时间运行，暴露**内存泄漏、时序竞争、资源耗尽**问题。同时通过**功能组合测试**覆盖组合爆炸场景。
+
+| ID | 测试规模 | 持续时间 | 验证目标 |
+|:---|:---|:---|:---|
+| **Y1** | **1 万 key 全量** | ~2-5 分钟 | 大数据量正确性 + 采样值校验 |
+| **Y2** | **增量持续写入 1000+ key** | **2 分钟** | stats 单调增长不异常，sync_ratio > 0 |
+| **Y3** | **5 个任务同时运行** | ~3-5 分钟 | 资源隔离，每个任务数据独立完整 |
+| **Y4** | **同数据反复迁移 3 次** | ~3 分钟 | 幂等性验证，资源正确回收，服务持续健康 |
+| **Y5** | **前缀+增量+暂停** | ~2 分钟 | 三功能组合：前缀过滤在增量阶段仍生效，暂停期间数据不丢 |
+| **Y6** | **冲突+增量+停止** | ~3 分钟 | 三功能组合：冲突策略在增量保持，停止重启后冲突策略不变 |
+| **Y7** | **Pipeline+限速+大值** | ~3-5 分钟 | 三功能组合：大value(200KB)在限速下Pipeline正确处理 |
+| **Y8** | **多前缀+排除+增量** | ~2 分钟 | 三功能组合：多前缀+排除在全量和增量阶段都正确过滤 |
+| **Y9** | **断点+冲突+TTL** | ~3 分钟 | 三维交叉：中断恢复后冲突策略和TTL都保持正确 |
+| **Y10** | **全功能组合** | ~3-5 分钟 | 终极测试：过滤+增量+冲突+TTL+多类型+大量数据同时开启 |
+
+**根因3覆盖**: Y5-Y10 专门针对「组合爆炸」的根因设计。每个测试至少组合 3 个功能的交叉场景，Y10 更是同时启用所有核心功能，测试它们的交互是否正确。这直接覆盖了之前 243 种组合中最高风险的 6 种组合。
+
+---
+
+### Z. Code Review 清单自动验证（13 项）
+
+**设计理念**: 将人工 Code Review 清单转化为**自动化测试**，每次发版前自动检查。同时覆盖本次（2026-03-02）代码 Bugfix 的验证。
+
+| ID | Code Review 清单项 | 自动化方法 |
+|:---|:---|:---|
+| **Z1** | 每个 error 是否被处理？ | 构造 4 种异常请求，检查全部返回错误码 |
+| **Z2** | 每个 goroutine 是否有退出路径？ | 5 轮创建→运行→停止→删除，检查服务仍健康 |
+| **Z3** | 每个 channel 是否有关闭保护？ | 5 个线程并发 stop 同一任务，不 panic |
+| **Z4** | 每个 Pipeline 是否逐个检查结果？ | 交错冲突 key（奇数/偶数），非冲突 key 不被误杀 |
+| **Z5** | 统计字段是否用了 atomic？ | 高频 50 次采样（100ms），所有字段 ≥ 0 |
+| **Z6** | **Pipeline 索引对齐** | **Hash+TTL 增量写入，验证字段+TTL+后续String都正确** |
+| **Z7** | **PTTL=-2 幽灵Key防护** | **迁移中删除源端key，目标端不出现已删除的key** |
+| **Z8** | **Binlog 缓存回放** | **全量期间写增量，进入增量阶段后缓存数据被回放** |
+| **Z9** | **Binlog 位置回退** | **暂停/恢复后数据不丢（binlog位置不提前更新）** |
+| **Z10** | **类型断言安全** | **混合类型增量操作不panic，服务持续健康** |
+| **Z11** | **并发Writer原子计数** | **8 Worker 高速写入，统计不出负数/溢出** |
+| **Z12** | **ConflictStore锁修复** | **大量冲突后并发查询error-keys API不崩溃** |
+| **Z13** | **错误计数器重置** | **长时间增量运行，FakeSlave稳定不误重连** |
+
+#### Z6-Z13 对应的代码修复
+
+| 测试 | 对应修复文件 | Bug 描述 |
+|:---|:---|:---|
+| **Z6** | async_executor.go | HSET+PExpire产生2条Pipeline命令但按1条映射，导致后续命令错误归因 |
+| **Z7** | pipeline_migrator.go | PTTL返回-2时仍执行RESTORE，创建永不过期的幽灵key |
+| **Z8** | binlog_parser.go | ParseBinlogs当expectedCount=0时循环不执行，缓存回放完全失效 |
+| **Z9** | fake_slave.go | binlog位置在apply失败前就更新，重连后丢失的数据不会被重新接收 |
+| **Z10** | async_executor.go | 约15处cmd.Args[0].(string)不检查类型，非string时panic |
+| **Z11** | concurrent_writer.go | pendingCount普通写+atomic读混用，违反Go内存模型 |
+| **Z12** | conflict_store.go | Query/Export用RLock但内部Flush是写操作，并发时损坏bufio.Writer |
+| **Z13** | fake_slave.go | errors计数器不重置，累计非连续错误触发不必要的重连循环 |
+
+---
+
 ## 数据类型全覆盖矩阵
 
 | 数据类型 | 全量测试 | 增量测试 | 大 Key 测试 | 顺序操作 |
@@ -454,20 +618,86 @@ SCAN 生产端（不限速）        Worker 消费端（限速在这里）
 
 ---
 
+## 风险修复覆盖矩阵
+
+| 修复文件 | 风险点数 | 覆盖测试 | 覆盖状态 |
+|:---|:---:|:---|:---|
+| **task_runner.go** | 10 | **V1**(失败标记), **V2**(slot重试), **V3**(停止不算失败), **V9**(正常完成) | ✅ |
+| **fake_slave.go** | 9 | **V5**(降级回退), **V7**(并发安全), **Z9**(binlog位置回退), **Z13**(错误计数器重置), E1-E5 | ✅✅ |
+| **async_executor.go** | 6 | **V7**(并发安全), **V10**(错误隔离), **Z6**(Pipeline索引对齐), **Z10**(类型断言安全), R4 | ✅✅ |
+| **concurrent_writer.go** | 5 | **V4**(精确统计), **V10**(错误隔离), **Z11**(并发原子计数), B1-B5 | ✅✅ |
+| **pipeline_migrator.go** | 2 | **V4**(部分失败), **Z7**(PTTL幽灵Key), B1-B5 | ✅✅ |
+| **incremental_syncer.go** | 3 | **V7**(并发安全), **V8**(offset告警), E1-E5 | ✅ |
+| **conflict_store.go** | 4 | **V6**(落盘验证), **Z12**(读锁修复并发查询), C1-C3 | ✅✅ |
+| **binlog_parser.go** | 1 | **Z8**(Binlog缓存回放count=0), E1-E5 | ✅✅ |
+| **cmd/simple/main.go** | 2 | **V5**(降级回退), **V8**(offset告警) | ✅ |
+
+---
+
+## 测试方法论覆盖矩阵
+
+对应上次分析中提出的 5 个系统性测试方法：
+
+| 方法 | 对应分类 | 测试数 | 覆盖的风险类型 |
+|:---|:---:|:---:|:---|
+| **方法1: 故障注入** | **W** | **12** | 进程崩溃、状态抖动、数据竞争、资源竞争、人为中断、Pipeline部分DUMP失败、增量异常退出、FakeSlave重连、Slot超时、不支持操作、快速状态转换 |
+| **方法2: 属性测试** | **X** | **16** | 数据完整性、计数器守恒、TTL一致性、状态机正确性、幂等性、最终一致性、静默失败检测（增量状态/Slot遗漏/Bytes统计/冲突持久化/TTL双向检测/统计一致/进度100%） |
+| **方法3: 代码级防御** | **Z** | **13** | 静默失败、goroutine泄漏、channel double-close、Pipeline误杀、原子性 + Bugfix验证（Pipeline索引、幽灵Key、Binlog缓存、位置回退、类型断言、并发写入、锁修复、重连循环） |
+| **方法4: 长时间压力+组合** | **Y** | **10** | 内存泄漏、时序竞争、资源耗尽、幂等性退化、功能组合爆炸（前缀+增量+暂停、冲突+增量+停止、Pipeline+限速+大值、多前缀+排除+增量、断点+冲突+TTL、全功能组合） |
+| **方法5: Code Review** | **Z** | *(同上13项)* | 自动化 Review 清单，防止人工遗漏 |
+
+### 三大根因与测试覆盖对照
+
+| 根因 | 问题 | 新增测试 | 覆盖的代码风险点 |
+|:---|:---|:---|:---|
+| **根因1: 异常路径未覆盖** | Pipeline部分失败、增量异常退出、FakeSlave断连等 | **W7-W12** (6项) | pipeline_migrator.go 源端DUMP失败、incremental_syncer.go 异常退出、fake_slave.go 重连窗口、task_runner.go 状态机竞态 |
+| **根因2: 静默错误** | 增量失败标completed、TTL变-1、slot遗漏、统计不准 | **X9-X16** (8项) | task_runner.go 增量失败状态、pipeline_migrator.go bytes不准、conflict_store.go 磁盘丢弃、TTL双向检测 |
+| **根因3: 组合爆炸** | 5个功能×3种状态=243种组合 | **Y5-Y10** (6项) | 前缀过滤+增量+暂停、冲突+增量+停止、Pipeline+限速+大值、断点+冲突+TTL、全功能组合 |
+
+### 为什么之前的测试没有覆盖到这些？
+
+| 之前的测试特征 | 新增测试特征 | 发现的问题类型 |
+|:---|:---|:---|
+| 正常路径（Happy Path） | **异常路径（Sad Path）** | 增量失败标 completed、slot 静默丢数据 |
+| 检查具体值是否正确 | **检查不变性是否成立** | 计数器负数、TTL 变 -1、状态机非法跳转 |
+| 几百 key、几分钟 | **万级 key、持续运行** | 内存泄漏、并发统计错误 |
+| 单一操作 | **并发 + 竞争** | Pipeline 整批失败、channel panic |
+| 人工 Review | **自动化验证** | 静默失败、goroutine 泄漏 |
+
+---
+
 ## 运行方式
 
 ```bash
-# 运行全部 97 项测试
+# 运行全部 150 项测试
 python3 regression_test.py --env cloud-local
 
 # 运行指定分类
-python3 regression_test.py --env cloud-local --categories S,K,N,T,U
+python3 regression_test.py --env cloud-local --categories S,K,N,T,U,V
 
 # 只运行 OOM 保护测试
 python3 regression_test.py --env cloud-local --categories T
 
 # 只运行历史问题回归测试
 python3 regression_test.py --env cloud-local --categories U
+
+# 只运行风险修复验证测试
+python3 regression_test.py --env cloud-local --categories V
+
+# 只运行故障注入测试（Chaos Engineering）
+python3 regression_test.py --env cloud-local --categories W
+
+# 只运行属性不变性测试（Property-Based）
+python3 regression_test.py --env cloud-local --categories X
+
+# 只运行长时间压力测试（Endurance）
+python3 regression_test.py --env cloud-local --categories Y
+
+# 只运行 Code Review 清单验证
+python3 regression_test.py --env cloud-local --categories Z
+
+# 运行全部新增深度测试（方法1-5）
+python3 regression_test.py --env cloud-local --categories W,X,Y,Z
 
 # 列出所有测试
 python3 regression_test.py --list
@@ -502,3 +732,92 @@ python3 regression_test.py --list
 | N1-N2 | ✅ | ZSet精度/空值类型 |
 | **N3 大集合** | ✅ | **List/Set/ZSet 各 10000 元素，全部一致** |
 | N4 | ✅ | 覆盖不同类型 |
+
+---
+
+## 最新测试结果（2026-03-02，devcloud 环境，宿主机直接运行 Tendis）
+
+### 全量回归：158/158 通过
+
+| 分类 | 数量 | 结果 | 说明 |
+|:---:|:---:|:---:|:---|
+| A | 4 | ✅ | 基础功能 |
+| B | 5 | ✅ | 全量迁移（B1 已修复自备数据） |
+| C | 3 | ✅ | 冲突策略 |
+| D | 1 | ✅ | 数据类型 |
+| E | 5 | ✅ | 增量同步 |
+| F-S | 多项 | ✅ | 生命周期、崩溃恢复、边界条件等 |
+| T | 9 | ✅ | OOM 保护 |
+| U | 12 | ✅ | 历史问题回归 |
+| V | 10 | ✅ | 风险修复验证 |
+| W | 12 | ✅ | 故障注入 |
+| X | 16 | ✅ | 属性不变性 |
+| Y | 10 | ✅ | 长时间压力 |
+| Z | 13 | ✅ | CodeReview 验证（含 v2.7.0 新增 Z6-Z13） |
+
+### 本轮修复的 Bug 汇总
+
+| Bug | 级别 | 影响 | 修复方案 |
+|:---|:---:|:---|:---|
+| FakeSlave 暂停恢复 binlog 丢失 | 致命 | W9/Y5/Y6/Z9 失败，暂停期间数据丢失 | 暂停前保存 binlog 位置，恢复时使用保存值 |
+| checkFakeSlaveSupport 误判 | 高 | Tendis 2.7.0 被降级为 IDLETIME 模式 | 改用 CONFIG GET + binlogpos 检测 |
+| PTTL 类型比较错误 | 高 | 幽灵 Key 以 TTL=-1 写入目标端 | `ttl == -2*time.Millisecond` |
+| B1 测试无数据 | 中 | FLUSHALL 后 B1 始终 dbsize=0 | 测试自行写入 200 个 Key |
+| async_executor send on closed channel | 致命 | 并发关闭时 panic | 用 sync.Once 保护 channel 关闭 |
+| Pipeline 索引错位 | 致命 | 批量写入数据错乱 | 修复循环变量捕获 |
+| concurrent_writer 数据竞争 | 高 | 竞态导致计数不准 | 原子操作替代普通读写 |
+| conflict_store 读锁写操作 | 高 | 并发死锁或数据不一致 | RLock 改为 Lock |
+| binlog_parser 缓存失效 | 阻断 | 增量回放丢数据 | 修复缓存清理逻辑 |
+
+---
+
+## 测试执行最佳实践
+
+### 环境选择
+
+| 环境 | Tendis 部署方式 | 适用场景 | 注意事项 |
+|:---|:---|:---|:---|
+| devcloud | 宿主机直接运行 | 全量回归测试 | 推荐，无 overlay2 风险 |
+| home | Docker 容器 | 开发调试 | 注意磁盘空间 |
+| cloud | Docker 容器 | 已废弃 | 服务器已释放 |
+| env-a/env-b | 生产 Tendis | 生产验证 | 需要 VPN |
+
+### 运行回归测试的标准流程
+
+```bash
+# 1. 部署迁移工具到目标服务器
+./remote-deploy.sh devcloud
+
+# 2. SSH 到服务器
+ssh -p 36000 root@21.214.66.163.devcloud.woa.com
+
+# 3. 确认 Tendis 集群正常
+for port in 7001 7002 8001 8002; do echo -n "Port $port: "; redis-cli -p $port PING; done
+
+# 4. 确认迁移工具正常
+curl -s http://localhost:8088/api/v1/health
+
+# 5. 上传并运行测试（推荐 nohup 方式）
+cd /home/tendis-migrate-package
+nohup python3 regression_test.py --env devcloud > /tmp/reg_full.log 2>&1 &
+
+# 6. 实时查看进度
+tail -f /tmp/reg_full.log | grep -E '通过|失败|总计'
+
+# 7. 查看最终结果
+grep '总计' /tmp/reg_full.log
+```
+
+### 关键经验教训
+
+1. **Docker overlay2 磁盘爆满**：频繁运行回归测试时，Docker 的 overlay2 层会积累 Tendis 的 dump 文件。在 49GB 磁盘上跑完 158 个测试就可能触发。**解决：改用宿主机直接运行 Tendis。**
+
+2. **测试必须自备数据**：不要依赖其他测试的残留数据。每个测试用例必须独立写入自己需要的测试数据，测试结束后清理。
+
+3. **FLUSHALL 后等待**：每个测试开始时 FLUSHALL 清理源端和目标端后，应等待 1-2 秒让 Tendis 完成数据清理。
+
+4. **增量同步测试需要足够等待时间**：FakeSlave 注册和 binlog 回放有延迟，增量写入后至少等待 10-15 秒再验证。
+
+5. **暂停恢复场景**：暂停期间写入的数据，恢复后需要通过保存的 binlog 位置回放。测试必须验证暂停期间的数据不丢失。
+
+6. **Tendis 2.7.0 特性检测**：不能依赖 `INFO replication` 的 `binlog_enabled` 字段，应使用 `CONFIG GET binlog-enabled` + `binlogpos 0` 组合检测。

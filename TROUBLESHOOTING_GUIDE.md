@@ -437,6 +437,8 @@ func matchKeyFilter(key string, options *TaskOptions) bool {
 | 2026-02-12 | 添加环境适配代码污染回滚记录、v2.4.0新增功能问题记录（Preflight Check、拓扑刷新、IP探测、Error Keys） |
 | 2026-02-16 | v2.5.0: 限速修复（BUG-4/5/6）、TTL一致性、系统key过滤、FakeSlave panic、崩溃恢复、生产故障（P0/P1） |
 | 2026-03-01 | v2.6.0: 流式处理优化、数据校验增强、回归测试 97/97 全部通过 |
+| 2026-03-02 | v2.7.0: 代码深度审查修复16个Bug（async_executor/concurrent_writer/conflict_store/fake_slave/binlog_parser/pipeline_migrator/task_runner），测试脚本修复10个Bug，新增8个Z分类回归测试 |
+| 2026-03-02 | v2.7.1: 修复FakeSlave暂停恢复binlog丢失、checkFakeSlaveSupport误判、PTTL类型比较、Docker overlay2磁盘爆满；改为宿主机直接运行Tendis；B1测试自备数据；全量回归158/158通过 |
 
 ---
 
@@ -1760,6 +1762,248 @@ func (rl *RateLimiter) WaitN(n int) {
 # 只运行历史问题回归
 python3 tests/regression_test.py --env home --categories U
 
-# 运行全部（包含 97 个测试）
+# 运行全部（包含 158 个测试）
 python3 tests/regression_test.py --env home
 ```
+
+---
+
+## 16. 深度代码审查修复（2026-03-02）
+
+本次基于 3 个根因分析（异常路径未覆盖、静默错误、组合爆炸）对 7 个核心 Go 文件进行了全面排查，共发现和修复 16 个 Bug。
+
+### 16.1 致命级 Bug
+
+#### BUG-A1: async_executor.go — Stop 后 send on closed channel panic
+
+**现象**: 增量同步停止后程序 panic 崩溃。
+
+**根因**: `Stop()` 关闭 buffer channel 后，worker 排空时失败命令重试写入已关闭的 channel。
+
+**修复**: 先 cancel context 再 close buffer；重试前检查 running 状态；Submit 添加 `defer recover()`。
+
+#### BUG-A2: async_executor.go — Pipeline 索引错位
+
+**现象**: HSET 命令的错误被归因到后续无关命令，错误统计混乱。
+
+**根因**: HSET+PExpire 产生 2 条 Pipeline 命令，但 results 按 1:1 映射到 cmds，导致索引错位。
+
+**修复**: `addToPipelineWithCount` 返回每个命令实际产生的 Pipeline 条目数，用累加索引正确映射。
+
+**测试**: Z6（Pipeline 索引对齐验证）
+
+#### BUG-A3: async_executor.go — 约 15 处非安全类型断言
+
+**现象**: 非 string 类型参数导致 panic。
+
+**修复**: 全部改为安全模式 `key, ok := cmd.Args[0].(string); if !ok { return 0 }`。
+
+**测试**: Z10（类型断言安全）
+
+### 16.2 高级 Bug
+
+#### BUG-B1: concurrent_writer.go — pendingCount 数据竞争
+
+**根因**: `w.pendingCount[idx]++` 普通写与 `atomic.LoadInt64` 读混用，违反 Go 内存模型。
+
+**修复**: 统一使用 `atomic.AddInt64` / `atomic.StoreInt64`。
+
+**测试**: Z11（并发 Writer 原子计数）
+
+#### BUG-B2: conflict_store.go — 读锁下执行写操作
+
+**根因**: Query/Export 持有 RLock 调用 readFromDisk→Flush()（写操作），并发 Query 损坏 bufio.Writer。
+
+**修复**: Query 和 Export 改用写锁（`s.mu.Lock()`）。
+
+**测试**: Z12（ConflictStore 锁修复）
+
+#### BUG-B3: conflict_store.go — Close 数据丢失窗口
+
+**根因**: Flush() 和 Close() 分两次加锁，之间可能有新写入丢失。
+
+**修复**: 合并到同一个锁作用域。
+
+### 16.3 阻断级 Bug
+
+#### BUG-C1: binlog_parser.go — ParseBinlogs count=0 不解析
+
+**现象**: `ReplayCachedBinlogs` 完全失效，全量期间写入的增量数据丢失。
+
+**根因**: 循环条件 `i < expectedCount` 当 expectedCount=0 时永远不执行。
+
+**修复**: 添加 `expectedCount == 0` 时解析所有可用数据的逻辑。
+
+**测试**: Z8（Binlog 缓存回放）
+
+### 16.4 严重级 Bug
+
+#### BUG-D1: fake_slave.go — binlog 位置提前更新
+
+**现象**: apply 失败后重连使用新位置，丢失的 binlog 不会被重新接收。
+
+**修复**: 只在 apply 成功后更新位置。
+
+**测试**: Z9（Binlog 位置回退）
+
+#### BUG-D2: fake_slave.go — errors 计数器不重置
+
+**现象**: 累计非连续错误触发不必要的重连循环。
+
+**修复**: 成功处理命令时 `fs.stats.errors.Store(0)` 重置计数器。
+
+**测试**: Z13（错误计数器重置）
+
+#### BUG-D3: fake_slave.go — conn 无锁访问
+
+**根因**: receiveLoop 中 `fs.conn.SetReadDeadline` 与 Stop() 并发设 nil 导致 panic。
+
+**修复**: 先加锁获取 conn 副本再使用。
+
+### 16.5 中等级 Bug
+
+#### BUG-E1: pipeline_migrator.go — PTTL=-2 幽灵 key
+
+**根因**: Key 在 DUMP 和 PTTL 之间被删除，PTTL 返回 -2 但仍执行 RESTORE（ttl=0=永不过期）。
+
+**修复**: 检测 PTTL=-2 时跳过此 key。
+
+**测试**: Z7（幽灵 Key 防护）
+
+#### BUG-E2: task_runner.go — json.Unmarshal 错误被忽略
+
+**修复**: 添加错误检查，失败时使用默认配置。
+
+#### BUG-E3: task_runner.go — GetOrCreateStats 返回 nil
+
+**修复**: 添加 nil 检查，失败时跳过统计更新。
+
+#### BUG-E4: concurrent_writer.go — SET 命令 Args 越界 panic
+
+**修复**: 添加 `if len(cmd.Args) < 1` 检查。
+
+---
+
+### 16.6 测试脚本 Bug 修复（同期）
+
+本次还修复了 regression_test.py 中发现的 10 个问题：
+
+| # | 位置 | 问题 | 修复 |
+|:---|:---|:---|:---|
+| 1 | W11 第6150行 | `and`/`or` 运算符优先级错误 | 添加括号 `service_ok and (... or ...)` |
+| 2 | W8 第5948行 | 双重 API 调用导致不一致 | 先存结果再判断 |
+| 3 | W9 第6021行 | FakeSlave 容忍度过高（70%） | 提高到 85% |
+| 4 | W12 | API 返回值未检查 | 添加返回值检查和 stop 等待时间 |
+| 5 | V1 第4929行 | 等待时间不足（TCP超时>30s） | 改为轮询方式等待 |
+| 6 | V4 第5082行 | skipped 字段名双重计数 | 改为 fallback 取值 |
+| 7 | V6 第5221行 | `or` 条件使检查失效 | 改为检查 API code |
+| 8 | X9 | docstring 与实现不一致 | 修正 docstring 描述 |
+| 9 | X11 第6884行 | bytes 验证过于宽松 | 添加合理范围检查 |
+| 10 | X16 第7127行 | progress 嵌套重名字段 | 修正字段访问路径 |
+
+**相关关键词**: `深度代码审查`, `Pipeline索引`, `Binlog缓存`, `类型断言`, `原子操作`, `读锁`, `幽灵Key`, `计数器重置`
+
+---
+
+## 17. Docker Overlay2 磁盘爆满与 Tendis 容器问题（2026-03-02）
+
+### 17.1 Docker overlay2 积累 Tendis dump 文件导致磁盘 100%
+
+**现象**: 回归测试运行到 Z 分类时，所有写入操作返回 `ERR:3,msg:db stopped!`，目标端数据只写入一半（精确到一半 slot 范围），磁盘 `/data` 使用 100%。
+
+**根因**:
+1. Tendis 的 `dumpdir` 默认为 `./dump`（相对路径），在 Docker 容器中写入到 overlay2 diff 层
+2. RocksDB 的 SST dump 文件不受宿主机 `-v /data/tendis/xxx:/data` 挂载管控
+3. 大量回归测试持续读写，dump 文件在 overlay2 层累积到 46-97GB
+4. `/data` 分区只有 49GB，一旦满了 Tendis 进入 `db stopped` 只读模式
+
+**典型症状**:
+- 回归测试恰好一半数据写入成功（50/100, 5/10, 750/1500, 15/30）
+- `df -h /data` 显示 100% 使用
+- `du -sh /data/docker/lib/overlay2/` 显示数十 GB
+- Tendis 错误: `ERR:3,msg:db stopped!`
+
+**解决方案**（彻底方案：不用 Docker，直接宿主机运行 Tendis）:
+```bash
+# 1. 停止并删除所有 Docker 容器
+docker rm -f tendis-7001 tendis-7002 tendis-8001 tendis-8002
+
+# 2. 清理 Docker 存储
+docker system prune -a -f
+systemctl restart docker  # 释放被删除文件占用的空间
+
+# 3. 直接在宿主机运行 Tendis
+TENDIS_BIN=/home/Tendis-2.7.0-rocksdb-v8.5.3/build/bin/tendisplus
+for port in 7001 7002 8001 8002; do
+    mkdir -p /data/tendis/$port/log /data/tendis/$port/dump
+    $TENDIS_BIN /data/tendis/$port/tendis.conf
+done
+```
+
+**配置要点**（tendis.conf）:
+```
+dir /data/tendis/$port        # 数据目录指向宿主机路径
+logdir /data/tendis/$port/log
+dumpdir /data/tendis/$port/dump  # 关键！dump 文件也在可控路径下
+daemon yes                     # 宿主机运行用 daemon 模式
+dump-file-keep-num 1           # 只保留 1 个 dump 文件
+dump-file-keep-hour 1          # dump 文件只保留 1 小时
+```
+
+**预防措施**:
+- 优先宿主机直接运行 Tendis，避免 Docker overlay2 积累
+- 如必须用 Docker，配置文件中 `dumpdir` 必须指向挂载卷内路径
+- 定期监控 `df -h /data` 和 `du -sh /data/docker/lib/overlay2/`
+
+### 17.2 Docker 容器中 Tendis daemon 模式导致容器立即退出
+
+**现象**: Docker 容器创建后立即退出（exit code 0），不断重启，但 Tendis 进程实际没有运行。
+
+**根因**: Tendis 默认 `daemon:yes`，fork 出子进程后父进程退出。Docker 监控的是父进程（PID 1），父进程退出后 Docker 认为容器已停止。
+
+**解决方案**:
+- Docker 容器中必须配置 `daemon no`（前台模式）
+- 宿主机直接运行时用 `daemon yes`（后台模式）
+
+### 17.3 B1 测试依赖前置数据
+
+**现象**: 全量回归测试中 B1 始终失败，`src_dbsize=0, migrated=0`。
+
+**根因**: B1（全量无过滤）测试不自己准备数据，依赖源端已有残留数据。在 FLUSHALL 后源端为空。
+
+**修复**: B1 测试自行写入 200 个测试 key：
+```python
+src = SRC_PORTS[0]
+for i in range(200):
+    redis_set(src, f"b1_data:{i:04d}", f"value_{i}")
+```
+
+### 17.4 FakeSlave 暂停恢复 binlog 位置丢失
+
+**现象**: W9/Y5/Y6/Z9 测试失败 — 暂停恢复后增量同步数据为 0。
+
+**根因**: 暂停时 `task.Cleanup()` 关闭 `stopCh` 导致 FakeSlave 断开。恢复时 `startFakeSlaves()` 获取**当前** binlogpos（已前进），暂停期间的 binlog 条目永久丢失。
+
+**修复**: 
+1. FakeSlave 新增 `GetCurrentBinlogPos()` / `GetSourceAddr()` / `GetStoreID()` 方法
+2. Task 结构体新增 `savedBinlogPositions map[string]uint64` 字段
+3. `waitForFakeSlaves()` 在停止 FakeSlave 前调用 `saveFakeSlaveBinlogPositions()` 保存位置
+4. `startFakeSlaves()` 恢复时优先使用保存的位置
+
+### 17.5 checkFakeSlaveSupport() 误判 Tendis 不支持 binlog
+
+**现象**: Tendis 2.7.0 已启用 binlog，但迁移工具降级使用 IDLETIME 模式。
+
+**根因**: `checkFakeSlaveSupport()` 检查 `INFO replication` 中的 `binlog_enabled` 字段，但 Tendis 2.7.0 不暴露此字段。
+
+**修复**: 改用 `CONFIG GET binlog-enabled` 和 `binlogpos 0` 命令检测。
+
+### 17.6 PTTL 类型比较错误
+
+**现象**: 幽灵 key（DUMP 后被删除的 key）被以 TTL=0（永不过期）写入目标端。
+
+**根因**: `if ttl == -2` 比较 `time.Duration`（纳秒）和整数 -2（即 -2 纳秒），但 PTTL 返回 -2 毫秒。
+
+**修复**: `if ttl == -2*time.Millisecond`
+
+**相关关键词**: `overlay2`, `磁盘爆满`, `db stopped`, `daemon`, `binlog位置`, `FakeSlave`, `checkFakeSlaveSupport`, `PTTL`

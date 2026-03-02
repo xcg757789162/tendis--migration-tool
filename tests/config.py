@@ -9,6 +9,7 @@
 预设环境:
   home     - 家里环境（本地工具 + 192.168.1.19 Docker 容器）
   cloud    - 默认测试服务器（1.95.147.159 工具 + 192.168.0.142 Tendis）
+  devcloud - DevCloud 服务器（21.214.66.163:36000，工具+Tendis 同机部署，宿主机直接运行 Tendis）
   env-a    - 测试环境 A（8.137.20.144 工具 + 10.31.36.x Tendis）
   env-b    - 测试环境 B（8.137.20.144 工具 + 10.31.36.5/16 Tendis）
   custom   - 完全自定义（通过环境变量指定）
@@ -92,6 +93,16 @@ ENVIRONMENTS = {
         "dst_host":  "10.31.36.16",
         "dst_ports": [8901, 8902, 8903],
         "redis_via_ssh": True,
+    },
+    # devcloud: 测试脚本在 21.214.66.163 服务器上本地运行
+    "devcloud": {
+        "api":       "http://localhost:8088/api/v1",
+        "ssh_cmd":   "",
+        "src_host":  "21.214.66.163",
+        "dst_host":  "21.214.66.163",
+        "src_ports": [7001, 7002],
+        "dst_ports": [8001, 8002],
+        "redis_via_ssh": False,
     },
 }
 

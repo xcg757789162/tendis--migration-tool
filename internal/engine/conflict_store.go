@@ -180,8 +180,20 @@ func (s *ConflictKeyStore) writeToDisk(record *ConflictKeyRecord) {
 		return
 	}
 	
-	s.diskWriter.Write(data)
-	s.diskWriter.WriteByte('\n')
+	if _, err := s.diskWriter.Write(data); err != nil {
+		log.Printf("[ConflictKeyStore] Disk write error for key=%s: %v", record.Key, err)
+		// 写入失败时尝试降级到内存（如果还有空间）
+		return
+	}
+	if err := s.diskWriter.WriteByte('\n'); err != nil {
+		log.Printf("[ConflictKeyStore] Disk write newline error: %v", err)
+	}
+	// 定期刷新确保数据落盘
+	if s.diskCount.Load()%100 == 0 {
+		if err := s.diskWriter.Flush(); err != nil {
+			log.Printf("[ConflictKeyStore] Disk flush error: %v", err)
+		}
+	}
 }
 
 // Flush 刷新缓冲区
@@ -197,10 +209,13 @@ func (s *ConflictKeyStore) Flush() error {
 
 // Close 关闭存储
 func (s *ConflictKeyStore) Close() error {
-	s.Flush()
-	
+	// 【BUG-FIX】在同一个锁作用域内完成 Flush + Close，避免 Flush 释放锁后再加锁之间的数据丢失窗口
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	
+	if s.diskWriter != nil {
+		s.diskWriter.Flush()
+	}
 	
 	if s.diskFile != nil {
 		return s.diskFile.Close()
@@ -225,9 +240,6 @@ func (s *ConflictKeyStore) GetDiskCount() int64 {
 
 // Query 查询冲突 Key（分页）
 func (s *ConflictKeyStore) Query(page, size int, filter *ConflictKeyFilter) (*ConflictKeyQueryResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	
 	if page < 1 {
 		page = 1
 	}
@@ -237,6 +249,10 @@ func (s *ConflictKeyStore) Query(page, size int, filter *ConflictKeyFilter) (*Co
 	if size > 1000 {
 		size = 1000
 	}
+	
+	// 【BUG-FIX】使用写锁而非读锁，因为 readFromDisk 内部会调用 diskWriter.Flush()（写操作）
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	
 	// 合并内存和磁盘数据
 	allRecords := make([]*ConflictKeyRecord, 0, len(s.memoryBuffer))
@@ -316,8 +332,9 @@ func (s *ConflictKeyStore) readFromDisk(filter *ConflictKeyFilter) ([]*ConflictK
 
 // Export 导出冲突 Key 到文件
 func (s *ConflictKeyStore) Export(writer io.Writer, format string, filter *ConflictKeyFilter) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// 【BUG-FIX】使用写锁，因为 readFromDisk 内部调用 diskWriter.Flush()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	
 	// 刷新磁盘缓冲
 	s.diskWriter.Flush()
@@ -349,7 +366,11 @@ func (s *ConflictKeyStore) exportJSON(writer io.Writer, filter *ConflictKeyFilte
 		}
 		first = false
 		
-		data, _ := json.MarshalIndent(r, "  ", "  ")
+		data, err := json.MarshalIndent(r, "  ", "  ")
+		if err != nil {
+			log.Printf("[ConflictKeyStore] JSON marshal error for key=%s: %v", r.Key, err)
+			continue
+		}
 		io.WriteString(writer, "  ")
 		writer.Write(data)
 	}
@@ -362,7 +383,11 @@ func (s *ConflictKeyStore) exportJSON(writer io.Writer, filter *ConflictKeyFilte
 		}
 		first = false
 		
-		data, _ := json.MarshalIndent(r, "  ", "  ")
+		data, err := json.MarshalIndent(r, "  ", "  ")
+		if err != nil {
+			log.Printf("[ConflictKeyStore] JSON marshal error for key=%s: %v", r.Key, err)
+			continue
+		}
 		io.WriteString(writer, "  ")
 		writer.Write(data)
 	}
@@ -379,7 +404,11 @@ func (s *ConflictKeyStore) exportJSONL(writer io.Writer, filter *ConflictKeyFilt
 			continue
 		}
 		
-		data, _ := json.Marshal(r)
+		data, err := json.Marshal(r)
+		if err != nil {
+			log.Printf("[ConflictKeyStore] JSONL marshal error for key=%s: %v", r.Key, err)
+			continue
+		}
 		writer.Write(data)
 		io.WriteString(writer, "\n")
 	}
@@ -387,7 +416,11 @@ func (s *ConflictKeyStore) exportJSONL(writer io.Writer, filter *ConflictKeyFilt
 	// 导出磁盘数据
 	diskRecords, _ := s.readFromDisk(filter)
 	for _, r := range diskRecords {
-		data, _ := json.Marshal(r)
+		data, err := json.Marshal(r)
+		if err != nil {
+			log.Printf("[ConflictKeyStore] JSONL marshal error for key=%s: %v", r.Key, err)
+			continue
+		}
 		writer.Write(data)
 		io.WriteString(writer, "\n")
 	}

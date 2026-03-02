@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -25,10 +26,10 @@ type IncrementalSyncer struct {
 	running       bool
 	mutex         sync.RWMutex
 
-	// 统计
-	keysProcessed int64
-	keysSkipped   int64
-	keysFailed    int64
+	// 统计（使用 atomic 保证并发安全）
+	keysProcessed atomic.Int64
+	keysSkipped   atomic.Int64
+	keysFailed    atomic.Int64
 	batchSize     int
 }
 
@@ -102,9 +103,9 @@ func (is *IncrementalSyncer) GetStats() map[string]interface{} {
 	defer is.mutex.RUnlock()
 
 	return map[string]interface{}{
-		"keys_processed": is.keysProcessed,
-		"keys_skipped":   is.keysSkipped,
-		"keys_failed":    is.keysFailed,
+		"keys_processed": is.keysProcessed.Load(),
+		"keys_skipped":   is.keysSkipped.Load(),
+		"keys_failed":    is.keysFailed.Load(),
 		"running":        is.running,
 	}
 }
@@ -121,6 +122,8 @@ func (is *IncrementalSyncer) consumeQueue(nodeAddr string, queue *storage.LevelD
 	defer ticker.Stop()
 
 	batch := make([]*storage.ChangeRecord, 0, is.batchSize)
+	consecutiveErrors := 0
+	const maxConsecutiveErrors = 10
 
 	for {
 		select {
@@ -139,12 +142,23 @@ func (is *IncrementalSyncer) consumeQueue(nodeAddr string, queue *storage.LevelD
 			for len(batch) < is.batchSize {
 				change, err := queue.Dequeue()
 				if err != nil {
+					consecutiveErrors++
 					is.logger.Warn("Failed to dequeue change", map[string]interface{}{
-						"node":  nodeAddr,
-						"error": err.Error(),
+						"node":              nodeAddr,
+						"error":             err.Error(),
+						"consecutive_errors": consecutiveErrors,
 					})
+					if consecutiveErrors >= maxConsecutiveErrors {
+						is.logger.Error("Too many consecutive dequeue errors, pausing consumer", map[string]interface{}{
+							"node":   nodeAddr,
+							"errors": consecutiveErrors,
+						})
+						time.Sleep(5 * time.Second) // 退避等待
+						consecutiveErrors = 0
+					}
 					break
 				}
+				consecutiveErrors = 0 // 成功后重置
 				if change == nil {
 					break // 队列为空
 				}
@@ -172,9 +186,9 @@ func (is *IncrementalSyncer) processBatch(batch []*storage.ChangeRecord) {
 					"key":   change.Key,
 					"error": err.Error(),
 				})
-				is.keysFailed++
+				is.keysFailed.Add(1)
 			} else {
-				is.keysProcessed++
+				is.keysProcessed.Add(1)
 			}
 
 		case "set", "hset", "lpush", "rpush", "sadd", "zadd", "setex", "psetex":
@@ -185,24 +199,24 @@ func (is *IncrementalSyncer) processBatch(batch []*storage.ChangeRecord) {
 					"key":   change.Key,
 					"error": err.Error(),
 				})
-				is.keysFailed++
+				is.keysFailed.Add(1)
 			} else if migrated {
-				is.keysProcessed++
+				is.keysProcessed.Add(1)
 			} else {
-				is.keysSkipped++
+				is.keysSkipped.Add(1)
 			}
 
 		default:
 			// 其他事件类型暂时忽略
-			is.keysSkipped++
+			is.keysSkipped.Add(1)
 		}
 	}
 
 	is.logger.Debug("Processed incremental batch", map[string]interface{}{
 		"batch_size": len(batch),
-		"processed":  is.keysProcessed,
-		"skipped":    is.keysSkipped,
-		"failed":     is.keysFailed,
+		"processed":  is.keysProcessed.Load(),
+		"skipped":    is.keysSkipped.Load(),
+		"failed":     is.keysFailed.Load(),
 	})
 }
 

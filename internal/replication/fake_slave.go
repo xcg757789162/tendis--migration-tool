@@ -102,6 +102,8 @@ type FakeSlave struct {
 	// 停止信号
 	stopCh   chan struct{}
 	stopOnce sync.Once // 【BUG-FIX】防止多次 close(stopCh) panic
+	// 【BUG-FIX】防止多次 close(connectedCh) panic
+	connectedOnce sync.Once
 	// 错误信息
 	lastError atomic.Value
 
@@ -218,6 +220,16 @@ func (fs *FakeSlave) GetCurrentBinlogPos() uint64 {
 	return fs.currentBinlogPos.Load()
 }
 
+// GetSourceAddr 获取源端地址
+func (fs *FakeSlave) GetSourceAddr() string {
+	return fs.config.SourceAddr
+}
+
+// GetStoreID 获取 store ID
+func (fs *FakeSlave) GetStoreID() uint32 {
+	return fs.config.StoreID
+}
+
 // GetStats 获取统计信息
 func (fs *FakeSlave) GetStats() map[string]int64 {
 	return map[string]int64{
@@ -262,7 +274,7 @@ func (fs *FakeSlave) connectAndRun(ctx context.Context) error {
 		connErr := fmt.Errorf("connect to %s failed: %w", fs.config.SourceAddr, err)
 		if !fs.connected.Load() {
 			fs.connectionError.Store(&errorWrapper{err: connErr})
-			close(fs.connectedCh) // 通知等待者连接失败
+			fs.connectedOnce.Do(func() { close(fs.connectedCh) })
 		}
 		return connErr
 	}
@@ -290,7 +302,7 @@ func (fs *FakeSlave) connectAndRun(ctx context.Context) error {
 			authErr := fmt.Errorf("auth failed: %w", err)
 			if !fs.connected.Load() {
 				fs.connectionError.Store(&errorWrapper{err: authErr})
-				close(fs.connectedCh)
+				fs.connectedOnce.Do(func() { close(fs.connectedCh) })
 			}
 			return authErr
 		}
@@ -302,7 +314,7 @@ func (fs *FakeSlave) connectAndRun(ctx context.Context) error {
 		syncErr := fmt.Errorf("INCRSYNC failed: %w", err)
 		if !fs.connected.Load() {
 			fs.connectionError.Store(&errorWrapper{err: syncErr})
-			close(fs.connectedCh)
+			fs.connectedOnce.Do(func() { close(fs.connectedCh) })
 		}
 		return syncErr
 	}
@@ -310,7 +322,7 @@ func (fs *FakeSlave) connectAndRun(ctx context.Context) error {
 
 	// 4. 标记连接成功，通知等待者
 	if !fs.connected.Swap(true) {
-		close(fs.connectedCh) // 首次连接成功，通知等待者
+		fs.connectedOnce.Do(func() { close(fs.connectedCh) })
 		log.Printf("[FakeSlave] Connection ready, notifying waiters")
 	}
 
@@ -402,7 +414,14 @@ func (fs *FakeSlave) receiveLoop(ctx context.Context) error {
 		}
 
 		// 设置读取超时
-		fs.conn.SetReadDeadline(time.Now().Add(fs.config.ReadTimeout))
+		// 【BUG-FIX】加锁访问 conn，防止 Stop() 并发将 conn 设为 nil 导致 panic
+		fs.mu.Lock()
+		conn := fs.conn
+		fs.mu.Unlock()
+		if conn == nil {
+			return fmt.Errorf("connection closed")
+		}
+		conn.SetReadDeadline(time.Now().Add(fs.config.ReadTimeout))
 
 		// 读取并解析 RESP 命令
 		cmd, args, err := fs.readCommand()
@@ -424,6 +443,13 @@ func (fs *FakeSlave) receiveLoop(ctx context.Context) error {
 		if err := fs.handleCommand(ctx, cmd, args); err != nil {
 			log.Printf("[FakeSlave] Handle command %s failed: %v", cmd, err)
 			fs.stats.errors.Add(1)
+			// 连续错误达到阈值时中断循环触发重连，避免数据持续不一致
+			if fs.stats.errors.Load() > 10 {
+				return fmt.Errorf("too many consecutive errors (>10), last: %w", err)
+			}
+		} else {
+			// 【BUG-FIX】成功处理命令时重置错误计数器，避免累计非连续错误导致误触发重连
+			fs.stats.errors.Store(0)
 		}
 	}
 }
@@ -560,35 +586,59 @@ func (fs *FakeSlave) handleCommand(ctx context.Context, cmd string, args []strin
 		// Master 在发送 applybinlogsv2 后会等待 +OK 响应（超时时间 timeoutSecBinlogWaitRsp，默认3秒）
 		if err != nil {
 			// 发送错误响应
-			fs.writer.WriteString(fmt.Sprintf("-ERR %s\r\n", err.Error()))
-			fs.writer.Flush()
+			if _, writeErr := fs.writer.WriteString(fmt.Sprintf("-ERR %s\r\n", err.Error())); writeErr != nil {
+				return fmt.Errorf("write error response failed: %w", writeErr)
+			}
+			if flushErr := fs.writer.Flush(); flushErr != nil {
+				return fmt.Errorf("flush error response failed: %w", flushErr)
+			}
 			return err
 		}
 		// 发送成功响应
-		fs.writer.WriteString("+OK\r\n")
-		fs.writer.Flush()
+		if _, writeErr := fs.writer.WriteString("+OK\r\n"); writeErr != nil {
+			return fmt.Errorf("write OK response failed: %w", writeErr)
+		}
+		if flushErr := fs.writer.Flush(); flushErr != nil {
+			return fmt.Errorf("flush OK response failed: %w", flushErr)
+		}
 		return nil
 	case "BINLOG_HEARTBEAT":
 		err := fs.handleBinlogHeartbeat(args)
 		// 【关键】心跳也需要响应 +OK
 		if err != nil {
-			fs.writer.WriteString(fmt.Sprintf("-ERR %s\r\n", err.Error()))
-			fs.writer.Flush()
+			if _, writeErr := fs.writer.WriteString(fmt.Sprintf("-ERR %s\r\n", err.Error())); writeErr != nil {
+				return fmt.Errorf("write heartbeat error response failed: %w", writeErr)
+			}
+			if flushErr := fs.writer.Flush(); flushErr != nil {
+				return fmt.Errorf("flush heartbeat error response failed: %w", flushErr)
+			}
 			return err
 		}
-		fs.writer.WriteString("+OK\r\n")
-		fs.writer.Flush()
+		if _, writeErr := fs.writer.WriteString("+OK\r\n"); writeErr != nil {
+			return fmt.Errorf("write heartbeat OK failed: %w", writeErr)
+		}
+		if flushErr := fs.writer.Flush(); flushErr != nil {
+			return fmt.Errorf("flush heartbeat OK failed: %w", flushErr)
+		}
 		return nil
 	case "PING":
 		// 响应 PING
-		fs.writer.WriteString("+PONG\r\n")
-		fs.writer.Flush()
+		if _, writeErr := fs.writer.WriteString("+PONG\r\n"); writeErr != nil {
+			return fmt.Errorf("write PONG failed: %w", writeErr)
+		}
+		if flushErr := fs.writer.Flush(); flushErr != nil {
+			return fmt.Errorf("flush PONG failed: %w", flushErr)
+		}
 		return nil
 	default:
 		log.Printf("[FakeSlave] Unknown command: %s %v", cmd, args)
 		// 对于未知命令也发送 +OK 以保持连接
-		fs.writer.WriteString("+OK\r\n")
-		fs.writer.Flush()
+		if _, writeErr := fs.writer.WriteString("+OK\r\n"); writeErr != nil {
+			return fmt.Errorf("write unknown cmd OK failed: %w", writeErr)
+		}
+		if flushErr := fs.writer.Flush(); flushErr != nil {
+			return fmt.Errorf("flush unknown cmd OK failed: %w", flushErr)
+		}
 		return nil
 	}
 }
@@ -600,9 +650,15 @@ func (fs *FakeSlave) handleApplyBinlogsV2(ctx context.Context, args []string) er
 		return fmt.Errorf("applybinlogsv2 requires at least 4 arguments, got %d", len(args))
 	}
 
-	storeID, _ := strconv.ParseUint(args[0], 10, 32)
+	storeID, err := strconv.ParseUint(args[0], 10, 32)
+	if err != nil {
+		return fmt.Errorf("parse storeID failed: %w", err)
+	}
 	binlogsData := args[1]
-	count, _ := strconv.Atoi(args[2])
+	count, err := strconv.Atoi(args[2])
+	if err != nil {
+		return fmt.Errorf("parse count failed: %w", err)
+	}
 	// flag := args[3] // 暂时不用
 
 	log.Printf("[FakeSlave] Received applybinlogsv2: storeId=%d, count=%d, dataLen=%d",
@@ -631,10 +687,11 @@ func (fs *FakeSlave) handleApplyBinlogsV2(ctx context.Context, args []string) er
 
 	// 过滤并应用 binlog
 	var filteredEntries []BinlogEntry
+	var maxBinlogID uint64
 	for _, entry := range entries {
-		// 更新 binlog 位置
-		if entry.BinlogID > fs.currentBinlogPos.Load() {
-			fs.currentBinlogPos.Store(entry.BinlogID)
+		// 【BUG-FIX】先记录最大 binlogID，但不立即更新位置（等 apply 成功后再更新）
+		if entry.BinlogID > maxBinlogID {
+			maxBinlogID = entry.BinlogID
 		}
 
 		// Key 过滤
@@ -663,6 +720,11 @@ func (fs *FakeSlave) handleApplyBinlogsV2(ctx context.Context, args []string) er
 			return fmt.Errorf("apply binlogs to target failed: %w", err)
 		}
 		fs.stats.appliedBinlogs.Add(int64(len(filteredEntries)))
+	}
+
+	// 【BUG-FIX】apply 成功后才更新 binlog 位置，失败时不更新（重连后重新接收）
+	if maxBinlogID > fs.currentBinlogPos.Load() {
+		fs.currentBinlogPos.Store(maxBinlogID)
 	}
 
 	return nil

@@ -57,6 +57,7 @@ show_help() {
     echo "  $0 env-a               # 测试环境 A（8.137.20.144:8822）"
     echo "  $0 env-b               # 测试环境 B（140.143.218.100:5542）"
     echo "  $0 env-c               # 测试环境 C（10.248.37.11:22）"
+    echo "  $0 devcloud            # DevCloud 环境（21.214.66.163:36000）"
     echo "  $0 home                # 家里环境（192.168.1.19，本地不需要部署）"
     echo ""
 }
@@ -96,6 +97,12 @@ parse_args() {
             env-c|ENV-C)
                 SSH_TARGET="root@10.248.37.11"
                 SSH_PORT="22"
+                REMOTE_PATH="/home"
+                shift
+                ;;
+            devcloud|DEVCLOUD)
+                SSH_TARGET="root@21.214.66.163.devcloud.woa.com"
+                SSH_PORT="36000"
                 REMOTE_PATH="/home"
                 shift
                 ;;

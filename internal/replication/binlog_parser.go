@@ -129,7 +129,8 @@ func (p *BinlogParser) ParseBinlogs(data []byte, expectedCount int) ([]ParsedBin
 	offset := BinlogHeaderSize
 	results := make([]ParsedBinlog, 0, expectedCount)
 
-	for i := 0; i < expectedCount && offset < len(data); i++ {
+	// 【BUG-FIX】当 expectedCount=0 时，解析所有可用的 binlog（用于缓存回放场景）
+	for i := 0; (expectedCount == 0 || i < expectedCount) && offset < len(data); i++ {
 		// 读取 ReplLogRawV2
 		raw, bytesRead, err := p.readReplLogRaw(data[offset:])
 		if err != nil {

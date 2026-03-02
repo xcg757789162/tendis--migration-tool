@@ -440,23 +440,155 @@ CMake Error: install(EXPORT "glog-targets" ...) includes target "glog" which req
 
 ---
 
-## 附录：快速一键部署脚本
+### 问题 7：不同 CPU 导致 SIGILL (exit code 132)
 
-如果已有镜像，可以用以下脚本快速部署集群：
+**现象**：Docker 容器启动后立即退出，exit code 132，`docker logs` 无输出
+
+**原因**：编译时 RocksDB 使用 `-march=native`，如果编译机 CPU 支持 AVX-512（如 Intel Xeon），但运行机 CPU 只支持 AVX2（如 AMD EPYC 7K62），就会出现非法指令（SIGILL）
+
+**诊断方法**：
+```bash
+# 检查 CPU 指令集
+cat /proc/cpuinfo | grep flags | head -1 | tr ' ' '\n' | grep -E 'avx|sse4|bmi'
+
+# 直接在宿主机运行测试
+/path/to/tendisplus --help
+# 如果报 "Illegal instruction" 就是 CPU 不兼容
+```
+
+**解决**：在目标机器上重新从源码编译 Tendis，关键参数：
+```bash
+cmake .. -DCMAKE_BUILD_TYPE=Release -DNEW_ROCKSDB=ON -DCOM_OPT_LTO=OFF -DUSE_RTTI=ON
+```
+
+---
+
+### 问题 8：容器内 GLIBC 版本不兼容
+
+**现象**：`tendisplus: /lib64/libm.so.6: version 'GLIBC_2.38' not found`
+
+**原因**：宿主机是新系统（如 TencentOS 4, glibc 2.38），但 Docker 基础镜像是 CentOS 8（glibc 2.28）。编译出的二进制链接了宿主机的高版本 glibc
+
+**解决方案**：
+1. 使用与宿主机 glibc 兼容的基础镜像（如 `opencloudos/opencloudos:9.0`）
+2. 或者在 CentOS 8 容器内编译（保证 glibc 一致）
+3. 或者静态链接编译
+
+---
+
+### 问题 9：链接时找不到 -lstdc++
+
+**现象**：`/usr/bin/ld: cannot find -lstdc++: No such file or directory`
+
+**原因**：系统只有 libstdc++ 动态库，没有静态库
+
+**解决**：安装 libstdc++ 静态库
+```bash
+dnf install -y libstdc++-static
+```
+
+---
+
+### 问题 10：RocksDB 子目录结构
+
+**现象**：cmake 报 `add_subdirectory given source "xxx/rocksdb/rocksdb" which is not an existing directory`
+
+**原因**：Tendis CMakeLists.txt 中 `ROCKSDB_DIR` 设为 `src/thirdparty/rocksdb`，然后 `add_subdirectory(${ROCKSDB_DIR}/rocksdb ...)`，即期望 RocksDB 源码在 `src/thirdparty/rocksdb/rocksdb/` 嵌套目录下
+
+**解决**：克隆 RocksDB 到正确的嵌套路径：
+```bash
+# 错误：git clone ... $SRC/src/thirdparty/rocksdb
+# 正确：
+mkdir -p $SRC/src/thirdparty/rocksdb
+git clone --depth 1 --branch v8.5.3 https://github.com/facebook/rocksdb.git $SRC/src/thirdparty/rocksdb/rocksdb
+```
+
+---
+
+### 问题 11：Tendis 镜像必须用配置文件启动
+
+**现象**：Docker CMD 使用命令行参数 `tendisplus --bind 0.0.0.0 --port 7001 ...` 启动失败
+
+**原因**：Tendis 2.7.0 的参数解析是读配置文件，不支持命令行 `--key value` 格式
+
+**解决**：创建配置文件挂载到容器内：
+```bash
+docker run -d --name tendis-7001 --network host \
+  -v /data/tendis/7001:/data \
+  ${IMAGE} tendisplus /data/tendisplus.conf
+```
+
+---
+
+### 问题 12：Docker overlay2 积累 Tendis dump 文件导致磁盘 100%（重要！）
+
+**现象**：回归测试运行到后半段时，所有写入操作返回 `ERR:3,msg:db stopped!`，目标端数据只写入一半，`df -h /data` 显示 100%
+
+**根因**：
+1. Tendis 的 `dumpdir` 默认为 `./dump`（相对路径），在 Docker 容器中写入到 overlay2 diff 层
+2. RocksDB 的 SST dump 文件不受宿主机 `-v /data/tendis/xxx:/data` 挂载管控
+3. 大量回归测试持续读写，dump 文件在 overlay2 层累积到 46-97GB
+4. 分区满后 Tendis 进入 `db stopped` 只读模式
+
+**典型症状**：
+- 回归测试恰好一半数据写入成功（50/100, 5/10, 750/1500）
+- `du -sh /data/docker/lib/overlay2/` 显示数十 GB
+
+**解决**：**直接在宿主机运行 Tendis，不用 Docker**（见下方"附录 B"）
+
+---
+
+### 问题 13：Docker 容器中 daemon 模式导致容器立即退出
+
+**现象**：Docker 容器创建后立即退出（exit code 0），不断重启
+
+**根因**：Tendis 默认 `daemon:yes`，fork 出子进程后父进程退出。Docker 监控 PID 1，父进程退出后容器停止
+
+**解决**：
+- **Docker 容器**内必须配置 `daemon no`（前台模式）
+- **宿主机直接运行**用 `daemon yes`（后台模式）
+
+---
+
+## 附录 A：Docker 快速一键部署脚本
+
+如果已有镜像，可以用以下脚本快速部署集群。
+
+**重要**：必须使用配置文件方式启动，不能用命令行参数。
+
+**注意**：Docker 部署存在 overlay2 磁盘爆满风险（见问题 12），如果频繁运行回归测试，**强烈建议使用附录 B 的宿主机直接部署方式**。
 
 ```bash
 #!/bin/bash
 # deploy-tendis-cluster.sh
-# 用法: bash deploy-tendis-cluster.sh <宿主机IP> <镜像地址>
+# 用法: bash deploy-tendis-cluster.sh <宿主机IP> <镜像地址> [kvstorecount]
 
-HOST_IP=${1:?"用法: $0 <宿主机IP> <镜像地址>"}
-IMAGE=${2:?"用法: $0 <宿主机IP> <镜像地址>"}
+HOST_IP=${1:?"用法: $0 <宿主机IP> <镜像地址> [kvstorecount]"}
+IMAGE=${2:?"用法: $0 <宿主机IP> <镜像地址> [kvstorecount]"}
+KVSTORECOUNT=${3:-2}
 
-echo "=== 拉取镜像 ==="
-docker pull ${IMAGE}
-
-echo "=== 创建数据目录 ==="
+echo "=== 创建数据目录和配置文件 ==="
 mkdir -p /data/tendis/{7001,7002,8001,8002}
+
+for PORT in 7001 7002 8001 8002; do
+cat > /data/tendis/${PORT}/tendisplus.conf << EOF
+bind 0.0.0.0
+port ${PORT}
+dir /data
+logdir /data
+dumpdir /data/dump
+loglevel notice
+cluster-enabled true
+kvstorecount ${KVSTORECOUNT}
+binlog-enabled yes
+daemon no
+dump-file-keep-num 1
+dump-file-keep-hour 1
+rocks.blockcachemb 128
+rocks.write-buffer-size 8388608
+rocks.max-write-buffer-number 2
+EOF
+done
 
 echo "=== 启动容器 ==="
 for PORT in 7001 7002 8001 8002; do
@@ -467,29 +599,20 @@ for PORT in 7001 7002 8001 8002; do
     --restart always \
     -v /data/tendis/${PORT}:/data \
     ${IMAGE} \
-    tendisplus \
-      --bind 0.0.0.0 \
-      --port ${PORT} \
-      --dir /data \
-      --logdir /data \
-      --loglevel notice \
-      --cluster-enabled true \
-      --kvstorecount 2 \
-      --binlog-enabled yes \
-      --daemon no
+    tendisplus /data/tendisplus.conf
 done
 
-sleep 3
+sleep 5
 
 echo "=== 组建源集群 (7001+7002) ==="
 redis-cli -h ${HOST_IP} -p 7001 cluster meet ${HOST_IP} 7002
-sleep 2
+sleep 3
 for i in $(seq 0 8191); do redis-cli -h ${HOST_IP} -p 7001 cluster addslots $i > /dev/null; done
 for i in $(seq 8192 16383); do redis-cli -h ${HOST_IP} -p 7002 cluster addslots $i > /dev/null; done
 
 echo "=== 组建目标集群 (8001+8002) ==="
 redis-cli -h ${HOST_IP} -p 8001 cluster meet ${HOST_IP} 8002
-sleep 2
+sleep 3
 for i in $(seq 0 8191); do redis-cli -h ${HOST_IP} -p 8001 cluster addslots $i > /dev/null; done
 for i in $(seq 8192 16383); do redis-cli -h ${HOST_IP} -p 8002 cluster addslots $i > /dev/null; done
 
@@ -509,5 +632,154 @@ echo "目标集群: ${HOST_IP}:8001, ${HOST_IP}:8002"
 使用方式：
 
 ```bash
-bash deploy-tendis-cluster.sh 192.168.0.142 swr.cn-southwest-2.myhuaweicloud.com/tendis/tendisplus:v2.7.0
+bash deploy-tendis-cluster.sh 21.214.66.163 tendisplus:v2.7.0-local 2
 ```
+
+---
+
+## 附录 B：宿主机直接部署 Tendis（推荐）
+
+**推荐理由**：
+- 避免 Docker overlay2 磁盘爆满问题
+- dump 文件、数据文件、日志文件完全可控
+- 更易调试和监控
+- 适合频繁运行回归测试的开发环境
+
+### 前置条件
+
+已在宿主机编译好 Tendis，二进制路径如 `/home/Tendis-2.7.0-rocksdb-v8.5.3/build/bin/tendisplus`。
+
+### 一键部署脚本
+
+```bash
+#!/bin/bash
+# deploy-tendis-native.sh - 宿主机直接部署 Tendis 集群
+# 用法: bash deploy-tendis-native.sh <宿主机IP> <tendisplus二进制路径> [kvstorecount]
+#
+# 示例:
+#   bash deploy-tendis-native.sh 21.214.66.163 /home/Tendis-2.7.0-rocksdb-v8.5.3/build/bin/tendisplus 2
+
+HOST_IP=${1:?"用法: $0 <宿主机IP> <tendisplus路径> [kvstorecount]"}
+TENDIS_BIN=${2:?"用法: $0 <宿主机IP> <tendisplus路径> [kvstorecount]"}
+KVSTORECOUNT=${3:-2}
+
+if [ ! -f "$TENDIS_BIN" ]; then
+    echo "错误: 找不到 tendisplus 二进制: $TENDIS_BIN"
+    exit 1
+fi
+
+echo "=== 停止已有的 Tendis 进程 ==="
+for PORT in 7001 7002 8001 8002; do
+    redis-cli -h ${HOST_IP} -p ${PORT} SHUTDOWN NOSAVE 2>/dev/null || true
+done
+sleep 2
+
+echo "=== 清理旧数据（可选，回归测试建议清理）==="
+for PORT in 7001 7002 8001 8002; do
+    rm -rf /data/tendis/${PORT}
+done
+
+echo "=== 创建数据目录和配置文件 ==="
+for PORT in 7001 7002 8001 8002; do
+    mkdir -p /data/tendis/${PORT}/log /data/tendis/${PORT}/dump
+    cat > /data/tendis/${PORT}/tendis.conf << EOF
+bind 0.0.0.0
+port ${PORT}
+dir /data/tendis/${PORT}
+logdir /data/tendis/${PORT}/log
+dumpdir /data/tendis/${PORT}/dump
+loglevel notice
+cluster-enabled true
+kvstorecount ${KVSTORECOUNT}
+binlog-enabled yes
+daemon yes
+dump-file-keep-num 1
+dump-file-keep-hour 1
+rocks.blockcachemb 128
+rocks.write-buffer-size 8388608
+rocks.max-write-buffer-number 2
+EOF
+done
+
+echo "=== 启动 Tendis ==="
+for PORT in 7001 7002 8001 8002; do
+    ${TENDIS_BIN} /data/tendis/${PORT}/tendis.conf
+    echo "Started port ${PORT}"
+done
+
+sleep 3
+
+echo "=== 验证启动 ==="
+ALL_OK=true
+for PORT in 7001 7002 8001 8002; do
+    PONG=$(redis-cli -h ${HOST_IP} -p ${PORT} PING 2>/dev/null)
+    if [ "$PONG" = "PONG" ]; then
+        echo "  ✓ ${HOST_IP}:${PORT} PONG"
+    else
+        echo "  ✗ ${HOST_IP}:${PORT} 启动失败!"
+        ALL_OK=false
+    fi
+done
+
+if [ "$ALL_OK" = "false" ]; then
+    echo "有节点启动失败，检查日志: /data/tendis/*/log/"
+    exit 1
+fi
+
+echo "=== 组建源集群 (7001+7002) ==="
+redis-cli -h ${HOST_IP} -p 7001 cluster meet ${HOST_IP} 7002
+sleep 3
+for i in $(seq 0 8191); do redis-cli -h ${HOST_IP} -p 7001 cluster addslots $i > /dev/null; done
+for i in $(seq 8192 16383); do redis-cli -h ${HOST_IP} -p 7002 cluster addslots $i > /dev/null; done
+
+echo "=== 组建目标集群 (8001+8002) ==="
+redis-cli -h ${HOST_IP} -p 8001 cluster meet ${HOST_IP} 8002
+sleep 3
+for i in $(seq 0 8191); do redis-cli -h ${HOST_IP} -p 8001 cluster addslots $i > /dev/null; done
+for i in $(seq 8192 16383); do redis-cli -h ${HOST_IP} -p 8002 cluster addslots $i > /dev/null; done
+
+sleep 3
+
+echo "=== 集群状态 ==="
+echo "--- 源集群 ---"
+redis-cli -h ${HOST_IP} -p 7001 cluster info | grep -E "cluster_state|cluster_known_nodes|cluster_slots"
+echo "--- 目标集群 ---"
+redis-cli -h ${HOST_IP} -p 8001 cluster info | grep -E "cluster_state|cluster_known_nodes|cluster_slots"
+
+echo ""
+echo "=== 部署完成 ==="
+echo "源集群: ${HOST_IP}:7001, ${HOST_IP}:7002"
+echo "目标集群: ${HOST_IP}:8001, ${HOST_IP}:8002"
+echo ""
+echo "配置关键参数:"
+echo "  kvstorecount=${KVSTORECOUNT}, binlog-enabled=yes"
+echo "  dumpdir 在各节点 /data/tendis/PORT/dump/"
+echo "  dump-file-keep-num=1, dump-file-keep-hour=1（防止磁盘占满）"
+```
+
+### 停止 Tendis
+
+```bash
+for PORT in 7001 7002 8001 8002; do
+    redis-cli -h <HOST_IP> -p ${PORT} SHUTDOWN NOSAVE
+done
+```
+
+### Docker 方式 vs 宿主机方式对比
+
+| 方面 | Docker 部署 | 宿主机直接部署 |
+|------|-------------|----------------|
+| 磁盘风险 | overlay2 可能积累 dump 文件，导致磁盘爆满 | 所有文件都在 /data/tendis/ 下，完全可控 |
+| daemon 模式 | 必须 `daemon no`（前台） | 用 `daemon yes`（后台） |
+| 调试便利 | 需要 docker logs/exec | 直接查看日志文件 |
+| 环境隔离 | 隔离好，但增加复杂度 | 依赖宿主机环境 |
+| 适用场景 | 生产环境、需要环境隔离时 | 开发测试环境、频繁运行回归测试 |
+
+### 配置要点
+
+| 配置项 | Docker | 宿主机 | 说明 |
+|--------|--------|--------|------|
+| `daemon` | no | yes | Docker 必须前台，宿主机用后台 |
+| `dumpdir` | /data/dump（挂载卷内） | /data/tendis/PORT/dump | 必须指向可控路径 |
+| `dump-file-keep-num` | 1 | 1 | 只保留 1 个 dump，防止积累 |
+| `dump-file-keep-hour` | 1 | 1 | dump 文件只保留 1 小时 |

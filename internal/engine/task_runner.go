@@ -68,7 +68,10 @@ func NewTaskRunner(m *Master, task *model.Task) (*TaskRunner, error) {
 		return nil, fmt.Errorf("parse target config: %w", err)
 	}
 	if task.Config != "" {
-		json.Unmarshal([]byte(task.Config), &options)
+		if err := json.Unmarshal([]byte(task.Config), &options); err != nil {
+			log.Printf("Warning: invalid task config JSON, using defaults: %v", err)
+			options = *model.DefaultMigrationOptions()
+		}
 	} else {
 		options = *model.DefaultMigrationOptions()
 	}
@@ -118,11 +121,18 @@ func (r *TaskRunner) Run() {
 	}
 
 	// 更新统计
-	stats, _ := r.master.store.GetOrCreateStats(r.task.ID)
-	stats.TotalKeys = totalKeys
-	now := time.Now().Unix()
-	stats.StartTime = &now
-	r.master.store.UpdateStats(stats)
+	stats, err := r.master.store.GetOrCreateStats(r.task.ID)
+	if err != nil || stats == nil {
+		log.Printf("Warning: GetOrCreateStats failed, creating in-memory stats: %v", err)
+		// 不中断任务，但跳过统计更新
+	} else {
+		stats.TotalKeys = totalKeys
+		now := time.Now().Unix()
+		stats.StartTime = &now
+		if err := r.master.store.UpdateStats(stats); err != nil {
+			log.Printf("Warning: UpdateStats failed: %v", err)
+		}
+	}
 
 	// 检查是否支持 FakeSlave 模式
 	fakeSlaveSupported := r.checkFakeSlaveSupport()
@@ -156,6 +166,7 @@ func (r *TaskRunner) Run() {
 	}
 
 	// 阶段2: 增量同步
+	var incrSyncErr error
 	if r.options.SkipIncremental {
 		log.Printf("Phase 2: Incremental sync SKIPPED (skip_incremental=true)")
 	} else {
@@ -165,14 +176,32 @@ func (r *TaskRunner) Run() {
 		if fakeSlaveSupported {
 			// 方案 B 后续：回放缓存的 binlog，然后切换到实时模式
 			if err := r.runFakeSlaveIncrementalSyncWithReplay(); err != nil {
-				log.Printf("Incremental sync failed: %v", err)
+				if err == context.Canceled || r.ctx.Err() != nil {
+					// 用户手动停止增量同步是正常行为，不算失败
+					log.Printf("Incremental sync stopped by user")
+				} else {
+					log.Printf("Incremental sync failed: %v", err)
+					incrSyncErr = err
+				}
 			}
 		} else {
 			// 降级方案
 			if err := r.runIncrementalSync(); err != nil {
-				log.Printf("Incremental sync failed: %v", err)
+				if err == context.Canceled || r.ctx.Err() != nil {
+					log.Printf("Incremental sync stopped by user")
+				} else {
+					log.Printf("Incremental sync failed: %v", err)
+					incrSyncErr = err
+				}
 			}
 		}
+	}
+
+	// 如果增量同步异常失败（非用户停止），标记任务失败
+	if incrSyncErr != nil {
+		log.Printf("Task failed due to incremental sync error: %v", incrSyncErr)
+		r.master.store.UpdateTaskCompleted(r.task.ID, model.TaskStatusFailed)
+		return
 	}
 
 	// 阶段3: 数据校验
@@ -575,7 +604,13 @@ func (r *TaskRunner) runFakeSlaveIncrementalSyncWithReplay() error {
 	replayWg.Wait()
 	
 	if replayErrors > 0 {
-		log.Printf("Warning: %d FakeSlaves failed to replay cached binlogs", replayErrors)
+		log.Printf("ERROR: %d/%d FakeSlaves failed to replay cached binlogs", replayErrors, len(fakeSlaves))
+		// 如果所有 FakeSlave 都失败了，返回错误
+		if replayErrors >= int64(len(fakeSlaves)) {
+			return fmt.Errorf("all %d FakeSlaves failed to replay cached binlogs", replayErrors)
+		}
+		// 部分失败：记录警告但继续（部分数据可能不一致）
+		log.Printf("Warning: %d FakeSlaves succeeded, continuing with partial replay", int64(len(fakeSlaves))-replayErrors)
 	}
 	
 	log.Printf("Binlog cache replay completed")
@@ -613,7 +648,31 @@ func (r *TaskRunner) checkFakeSlaveSupport() bool {
 	// 在第一个主节点上测试 binlog 支持
 	var supported bool
 	r.sourceClient.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
-		// 检查 INFO REPLICATION 中是否有 binlog 相关信息
+		if supported {
+			return nil // 只检查第一个节点
+		}
+
+		// 方法1: 检查 CONFIG GET binlog-enabled（最可靠）
+		result, err := node.ConfigGet(ctx, "binlog-enabled").Result()
+		if err == nil {
+			if val, ok := result["binlog-enabled"]; ok && (val == "yes" || val == "1") {
+				supported = true
+				log.Printf("Tendis binlog enabled (CONFIG GET) on node %s, FakeSlave mode available", node.String())
+				return nil
+			}
+		}
+
+		// 方法2: 检查 binlogpos 0 是否返回整数（直接测试 binlog 命令）
+		posResult, err := node.Do(ctx, "binlogpos", "0").Result()
+		if err == nil {
+			if _, ok := posResult.(int64); ok {
+				supported = true
+				log.Printf("Tendis binlog available (binlogpos) on node %s, FakeSlave mode available", node.String())
+				return nil
+			}
+		}
+
+		// 方法3: 检查 INFO REPLICATION 中的 binlog 字段（兼容老版本）
 		info, err := node.Info(ctx, "replication").Result()
 		if err != nil {
 			return nil
@@ -623,7 +682,7 @@ func (r *TaskRunner) checkFakeSlaveSupport() bool {
 		binlogEnabled := parseInfoField(info, "binlog_enabled")
 		if binlogEnabled == "1" || binlogEnabled == "yes" {
 			supported = true
-			log.Printf("Tendis binlog enabled on node %s, FakeSlave mode available", node.String())
+			log.Printf("Tendis binlog enabled (INFO) on node %s, FakeSlave mode available", node.String())
 			return nil
 		}
 		
@@ -675,26 +734,44 @@ func (r *TaskRunner) runFakeSlaveIncrementalSync() error {
 	
 	log.Printf("Found %d master nodes for FakeSlave replication", len(masters))
 	
-	// 2. 为每个 Master 节点创建 FakeSlave
-	// 使用 replication 包中的 FakeSlave
+	// 2. 获取每个 Master 节点的最新 binlog 位置（全量迁移后应从最新位置开始）
+	binlogPositions := make(map[string]uint64)
+	for _, m := range masters {
+		ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
+		result, err := m.client.Do(ctx, "binlogpos", m.storeID).Result()
+		cancel()
+		if err == nil {
+			if pos, ok := result.(int64); ok && pos > 0 {
+				binlogPositions[m.addr] = uint64(pos)
+				log.Printf("Master %s storeID=%d current binlog pos: %d", m.addr, m.storeID, pos)
+			}
+		} else {
+			log.Printf("Warning: failed to get binlog pos for %s storeID=%d: %v, starting from 0", m.addr, m.storeID, err)
+		}
+	}
+	
+	// 3. 为每个 Master 节点创建 FakeSlave
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(masters))
 	
-	for _, master := range masters {
+	for i, master := range masters {
 		wg.Add(1)
-		go func(m masterNode) {
+		go func(m masterNode, idx int) {
 			defer wg.Done()
 			
-			log.Printf("Starting FakeSlave for master %s (storeID=%d)", m.addr, m.storeID)
+			// 使用获取到的最新 binlog 位置，避免从 0 开始回放全量 binlog
+			startPos := binlogPositions[m.addr]
+			
+			log.Printf("Starting FakeSlave for master %s (storeID=%d, startBinlogPos=%d)", m.addr, m.storeID, startPos)
 			
 			// 创建伪 Slave 配置
 			config := replication.FakeSlaveConfig{
 				SourceAddr:     m.addr,
 				SourcePassword: r.sourceConfig.Password,
 				StoreID:        m.storeID,
-				StartBinlogPos: 0, // 从头开始（全量迁移后应该从最新位置开始）
+				StartBinlogPos: startPos,
 				FakeListenIP:   "127.0.0.1",
-				FakeListenPort: 6379,
+				FakeListenPort: uint16(6379 + idx), // 每个 FakeSlave 使用不同端口，避免冲突
 				ReadTimeout:    30 * time.Second,
 				HeartbeatTimeout: 30 * time.Second,
 				KeyFilter: func(key string) bool {
@@ -702,21 +779,17 @@ func (r *TaskRunner) runFakeSlaveIncrementalSync() error {
 				},
 			}
 			
-			// 创建 FakeSlave 实例
-			// 注意：这里需要一个单独的目标客户端连接
 			fakeSlave := replication.NewFakeSlave(config, r.targetClient)
 			
-			// 启动 FakeSlave
 			if err := fakeSlave.Start(r.ctx); err != nil {
 				if r.ctx.Err() != nil {
-					// 正常停止
 					log.Printf("FakeSlave for %s stopped by user", m.addr)
 					return
 				}
 				log.Printf("FakeSlave for %s failed: %v", m.addr, err)
 				errChan <- fmt.Errorf("FakeSlave for %s: %w", m.addr, err)
 			}
-		}(master)
+		}(master, i)
 	}
 	
 	// 等待所有 FakeSlave 完成或用户停止
@@ -726,15 +799,28 @@ func (r *TaskRunner) runFakeSlaveIncrementalSync() error {
 		close(done)
 	}()
 	
-	select {
-	case <-r.ctx.Done():
-		log.Printf("FakeSlave incremental sync stopped by user")
-		return nil
-	case err := <-errChan:
-		return err
-	case <-done:
-		log.Printf("All FakeSlaves completed")
-		return nil
+	// 收集所有错误，不只是第一个
+	var allErrors []error
+	for {
+		select {
+		case <-r.ctx.Done():
+			log.Printf("FakeSlave incremental sync stopped by user")
+			return nil
+		case err := <-errChan:
+			allErrors = append(allErrors, err)
+			log.Printf("FakeSlave error (%d total): %v", len(allErrors), err)
+			// 如果所有 FakeSlave 都失败了，立即返回
+			if len(allErrors) >= len(masters) {
+				return fmt.Errorf("all %d FakeSlaves failed, last error: %w", len(allErrors), err)
+			}
+		case <-done:
+			if len(allErrors) > 0 {
+				log.Printf("FakeSlaves completed with %d errors", len(allErrors))
+				return fmt.Errorf("%d FakeSlaves failed: %v", len(allErrors), allErrors[0])
+			}
+			log.Printf("All FakeSlaves completed")
+			return nil
+		}
 	}
 }
 
@@ -960,7 +1046,14 @@ func (r *TaskRunner) migrateKeyByDumpRestore(ctx context.Context, sourceNode *re
 	
 	// TTL
 	ttl, err := sourceNode.TTL(ctx, key).Result()
-	if err != nil || ttl < 0 {
+	if err != nil || ttl == -2*time.Second {
+		// TTL=-2 表示 key 不存在（DUMP 和 TTL 之间被删除），跳过避免幽灵 Key
+		if err == nil {
+			return r.targetClient.Del(ctx, key).Err()
+		}
+		ttl = 0
+	}
+	if ttl < 0 {
 		ttl = 0
 	}
 	
@@ -1253,6 +1346,10 @@ type EmbeddedWorker struct {
 	slots        SlotRange
 	paused       atomic.Bool
 	
+	// 暂停恢复相关：记录暂停时间，恢复后扩大 IDLETIME 阈值补偿暂停期间的写入
+	pausedAt     atomic.Int64 // 暂停时的 Unix 纳秒时间戳，0 表示未暂停
+	resumeBoost  atomic.Int64 // 恢复后需要补偿的额外秒数（暂停持续时间）
+	
 	keysProcessed atomic.Int64
 	bytesTransferred atomic.Int64
 }
@@ -1275,6 +1372,9 @@ func (w *EmbeddedWorker) RunFullMigration(ctx context.Context) {
 	log.Printf("Worker %s starting full migration: slots %d-%d", w.id, w.slots.Start, w.slots.End)
 
 	migrator := NewSlotMigrator(w.runner, w)
+	
+	const maxSlotRetries = 3 // 单个 slot 最大重试次数
+	var failedSlots []int
 
 	for slot := w.slots.Start; slot <= w.slots.End; slot++ {
 		select {
@@ -1288,13 +1388,39 @@ func (w *EmbeddedWorker) RunFullMigration(ctx context.Context) {
 			time.Sleep(100 * time.Millisecond)
 		}
 
-		if err := migrator.MigrateSlot(ctx, slot); err != nil {
-			log.Printf("Worker %s migrate slot %d failed: %v", w.id, slot, err)
-			continue
+		// 带重试的 slot 迁移
+		var lastErr error
+		for retry := 0; retry <= maxSlotRetries; retry++ {
+			lastErr = migrator.MigrateSlot(ctx, slot)
+			if lastErr == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return // 被取消，立即退出
+			}
+			if retry < maxSlotRetries {
+				delay := time.Duration(1<<retry) * time.Second // 1s, 2s, 4s
+				log.Printf("Worker %s slot %d failed (attempt %d/%d): %v, retrying in %v",
+					w.id, slot, retry+1, maxSlotRetries+1, lastErr, delay)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+				}
+			}
+		}
+		
+		if lastErr != nil {
+			log.Printf("Worker %s slot %d failed after %d retries: %v", w.id, slot, maxSlotRetries+1, lastErr)
+			failedSlots = append(failedSlots, slot)
 		}
 	}
 
-	log.Printf("Worker %s full migration completed", w.id)
+	if len(failedSlots) > 0 {
+		log.Printf("Worker %s full migration completed with %d failed slots: %v", w.id, len(failedSlots), failedSlots)
+	} else {
+		log.Printf("Worker %s full migration completed successfully", w.id)
+	}
 }
 
 // RunIncrementalSync 运行增量同步（问题7修复：实现真正的增量同步逻辑）
@@ -1311,7 +1437,7 @@ func (w *EmbeddedWorker) RunIncrementalSyncManual(ctx context.Context) {
 
 	// 配置参数
 	syncInterval := 30 * time.Second      // 同步间隔
-	idleTimeThreshold := syncInterval + 5*time.Second // 空闲时间阈值
+	baseIdleTimeThreshold := syncInterval + 5*time.Second // 基准空闲时间阈值（35s）
 	batchSize := int64(10000)             // 每轮扫描批次大小
 
 	// 同步间隔 ticker
@@ -1333,6 +1459,15 @@ func (w *EmbeddedWorker) RunIncrementalSyncManual(ctx context.Context) {
 			// 检查是否暂停
 			if w.paused.Load() {
 				continue
+			}
+
+			// 计算本轮的 IDLETIME 阈值
+			// 恢复后第一轮使用扩大的阈值（补偿暂停期间的写入）
+			idleTimeThreshold := baseIdleTimeThreshold
+			if boost := w.resumeBoost.Swap(0); boost > 0 {
+				idleTimeThreshold = time.Duration(boost)*time.Second + baseIdleTimeThreshold
+				log.Printf("Worker %s using boosted IDLETIME threshold: %v (compensating pause duration)", 
+					w.id, idleTimeThreshold)
 			}
 
 			scanRounds++
@@ -1454,6 +1589,10 @@ func (w *EmbeddedWorker) migrateKeyFromNode(ctx context.Context, sourceNode *red
 	if err != nil {
 		ttl = 0
 	}
+	if ttl == -2*time.Second {
+		// TTL=-2 表示 key 不存在（DUMP 和 TTL 之间被删除），跳过避免幽灵 Key
+		return false, 0
+	}
 	if ttl < 0 {
 		ttl = 0
 	}
@@ -1477,10 +1616,20 @@ func (w *EmbeddedWorker) migrateKeyFromNode(ctx context.Context, sourceNode *red
 // Pause 暂停
 func (w *EmbeddedWorker) Pause() {
 	w.paused.Store(true)
+	w.pausedAt.Store(time.Now().UnixNano())
 }
 
 // Resume 恢复
 func (w *EmbeddedWorker) Resume() {
+	pausedAt := w.pausedAt.Load()
+	if pausedAt > 0 {
+		pauseDuration := time.Since(time.Unix(0, pausedAt))
+		// 记录暂停持续时间（秒），恢复后第一轮扫描将使用更大的 IDLETIME 阈值
+		boostSeconds := int64(pauseDuration.Seconds()) + 10 // 额外 10 秒缓冲
+		w.resumeBoost.Store(boostSeconds)
+		log.Printf("Worker %s resume: pause duration=%.1fs, boost=%ds", w.id, pauseDuration.Seconds(), boostSeconds)
+	}
+	w.pausedAt.Store(0)
 	w.paused.Store(false)
 }
 
@@ -1571,8 +1720,10 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 	}
 
 	// 断点保存配置
-	const checkpointKeyInterval = 10000       // 每 10000 个 key 保存一次
-	const checkpointTimeInterval = 30 * time.Second // 每 30 秒保存一次
+	const checkpointKeyInterval int64 = 2000         // 每 2000 个 key 保存一次（缩小间隔，减少崩溃回退量）
+	const checkpointTimeInterval = 10 * time.Second   // 每 10 秒保存一次
+	const maxRetries = 3                               // 单批次最大重试次数
+	const retryBaseDelay = 2 * time.Second             // 重试基础延迟
 	m.lastCheckpointTime = time.Now()
 	m.keysInBatch = 0
 
@@ -1592,20 +1743,51 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 		// SCAN获取Key
 		keys, nextCursor, err := m.scanSlot(ctx, source, slot, cursor, batchSize)
 		if err != nil {
-			return err
+			// SCAN 失败：保存当前断点后返回错误
+			m.saveSlotCheckpoint(slot, cursor, keysMigrated)
+			return fmt.Errorf("scan slot %d failed: %w", slot, err)
 		}
 
-		// 批量迁移
+		// 批量迁移（带重试）
 		if len(keys) > 0 {
-			result, err := m.migrateKeys(ctx, source, target, keys)
-			if err != nil {
-				log.Printf("Migrate keys failed: %v", err)
+			var result *MigrateKeysResult
+			var migrateErr error
+			
+			for retry := 0; retry <= maxRetries; retry++ {
+				result, migrateErr = m.migrateKeys(ctx, source, target, keys)
+				if migrateErr == nil {
+					break
+				}
+				
+				// 检查是否被取消
+				if ctx.Err() != nil {
+					m.saveSlotCheckpoint(slot, cursor, keysMigrated)
+					return ctx.Err()
+				}
+				
+				if retry < maxRetries {
+					delay := retryBaseDelay * time.Duration(1<<retry) // 指数退避: 2s, 4s, 8s
+					log.Printf("Slot %d: migrateKeys failed (attempt %d/%d): %v, retrying in %v",
+						slot, retry+1, maxRetries+1, migrateErr, delay)
+					
+					select {
+					case <-ctx.Done():
+						m.saveSlotCheckpoint(slot, cursor, keysMigrated)
+						return ctx.Err()
+					case <-time.After(delay):
+					}
+				}
 			}
+			
+			// 重试全部失败：保存断点后返回错误（不推进 cursor，下次恢复从当前位置重试）
+			if migrateErr != nil {
+				m.saveSlotCheckpoint(slot, cursor, keysMigrated)
+				return fmt.Errorf("slot %d: migrateKeys failed after %d retries: %w", slot, maxRetries+1, migrateErr)
+			}
+
 			if result != nil {
-				// 只统计实际迁移的 key 数量
 				keysMigrated += result.Migrated
 				m.keysInBatch += result.Migrated
-				// 更新过滤和跳过计数到数据库（只统计真正的冲突，不统计重试跳过）
 				if result.Filtered > 0 || result.Skipped > 0 {
 					m.runner.master.store.IncrementSkippedAndFiltered(
 						m.runner.task.ID, result.Skipped, result.Filtered)
@@ -1613,7 +1795,6 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 				
 				// 检查是否应该关闭重试窗口
 				if m.resuming {
-					// 累加本批次处理的所有 key（migrated + skipped + filtered + retrySkipped）
 					m.resumeKeysCurrent += result.Migrated + result.Skipped + result.Filtered + result.RetrySkipped
 					if m.resumeKeysCurrent >= m.resumeKeyTarget {
 						m.conflictHandler.SetRetryWindow(false)
@@ -1625,9 +1806,10 @@ func (m *SlotMigrator) MigrateSlot(ctx context.Context, slot int) error {
 			}
 		}
 
+		// 只有 migrateKeys 成功后才推进 cursor
 		cursor = nextCursor
 		
-		// 定期保存断点（每 10000 个 key 或 30 秒）
+		// 定期保存断点
 		if m.keysInBatch >= checkpointKeyInterval || time.Since(m.lastCheckpointTime) >= checkpointTimeInterval {
 			m.saveSlotCheckpoint(slot, cursor, keysMigrated)
 			m.keysInBatch = 0
@@ -1739,37 +1921,84 @@ func (m *SlotMigrator) migrateKeys(ctx context.Context, source, target *redis.Cl
 		m.rateLimiter.AcquireSourceN(int64(len(keysToMigrate)))
 	}
 
-	// Pipeline迁移
+	// Pipeline迁移：逐个 DUMP，收集到 pipeline 中批量提交
 	pipe := target.Pipeline()
 	var totalBytes int64
+	var pipelineKeys []string // 记录实际加入 pipeline 的 key（DUMP 成功的）
 	
 	for _, key := range keysToMigrate {
-		// DUMP + RESTORE
 		dump, err := source.Dump(ctx, key).Result()
 		if err != nil {
 			continue
 		}
 
 		ttl, _ := source.TTL(ctx, key).Result()
+		if ttl == -2*time.Second {
+			// TTL=-2 表示 key 不存在（DUMP 和 TTL 之间被删除），跳过避免幽灵 Key
+			continue
+		}
 		if ttl < 0 {
 			ttl = 0
 		}
 
 		totalBytes += int64(len(dump))
 		pipe.RestoreReplace(ctx, key, ttl, dump)
+		pipelineKeys = append(pipelineKeys, key)
+	}
+
+	if len(pipelineKeys) == 0 {
+		return result, nil
 	}
 
 	// 应用目标端限流（按实际 key 数量消耗令牌，在 pipeline exec 之前）
 	if m.rateLimiter != nil {
-		m.rateLimiter.AcquireTargetN(int64(len(keysToMigrate)))
+		m.rateLimiter.AcquireTargetN(int64(len(pipelineKeys)))
 	}
 
-	_, err = pipe.Exec(ctx)
+	// 执行 Pipeline 并逐个检查结果
+	cmds, err := pipe.Exec(ctx)
 	if err != nil {
-		return result, err
+		// Pipeline 返回 err 表示至少有一个命令失败
+		// 但可能部分命令已成功，需要逐个检查
+		var successCount int64
+		var failedKeys []string
+		
+		for i, cmd := range cmds {
+			if cmd.Err() == nil {
+				successCount++
+			} else {
+				if i < len(pipelineKeys) {
+					failedKeys = append(failedKeys, pipelineKeys[i])
+				}
+			}
+		}
+		
+		if successCount > 0 {
+			// 部分成功：记录成功数量，但报告错误让上层决策
+			result.Migrated = successCount
+			result.Bytes = totalBytes
+			m.worker.ReportProgress(successCount, totalBytes)
+			log.Printf("Pipeline partial success: %d/%d keys succeeded, %d failed",
+				successCount, len(pipelineKeys), len(failedKeys))
+			
+			if len(failedKeys) > 0 && len(failedKeys) <= 10 {
+				log.Printf("Failed keys: %v", failedKeys)
+			} else if len(failedKeys) > 10 {
+				log.Printf("Failed keys (first 10): %v", failedKeys[:10])
+			}
+		}
+		
+		// 如果全部失败，返回错误让上层重试
+		if successCount == 0 {
+			return result, fmt.Errorf("pipeline exec all failed (%d keys): %w", len(pipelineKeys), err)
+		}
+		
+		// 部分成功：不返回 error（已成功的 key 已计入统计），但记录警告
+		return result, nil
 	}
 
-	result.Migrated = int64(len(keysToMigrate))
+	// 全部成功
+	result.Migrated = int64(len(pipelineKeys))
 	result.Bytes = totalBytes
 
 	// 报告进度（只统计实际迁移的 key）

@@ -2007,3 +2007,58 @@ for i in range(200):
 **修复**: `if ttl == -2*time.Millisecond`
 
 **相关关键词**: `overlay2`, `磁盘爆满`, `db stopped`, `daemon`, `binlog位置`, `FakeSlave`, `checkFakeSlaveSupport`, `PTTL`
+
+---
+
+## 18. getScanMatchPattern 将正则表达式误传给 SCAN MATCH (2026-03-03)
+
+### 18.1 pattern 模式下 SCAN MATCH 使用正则语法导致 0 key 返回
+
+**现象**: Z14 测试失败，`yes_migrated=0/300`。使用 `mode: "pattern", patterns: ["^z14_perf:yes_.*"]` 时，所有 key 都未被迁移，即使 `matchKeyFilterV2` 的正则匹配逻辑已经修复。
+
+**根因**: `getScanMatchPattern()` 函数对 `mode=pattern` 的处理错误。当 pattern 包含 `*` 时（如 `^z14_perf:yes_.*` 中的 `.*`），函数直接将正则表达式作为 SCAN MATCH 参数返回。
+
+**关键问题**: **Redis SCAN MATCH 使用 glob 语法，不是正则语法！**
+- 正则 `^z14_perf:yes_.*` 在 glob 中表示：以字面量 `^` 开头 → 不匹配任何实际 key
+- 正则中 `.` 和 `*` 的含义与 glob 完全不同
+- 结果：SCAN 返回 0 个 key，后续的 `matchKeyFilterV2` 根本没有机会执行
+
+**错误代码** (`getScanMatchPattern`):
+```go
+// 错误：将正则直接传给 SCAN MATCH
+if filter.Mode == "pattern" && len(filter.Patterns) == 1 {
+    pattern := filter.Patterns[0]
+    if strings.Contains(pattern, "*") {
+        return pattern  // "^z14_perf:yes_.*" 被当作 glob！
+    }
+    return "*" + pattern + "*"
+}
+```
+
+**修复**: pattern 模式统一返回 `*`，让客户端 `matchKeyFilterV2` 做正则过滤：
+```go
+if filter.Mode == "pattern" {
+    return "*"
+}
+```
+
+**教训**:
+1. Redis SCAN MATCH 是 **glob** 语法（`*`, `?`, `[abc]`），不是正则
+2. 正则表达式只能在客户端过滤（`matchKeyFilterV2`），不能下推到 SCAN MATCH
+3. 调试链路长的问题时，不要只看最终处理函数，要从数据源头（SCAN 参数）开始排查
+4. 这类 bug 在简单通配符（如 `pat_yes:*`）测试中不会暴露，只有正则语法（如 `^prefix.*`）才触发
+
+**相关关键词**: `getScanMatchPattern`, `SCAN MATCH`, `glob`, `正则`, `pattern`, `matchKeyFilterV2`, `Z14`
+
+### 18.2 回归测试结果汇总 (2026-03-03, devcloud 400G 新磁盘)
+
+**完整 168 项测试**: 167 通过, 1 失败
+- **Z14 正则预编译**: ✅ 修复后通过 (`yes_migrated=300/300; no_blocked=200/200`)
+- **E2 增量 DEL**: ❌ 全量运行时失败（`deleted_synced=6/10`），单独运行通过（`10/10`）。属于测试状态污染，非代码 bug。
+
+**之前 24 项失败的根因分类**:
+| 类别 | 数量 | 根因 |
+|------|------|------|
+| 磁盘满 | 14 | 旧 `/data` 分区 100% → Tendis 写入失败 |
+| 状态污染 | 9 | 顺序执行时残留任务/连接/数据互相影响 |
+| 代码 bug | 1 | `getScanMatchPattern` 将正则误传给 SCAN MATCH glob |

@@ -43,6 +43,8 @@ ENVIRONMENTS = {
         "dst_host":  "192.168.1.19",  # 【BUG-FIX】显式指定目标端 IP，避免源/目标不同 IP 时连错地址
         "src_ports": [7001, 7002],
         "dst_ports": [8001, 8002],
+        "src_password": "",
+        "dst_password": "",
         "redis_via_ssh": False,  # 本地直接 redis-cli
     },
     "cloud": {
@@ -52,6 +54,8 @@ ENVIRONMENTS = {
         "dst_host":  "192.168.0.142",  # 【BUG-FIX】显式指定目标端 IP
         "src_ports": [7001, 7002],
         "dst_ports": [8001, 8002],
+        "src_password": "",
+        "dst_password": "",
         "redis_via_ssh": True,
     },
     # cloud-local: 测试脚本在 1.95.147.159 上本地运行时使用
@@ -63,6 +67,8 @@ ENVIRONMENTS = {
         "dst_host":  "192.168.0.142",  # 【BUG-FIX】显式指定目标端 IP
         "src_ports": [7001, 7002],
         "dst_ports": [8001, 8002],
+        "src_password": "",
+        "dst_password": "",
         "redis_via_ssh": False,
     },
     "env-a": {
@@ -74,6 +80,8 @@ ENVIRONMENTS = {
         "src_addrs": ["10.31.36.8:8902", "10.31.36.10:8903", "10.31.36.12:8901"],
         "dst_addrs": ["10.31.36.3:8902", "10.31.36.15:8901", "10.31.36.13:8903"],
         "dst_ports": [8902],
+        "src_password": "",
+        "dst_password": "",
         "redis_via_ssh": True,
     },
     "env-b": {
@@ -83,6 +91,8 @@ ENVIRONMENTS = {
         "src_ports": [8901, 8902, 8903],
         "dst_host":  "10.31.36.16",
         "dst_ports": [8901, 8902, 8903],
+        "src_password": "",
+        "dst_password": "",
         "redis_via_ssh": True,
     },
     "env-b-deploy": {
@@ -92,6 +102,8 @@ ENVIRONMENTS = {
         "src_ports": [8901, 8902, 8903],
         "dst_host":  "10.31.36.16",
         "dst_ports": [8901, 8902, 8903],
+        "src_password": "",
+        "dst_password": "",
         "redis_via_ssh": True,
     },
     # devcloud: 测试脚本在 21.214.66.163 服务器上本地运行
@@ -102,6 +114,8 @@ ENVIRONMENTS = {
         "dst_host":  "21.214.66.163",
         "src_ports": [7001, 7002],
         "dst_ports": [8001, 8002],
+        "src_password": "P@ssw0rd!!",
+        "dst_password": "P@ssw0rd!!",
         "redis_via_ssh": False,
     },
 }
@@ -119,6 +133,10 @@ class TestConfig:
         self.src_host = os.environ.get("TM_SRC_HOST", env.get("src_host", ""))
         self.dst_host = os.environ.get("TM_DST_HOST", env.get("dst_host", self.src_host))
         self.redis_via_ssh = env.get("redis_via_ssh", True)
+
+        # 密码（环境变量覆盖）
+        self.src_password = os.environ.get("TM_SRC_PASSWORD", env.get("src_password", ""))
+        self.dst_password = os.environ.get("TM_DST_PASSWORD", env.get("dst_password", ""))
 
         # 端口
         src_ports_str = os.environ.get("TM_SRC_PORTS", "")
@@ -150,6 +168,8 @@ class TestConfig:
         print(f"  源端:    {', '.join(self.src_nodes)}")
         print(f"  目标端:  {', '.join(self.dst_nodes)}")
         print(f"  Redis:   {'SSH 远程执行' if self.redis_via_ssh else '本地直连'}")
+        print(f"  源密码:  {'***' if self.src_password else '(无)'}")
+        print(f"  目标密码: {'***' if self.dst_password else '(无)'}")
 
 
 def get_config_from_args(args=None):

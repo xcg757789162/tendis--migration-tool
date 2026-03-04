@@ -27,7 +27,7 @@
 |:---:|:---|:---:|:---|
 | **A** | 基础功能 | 4 | 健康检查、连接测试、迁移前校验、系统状态 |
 | **B** | 全量迁移 | 5 | 无过滤、前缀过滤、排除前缀、Pattern、Keylist |
-| **C** | 冲突策略 | 3 | skip、replace、skip_full_only |
+| **C** | 冲突策略 | 4 | skip、replace、skip_full_only、error |
 | **D** | 数据类型 | 1 | string/hash/list/set/zset 全类型迁移 |
 | **E** | 增量同步 | 5 | 基本SET、DEL、前缀过滤、多类型、纯增量模式 |
 | **F** | 全量+增量 | 1 | 完整流程（全量→增量→验证） |
@@ -84,6 +84,7 @@
 | C1 | 冲突 skip | 全阶段跳过已存在 Key |
 | C2 | 冲突 replace | 直接覆盖 |
 | C3 | 冲突 skip_full_only | 全量跳过 + 增量覆盖（默认策略） |
+| C4 | 冲突 error | 遇冲突报错，任务变为 failed（负向路径） |
 
 ### D. 数据类型（1 项）
 
@@ -768,6 +769,50 @@ python3 regression_test.py --list
 | concurrent_writer 数据竞争 | 高 | 竞态导致计数不准 | 原子操作替代普通读写 |
 | conflict_store 读锁写操作 | 高 | 并发死锁或数据不一致 | RLock 改为 Lock |
 | binlog_parser 缓存失效 | 阻断 | 增量回放丢数据 | 修复缓存清理逻辑 |
+
+---
+
+## 最新修复（2026-03-03）：Z14-Z20 新增测试用例
+
+### 本次修复 7 个问题及对应测试
+
+| # | 修复项 | 严重程度 | 问题描述 | 测试用例 |
+|:---:|:---|:---:|:---|:---|
+| 1 | regexp 预编译 | 🔴高 | `regexp.MatchString` 每次重编译，40亿Key性能灾难 | **Z14**: 正则pattern过滤500Key，验证正确性+时间 |
+| 2 | exclude_patterns 预编译 | 🔴高 | 排除正则也存在重编译问题 | **Z15**: 前缀+排除正则组合，验证排除生效 |
+| 3 | verifyKey PTTL 比较 | 🟡中 | 只比DUMP不比TTL，TTL丢失误判为一致 | **Z16**: 带/不带TTL的Key迁移后校验一致性 |
+| 4 | SCAN 前缀优化 | 🔴高 | 前缀模式仍SCAN *遍历全量再客户端过滤 | **Z17**: 多前缀模式验证只迁移目标前缀 |
+| 5 | cleanup wg.Wait | 🔴高 | Stop和cleanup并发关闭连接导致panic | **Z18**: 10次快速启停循环不崩溃 |
+| 6 | go-redis v8统一 | 🔴高 | v8/v9类型不兼容导致limiter未初始化 | **Z19**: 动态速率调整+数据正确迁移 |
+| 7 | 大Key扫描器初始化 | 🟡中 | BigKeyScanner/Migrator完全未创建 | **Z20**: 大Value+大Hash迁移不崩溃 |
+
+### 同步删除的死代码
+
+| 包/文件 | 文件数 | 说明 |
+|:---|:---:|:---|
+| `internal/binlog/` | 4 | 死代码，无人import |
+| `internal/worker/` | 3 | 旧分布式架构 |
+| `internal/master/` | 5 | 旧分布式架构 |
+| `cmd/worker/main.go` | 1 | 旧worker入口 |
+| `cmd/master/main.go` | 1 | 旧master入口 |
+| `go-redis/v9` 依赖 | - | go.mod中移除 |
+
+### 全量回归预期：168/168（原158 + 新增10）
+
+| 分类 | 数量 | 说明 |
+|:---:|:---:|:---|
+| A-Y | 152 | 原有测试不变 |
+| Z1-Z13 | 13 | 之前的 CodeReview 验证 |
+| **Z14-Z20** | **7** | 本次新增（问题8-12 + go-redis统一 + 大Key初始化） |
+| **Z21-Z23** | **3** | 本次新增（3个性能优化验证） |
+
+#### Z21-Z23 性能优化测试说明
+
+| # | 测试 | 优化项 | 旧方案 | 新方案 | 验证重点 |
+|:---:|:---|:---|:---|:---|:---|
+| 1 | **Z21** | CLUSTER GETKEYSINSLOT 精确取 key | 全局 SCAN * + 客户端过滤 slot | GETKEYSINSLOT 服务端精确获取 | 700 key 多前缀：目标前缀全迁移 + noise 前缀零泄漏 |
+| 2 | **Z22** | 节点级 SCAN (ForEachMaster) | ClusterClient.Scan 跨节点 | ForEachMaster 分节点并行 SCAN | 多节点各写 200 key：每个节点 key 都被迁移，无遗漏 |
+| 3 | **Z23** | DUMP+RESTORE Pipeline 批量 | 逐 key 串行 DUMP+TTL（2000 RTT/1000key） | Pipeline 批量（2 RTT/1000key） | 500 key 迁移：数据+TTL 完整性 + 合理完成时间 |
 
 ---
 

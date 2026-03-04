@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/go-redis/redis/v8"
 )
 
 // BigKeyLevel 大Key等级
@@ -510,13 +510,13 @@ func (m *BigKeyMigrator) migrateZSet(ctx context.Context, info *BigKeyInfo, stra
 		if len(result) > 0 {
 			m.limiter.AcquireTarget()
 
-			// 构建ZAdd参数
-			members := make([]redis.Z, 0, len(result)/2)
+			// 构建ZAdd参数（v8 使用 *redis.Z 指针）
+			members := make([]*redis.Z, 0, len(result)/2)
 			for i := 0; i < len(result); i += 2 {
 				if i+1 < len(result) {
 					var score float64
 					fmt.Sscanf(result[i+1], "%f", &score)
-					members = append(members, redis.Z{
+					members = append(members, &redis.Z{
 						Score:  score,
 						Member: result[i],
 					})

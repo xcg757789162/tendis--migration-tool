@@ -173,8 +173,14 @@
             />
           </svg>
           <div class="progress-text">
-            <span class="percent">{{ progress.percentage?.toFixed(1) || 0 }}</span>
-            <span class="unit">%</span>
+            <template v-if="isEstimating">
+              <span class="percent estimating">~</span>
+              <span class="unit estimating-hint">估算中</span>
+            </template>
+            <template v-else>
+              <span class="percent">{{ progress.percentage?.toFixed(1) || 0 }}</span>
+              <span class="unit">%</span>
+            </template>
           </div>
         </div>
         
@@ -196,7 +202,9 @@
             </div>
             <div class="stat-item">
               <span class="label">总Key数</span>
-              <span class="value muted">{{ formatNumber(progress.total_keys || 0) }}</span>
+              <span class="value muted" v-if="progress.total_keys > 0">{{ formatNumber(progress.total_keys) }}</span>
+              <span class="value muted estimating-text" v-else-if="isTaskRunning">估算中...</span>
+              <span class="value muted" v-else>0</span>
             </div>
             <div class="stat-item">
               <span class="label">过滤Key</span>
@@ -1151,6 +1159,23 @@ const config = computed(() => {
   } catch {
     return {}
   }
+})
+
+// 判断任务是否正在运行中
+const isTaskRunning = computed(() => {
+  if (!task.value) return false
+  const status = task.value.status
+  return status === 'running' || status === 'migrating' || status === 'paused'
+})
+
+// 判断是否处于"估算中"状态：任务正在运行，但 total_keys 为 0
+// 此时进度百分比无意义，应显示"估算中"而非 0%
+const isEstimating = computed(() => {
+  if (!isTaskRunning.value) return false
+  const totalKeys = progress.value?.total_keys || 0
+  const migratedKeys = progress.value?.migrated_keys || 0
+  // total_keys 为 0 但已经有迁移数据，说明 DBSIZE 获取失败
+  return totalKeys === 0 && migratedKeys > 0
 })
 
 // 判断是否为影子模式
@@ -2644,6 +2669,21 @@ watch(taskId, (newId, oldId) => {
         font-size: 16px;
         color: var(--text-secondary);
       }
+      
+      .estimating {
+        font-size: 32px;
+        color: var(--text-secondary);
+        animation: pulse 1.5s ease-in-out infinite;
+        -webkit-text-fill-color: var(--text-secondary);
+        background: none;
+      }
+      
+      .estimating-hint {
+        font-size: 12px;
+        color: var(--text-muted, #999);
+        display: block;
+        margin-top: 2px;
+      }
     }
   }
   
@@ -2689,6 +2729,12 @@ watch(taskId, (newId, oldId) => {
         
         &.warning {
           color: var(--el-color-warning);
+        }
+        
+        &.estimating-text {
+          color: var(--text-muted, #999);
+          font-size: 14px;
+          animation: pulse 1.5s ease-in-out infinite;
         }
       }
       

@@ -77,10 +77,18 @@
         <el-table-column label="进度" min-width="200">
           <template #default="{ row }">
             <div class="progress-cell" v-if="row.progress">
-              <div class="progress-bar">
-                <div class="progress-inner" :style="{ width: (row.progress.percentage || 0) + '%' }"></div>
-              </div>
-              <span class="progress-text">{{ (row.progress.percentage || 0).toFixed(1) }}%</span>
+              <template v-if="row.progress.total_keys === 0 && (row.progress.migrated_keys || row.progress.keys_migrated || 0) > 0 && (row.status === 'running' || row.status === 'migrating')">
+                <div class="progress-bar">
+                  <div class="progress-inner progress-estimating" style="width: 100%"></div>
+                </div>
+                <span class="progress-text estimating-text">估算中</span>
+              </template>
+              <template v-else>
+                <div class="progress-bar">
+                  <div class="progress-inner" :style="{ width: (row.progress.percentage || 0) + '%' }"></div>
+                </div>
+                <span class="progress-text">{{ (row.progress.percentage || 0).toFixed(1) }}%</span>
+              </template>
             </div>
             <span v-else class="no-progress">-</span>
           </template>
@@ -614,6 +622,12 @@ onUnmounted(() => {
       background: var(--gradient-blue);
       border-radius: 3px;
       transition: width 0.5s ease;
+      
+      &.progress-estimating {
+        background: linear-gradient(90deg, #e0e0e0 25%, #bdbdbd 50%, #e0e0e0 75%);
+        background-size: 200% 100%;
+        animation: shimmer 1.5s infinite;
+      }
     }
   }
   
@@ -622,7 +636,23 @@ onUnmounted(() => {
     font-weight: 500;
     color: var(--primary-color);
     min-width: 50px;
+    
+    &.estimating-text {
+      color: var(--text-secondary, #999);
+      font-size: 12px;
+      animation: pulse 1.5s ease-in-out infinite;
+    }
   }
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 
 .no-progress {

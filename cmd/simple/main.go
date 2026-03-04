@@ -889,15 +889,10 @@ func getScanMatchPattern(filter *KeyFilter) string {
 		return filter.Prefixes[0] + "*"
 	}
 
-	// 如果是 pattern 模式且只有一个模式，使用 SCAN MATCH
-	if filter.Mode == "pattern" && len(filter.Patterns) == 1 {
-		pattern := filter.Patterns[0]
-		// 如果 pattern 已经包含通配符，直接使用
-		if strings.Contains(pattern, "*") {
-			return pattern
-		}
-		// 否则，作为包含匹配
-		return "*" + pattern + "*"
+	// pattern 模式：正则表达式不能直接用于 SCAN MATCH（SCAN MATCH 是 glob 语法）
+	// 必须返回 "*" 让客户端 matchKeyFilterV2 做正则过滤
+	if filter.Mode == "pattern" {
+		return "*"
 	}
 
 	// 其他情况：服务端无法完全过滤，返回 * 后在客户端过滤
@@ -5719,7 +5714,7 @@ func (p *DynamicWorkerPool) processKeyBatch(workerID int, keys []string) {
 	}
 
 	// 使用 Pipeline 批量迁移（问题4修复：添加任务ID和大Key阈值）
-	migrated, skipped, failed, filtered, totalBytes := MigrateBatchWithPipelineAndFilter(
+	migrated, skipped, failed, filtered, totalBytes, conflictErr := MigrateBatchWithPipelineAndFilter(
 		p.ctx, p.sourceClient, p.targetClient, keys, p.conflictPolicy, keyFilter,
 		p.task.ID, p.largeKeyThreshold,
 	)
@@ -5730,6 +5725,17 @@ func (p *DynamicWorkerPool) processKeyBatch(workerID int, keys []string) {
 	atomic.AddInt64(p.skippedCount, skipped)
 	atomic.AddInt64(p.failedCount, failed)
 	atomic.AddInt64(p.filteredCount, filtered)
+
+	// error 策略：遇冲突立即停止任务并标记为 failed
+	if conflictErr != "" {
+		p.taskLog.Error("Conflict error policy triggered - failing task", map[string]interface{}{
+			"conflict": conflictErr,
+			"policy":   p.conflictPolicy,
+		})
+		saveErrorKeysToFile(p.task.ID)
+		failTaskDueToConflict(p.task.ID, conflictErr, p.taskLog)
+		return
+	}
 	
 	// 记录目标端成功/失败（用于自动暂停检测）
 	// 批量模式优化：只有当失败比例超过 50% 时才记录为连续失败
@@ -7250,8 +7256,8 @@ func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient re
 		results[i].Bytes = int64(len(dump))
 	}
 
-	// 阶段 2: 批量检查目标端是否存在（对于 skip 策略）
-	if policy == "skip" || policy == "skip_full_only" {
+	// 阶段 2: 批量检查目标端是否存在（对于 skip/error 策略）
+	if policy == "skip" || policy == "skip_full_only" || policy == "error" {
 		targetPipe := targetClient.Pipeline()
 		existsCmds := make([]*redis.IntCmd, len(keys))
 
@@ -7263,7 +7269,6 @@ func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient re
 
 		targetPipe.Exec(ctx)
 
-		// 处理 skip 策略
 		for i := range keys {
 			if dumpResults[i] == nil {
 				continue
@@ -7271,7 +7276,12 @@ func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient re
 			if existsCmds[i] != nil {
 				exists, _ := existsCmds[i].Result()
 				if exists > 0 {
-					results[i].Reason = "skipped"
+					if policy == "error" {
+						// error 策略：遇冲突标记为 conflict_error，调用方应终止任务
+						results[i].Reason = "conflict_error: key already exists: " + keys[i]
+					} else {
+						results[i].Reason = "skipped"
+					}
 					delete(dumpResults, i) // 移除，不需要 RESTORE
 				}
 			}
@@ -7382,7 +7392,8 @@ func MigrateBatchWithPipeline(ctx context.Context, sourceClient, targetClient re
 
 // MigrateBatchWithPipelineAndFilter 带过滤的批量迁移
 // 问题4修复：添加 taskID 和 largeKeyThreshold 参数用于大 Key 监控
-func MigrateBatchWithPipelineAndFilter(ctx context.Context, sourceClient, targetClient redis.UniversalClient, keys []string, policy string, keyFilter *KeyFilter, taskID string, largeKeyThreshold int64) (migrated, skipped, failed, filtered int64, totalBytes int64) {
+// conflictErr: 非空时表示 error 策略遇到冲突 key，调用方应终止任务
+func MigrateBatchWithPipelineAndFilter(ctx context.Context, sourceClient, targetClient redis.UniversalClient, keys []string, policy string, keyFilter *KeyFilter, taskID string, largeKeyThreshold int64) (migrated, skipped, failed, filtered int64, totalBytes int64, conflictErr string) {
 	// 先过滤 Key
 	filteredKeys := make([]string, 0, len(keys))
 	for _, key := range keys {
@@ -7416,6 +7427,12 @@ func MigrateBatchWithPipelineAndFilter(ctx context.Context, sourceClient, target
 			}
 		} else if r.Reason == "skipped" {
 			skipped++
+		} else if strings.HasPrefix(r.Reason, "conflict_error:") {
+			// error 策略遇冲突：记录第一个冲突 key，后续由调用方终止任务
+			failed++
+			if conflictErr == "" {
+				conflictErr = r.Reason
+			}
 		} else if r.Reason != "" {
 			failed++
 			// 【P2-BUG5 修复】记录详细的失败原因，包含源目标节点
@@ -7435,6 +7452,38 @@ func MigrateBatchWithPipelineAndFilter(ctx context.Context, sourceClient, target
 	}
 
 	return
+}
+
+// compiledPatternCache 预编译正则缓存（避免 40 亿 Key 场景下每次 regexp.MatchString 重新编译）
+// key: 原始 pattern 字符串, value: 编译后的 *regexp.Regexp（nil 表示编译失败，使用简单通配符）
+var (
+	compiledPatternCache   = make(map[string]*regexp.Regexp)
+	compiledPatternCacheMu sync.RWMutex
+)
+
+// getCompiledPattern 获取预编译的正则（缓存命中返回已编译结果，否则编译并缓存）
+func getCompiledPattern(pattern string) (*regexp.Regexp, bool) {
+	compiledPatternCacheMu.RLock()
+	if re, ok := compiledPatternCache[pattern]; ok {
+		compiledPatternCacheMu.RUnlock()
+		return re, re != nil
+	}
+	compiledPatternCacheMu.RUnlock()
+
+	// 编译并缓存
+	compiledPatternCacheMu.Lock()
+	defer compiledPatternCacheMu.Unlock()
+	// double-check
+	if re, ok := compiledPatternCache[pattern]; ok {
+		return re, re != nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		compiledPatternCache[pattern] = nil // 标记编译失败
+		return nil, false
+	}
+	compiledPatternCache[pattern] = re
+	return re, true
 }
 
 // systemInternalKeyPrefixes 内置排除的系统内部 key 前缀（不包含业务数据，不应被迁移）
@@ -7472,10 +7521,12 @@ func matchKeyFilterV2(key string, filter *KeyFilter) bool {
 		}
 	}
 
-	// 检查排除正则模式
+	// 检查排除正则模式（使用预编译缓存）
 	for _, pattern := range filter.ExcludePatterns {
-		if matched, err := regexp.MatchString(pattern, key); err == nil && matched {
-			return false
+		if re, ok := getCompiledPattern(pattern); ok {
+			if re.MatchString(key) {
+				return false
+			}
 		}
 	}
 
@@ -7494,13 +7545,21 @@ func matchKeyFilterV2(key string, filter *KeyFilter) bool {
 		}
 		return false
 	case "pattern":
-		// 简单模式匹配（支持 * 通配符）
+		// 正则模式匹配（使用预编译缓存，支持完整正则语法，向后兼容简单 * 通配符）
 		if len(filter.Patterns) == 0 {
 			return true
 		}
 		for _, pattern := range filter.Patterns {
-			if matchSimplePattern(key, pattern) {
-				return true
+			if re, ok := getCompiledPattern(pattern); ok {
+				// 正则匹配成功
+				if re.MatchString(key) {
+					return true
+				}
+			} else {
+				// 正则编译失败，fallback 到简单通配符匹配
+				if matchSimplePattern(key, pattern) {
+					return true
+				}
 			}
 		}
 		return false
@@ -10638,6 +10697,31 @@ func recordTargetSuccess(taskID string) {
 
 // autoStopTask 自动暂停任务
 // 【BUG-FIX】真正停止正在运行的迁移 goroutine
+// failTaskDueToConflict 因 error 冲突策略将任务标记为 failed（终态，不可恢复）
+func failTaskDueToConflict(taskID string, reason string, taskLog *logger.TaskLogger) {
+	tasksMu.Lock()
+	task, ok := tasks[taskID]
+	if ok && (task.Status == "running" || task.Status == "incremental") {
+		now := time.Now()
+		task.Status = "failed"
+		task.UpdatedAt = now.Format(time.RFC3339)
+		task.CompletedAt = now.Format(time.RFC3339)
+
+		// 通过 Cleanup 关闭 stopCh 并取消 context，通知迁移 goroutine 停止
+		task.Cleanup()
+	}
+	tasksMu.Unlock()
+
+	if ok {
+		taskLog.Error("Task failed due to conflict error policy", map[string]interface{}{
+			"reason": reason,
+		})
+		broadcastTaskUpdate(taskID)
+		broadcastTaskStatus(taskID, "failed")
+		saveTasksState()
+	}
+}
+
 // 【BUG-FIX-2】只有真正成功将状态从 running 改为 paused 的调用才启用自动恢复
 // 避免多个 worker 同时失败时反复调用 enableAutoRecoveryForTask 覆盖用户的 disable
 func autoStopTask(taskID string, reason string, taskLog *logger.TaskLogger) {
